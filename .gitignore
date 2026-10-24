@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+
+# Desktop build artifacts
+desktop/.venv/
+desktop/node_modules/
+desktop/build/
+desktop/src-tauri/binaries/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/schemas/
+desktop/private/
+
+# Never commit credentials, caches, profiles, or captured data
+.env
+.env.*
+*.key
+*.pem
+*.sqlite*
+*.token
+*.json
+!package.json
+!package-lock.json
+!tauri.conf.json
+
+# Logs
+logs/
+*.log

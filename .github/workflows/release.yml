@@ -1,0 +1,138 @@
+name: Release
+# Tag-triggered 3-OS build. Until the client source drop lands in this
+# repository, the pinned-engine test battery is skipped (hashFiles guard);
+# a workflow_dispatch run builds and signs but publishes nothing without a tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      production_signing:
+        description: Use configured OS publisher-signing credentials
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+          cache-on-failure: true
+      - run: python -m pip install -r desktop/requirements-worker.txt
+      - name: Pinned-engine test battery
+        if: hashFiles('desktop/engine/ember_client.py') != ''
+        run: python -c "import sys, unittest; sys.path.insert(0, 'desktop/engine'); unittest.main(module=None, argv=['unittest', 'test_ember_client', 'test_ember_browser_lifecycle.BrowserLifecycleTests', 'test_ember_browser_lifecycle.ClientRecoveryTests', 'test_ember_opportunity', 'test_ember_history', 'test_ember_market_readiness.ReadinessBudgetTests', 'test_ember_signal_service', 'test_frozen_h2h', 'test_ember_upcoming', 'test_ember_device_test', 'test_ember_stream', 'test_ember_browser_preparation', 'test_tt_market_semantics', 'test_tt_market_exec', 'test_draftkings_live'])"
+      - run: python desktop/build_worker.py
+      - run: python desktop/verify_bundle.py
+      - run: npm ci
+        working-directory: desktop
+      - run: npx tauri icon icon.svg
+        working-directory: desktop
+      - name: Build signature-verified update bundle
+        working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.EMBER_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.EMBER_UPDATER_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ inputs.production_signing && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ inputs.production_signing && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ inputs.production_signing && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          APPLE_ID: ${{ inputs.production_signing && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ inputs.production_signing && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.production_signing && secrets.APPLE_TEAM_ID || '' }}
+          EMBER_PRODUCTION_SIGNING: ${{ inputs.production_signing || false }}
+        run: python build_native.py --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Publish canonical release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          BUNDLE="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          OUT="$(mktemp -d)"
+          publish() {  # publish <file> <canonical-name>; sha256 sidecars for every artifact
+            cp "$1" "$OUT/$2"
+            shasum -a 256 "$OUT/$2" | awk '{print $1"  "$2}' > "$OUT/$2.sha256"
+          }
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            NSIS="$BUNDLE/nsis/Ember_${VER}_x64-setup.exe"
+            publish "$NSIS" "Ember_${VER}_x64-setup.exe"
+            cp "$NSIS" "$OUT/Ember-Setup-x64.exe"
+            shasum -a 256 "$OUT/Ember-Setup-x64.exe" | awk '{print $1"  Ember-Setup-x64.exe"}' > "$OUT/Ember-Setup-x64.exe.sha256"
+            publish "$NSIS" "ember-${VER}-windows-x86_64.exe"
+            publish "$NSIS.sig" "ember-${VER}-windows-x86_64.exe.sig"
+          elif [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            publish "$BUNDLE/dmg/Ember_${VER}_aarch64.dmg" "Ember_${VER}_aarch64.dmg"
+            cp "$BUNDLE/dmg/Ember_${VER}_aarch64.dmg" "$OUT/Ember-aarch64.dmg"
+            shasum -a 256 "$OUT/Ember-aarch64.dmg" | awk '{print $1"  Ember-aarch64.dmg"}' > "$OUT/Ember-aarch64.dmg.sha256"
+            publish "$BUNDLE/macos/Ember.app.tar.gz" "ember-${VER}-darwin-aarch64.app.tar.gz"
+            publish "$BUNDLE/macos/Ember.app.tar.gz.sig" "ember-${VER}-darwin-aarch64.app.tar.gz.sig"
+          else
+            publish "$BUNDLE/dmg/Ember_${VER}_x64.dmg" "Ember_${VER}_x64.dmg"
+            cp "$BUNDLE/dmg/Ember_${VER}_x64.dmg" "$OUT/Ember-x64.dmg"
+            shasum -a 256 "$OUT/Ember-x64.dmg" | awk '{print $1"  Ember-x64.dmg"}' > "$OUT/Ember-x64.dmg.sha256"
+            publish "$BUNDLE/macos/Ember.app.tar.gz" "ember-${VER}-darwin-x86_64.app.tar.gz"
+            publish "$BUNDLE/macos/Ember.app.tar.gz.sig" "ember-${VER}-darwin-x86_64.app.tar.gz.sig"
+          fi
+          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          gh release upload "$GITHUB_REF_NAME" "$OUT"/* -R "$GITHUB_REPOSITORY" --clobber
+  tap:
+    needs: native
+    if: startsWith(github.ref, 'refs/tags/v') && vars.EMBER_TAP_REPO != ''
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Refresh the Homebrew cask to the tagged release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.EMBER_TAP_TOKEN }}
+          TAP_REPO: ${{ vars.EMBER_TAP_REPO }}
+          RELEASE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${RELEASE#v}"
+          SHA_ARM64="$(gh release view "$RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | select(.name=="Ember_'"$VER"'_aarch64.dmg") | .digest' | sed 's/^sha256://')"
+          SHA_X64="$(gh release view "$RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | select(.name=="Ember_'"$VER"'_x64.dmg") | .digest' | sed 's/^sha256://')"
+          CASK="$(printf 'cask "ember" do\n  on_arm do\n    url "https://github.com/%s/releases/download/%s/Ember_%s_aarch64.dmg"\n    sha256 "%s"\n  end\n  on_intel do\n    url "https://github.com/%s/releases/download/%s/Ember_%s_x64.dmg"\n    sha256 "%s"\n  end\n  version "%s"\n  name "Ember"\n  desc "Live table-tennis signal client"\n  homepage "https://getembersignals.com"\n  app "Ember.app"\nend\n' \
+            "$GITHUB_REPOSITORY" "$RELEASE" "$VER" "$SHA_ARM64" \
+            "$GITHUB_REPOSITORY" "$RELEASE" "$VER" "$SHA_X64" "$VER")"
+          CONTENT="$(printf '%s' "$CASK" | base64 -w0)"
+          SHA="$(gh api "repos/$TAP_REPO/contents/Casks/ember.rb" --jq .sha 2>/dev/null || true)"
+          if [ -n "$SHA" ]; then
+            gh api "repos/$TAP_REPO/contents/Casks/ember.rb" --method PUT \
+              -f message="brew: ember $VER" -f content="$CONTENT" -f sha="$SHA" >/dev/null
+          else
+            gh api "repos/$TAP_REPO/contents/Casks/ember.rb" --method PUT \
+              -f message="brew: ember $VER" -f content="$CONTENT" >/dev/null
+          fi
