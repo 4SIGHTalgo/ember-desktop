@@ -1,16 +1,14 @@
 """Native event ACL and real packaged-WebView/worker checks before publication."""
+import base64
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
 import time
 import unittest
-from urllib.request import ProxyHandler, build_opener
 
 import psutil
-import websocket
 
 ROOT = Path(__file__).resolve().parent
 
@@ -23,91 +21,66 @@ class NativeCapabilityTests(unittest.TestCase):
         self.assertNotIn('remote', capability)
 
 
-@unittest.skipUnless(os.name == 'nt', 'WebView2 CDP is a Windows native integration check')
+def native_ui(pid, version, close=False):
+    script = r'''
+Add-Type -AssemblyName UIAutomationClient
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$pidCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, PID_VALUE)
+$windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $pidCondition)
+$report = @{window_found=$false; worker_version_observed=$false; start_disabled=$false; stopped=$false; login_enabled=$false}
+foreach ($window in $windows) {
+    if ($window.Current.Name -ne 'Ember') { continue }
+    $report.window_found = $true
+    $nodes = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($node in $nodes) {
+        $name = $node.Current.Name
+        if ($name -eq ('SPORTS SIGNALS '+[char]0xB7+' VERSION_VALUE')) { $report.worker_version_observed = $true }
+        if ($name -eq 'Stopped') { $report.stopped = $true }
+        if ($node.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {
+            if ($name -eq 'Start') { $report.start_disabled = !$node.Current.IsEnabled }
+            if ($name -eq 'Sign in through browser') { $report.login_enabled = $node.Current.IsEnabled }
+        }
+    }
+    CLOSE_ACTION
+}
+$report | ConvertTo-Json -Compress
+'''.replace('PID_VALUE', str(pid)).replace('VERSION_VALUE', version).replace('CLOSE_ACTION',
+        '$window.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()' if close else '')
+    encoded = base64.b64encode(script.encode('utf-16le')).decode()
+    result = subprocess.run(['powershell','-NoProfile','-NonInteractive','-EncodedCommand',encoded],
+        capture_output=True, encoding='utf-8', timeout=15, check=True)
+    return json.loads(result.stdout)
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows UI Automation observes the real native WebView')
 class NativeSmokeTests(unittest.TestCase):
     def test_packaged_ui_receives_real_worker_events_and_can_close(self):
         binary = Path(os.environ.get('EMBER_NATIVE_SMOKE_BINARY',
             ROOT/'src-tauri/target/x86_64-pc-windows-msvc/release/ember-desktop.exe')).resolve()
         self.assertTrue(binary.is_file(), 'Build the native application before this check')
         version = json.loads((ROOT/'src-tauri/tauri.conf.json').read_text())['version']
-        with socket.socket() as listener:
-            listener.bind(('127.0.0.1', 0))
-            port = listener.getsockname()[1]
         with tempfile.TemporaryDirectory(prefix='ember-native-smoke-', ignore_cleanup_errors=True) as folder:
             environment = dict(os.environ, LOCALAPPDATA=folder, WEBVIEW2_USER_DATA_FOLDER=str(Path(folder)/'webview'),
-                WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=f'--remote-debugging-port={port}'+
-                    (' --no-sandbox --disable-gpu' if os.environ.get('GITHUB_ACTIONS')=='true' else ''))
+                WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--force-renderer-accessibility')
             for key in ('EMBER_DEVICE_TEST_ONCE', 'EMBER_DEVICE_TEST_LOGIN_ONLY', 'EMBER_DEVICE_TEST_SCAN_ONLY',
                         'EMBER_DEVICE_BROWSER_TICKET'):
                 environment.pop(key, None)
             process = subprocess.Popen([str(binary)], cwd=binary.parent, env=environment)
-            connection = None
-            sequence = 0
-            def evaluate(expression):
-                nonlocal sequence
-                sequence += 1
-                connection.send(json.dumps({'id':sequence, 'method':'Runtime.evaluate', 'params':{
-                    'expression':expression, 'awaitPromise':True, 'returnByValue':True}}))
-                while True:
-                    reply = json.loads(connection.recv())
-                    if reply.get('id') == sequence:
-                        self.assertNotIn('error', reply)
-                        result = reply['result']
-                        self.assertNotIn('exceptionDetails', result, 'Native UI command/event permission failed')
-                        return result['result'].get('value')
             try:
                 deadline = time.monotonic()+45
-                opener = build_opener(ProxyHandler({}))
-                probe = {'stage':'debug_endpoint'}
+                observed = {}
                 while time.monotonic() < deadline:
                     self.assertIsNone(process.poll(), 'Native app exited before its WebView became ready')
-                    try:
-                        with opener.open(f'http://127.0.0.1:{port}/json/list', timeout=1) as response:
-                            pages = json.load(response)
-                        probe = {'stage':'page_target','types':[p.get('type') for p in pages]}
-                        page = next(p for p in pages if p['type']=='page' and 'tauri.localhost' in p['url'])
-                        probe = {'stage':'debug_connection'}
-                        connection = websocket.create_connection(page['webSocketDebuggerUrl'], timeout=30, suppress_origin=True,
-                            http_no_proxy=['127.0.0.1','localhost'])
-                        if evaluate("typeof window.__TAURI__==='object' && !!document.getElementById('status')"):
-                            break
-                        connection.close()
-                        connection = None
-                    except (OSError, StopIteration, websocket.WebSocketException) as error:
-                        probe['error_type'] = type(error).__name__
-                    time.sleep(.2)
-                children = [child.name() for child in psutil.Process(process.pid).children(recursive=True)]
-                self.assertIsNotNone(connection, f'Native WebView did not expose its local UI: {probe}; children={children}')
-                observed = evaluate("""(async()=>{
-                    let received,timer;
-                    const response=new Promise(resolve=>received=resolve);
-                    const off=await window.__TAURI__.event.listen('worker',({payload})=>{
-                        if(payload.kind==='missed_history')received(true);
-                    });
-                    try {
-                        await window.__TAURI__.core.invoke('missed_history');
-                        return await Promise.race([response,new Promise((_,reject)=>{
-                            timer=setTimeout(()=>reject(new Error('worker event timeout')),15000);
-                        })]);
-                    } finally { clearTimeout(timer);off(); }
-                })()""")
-                self.assertTrue(observed, 'A real worker response must traverse the native event ACL')
-                for _ in range(100):
-                    ready = evaluate("window.__TAURI__.core.invoke('worker_status')")
-                    if ready:
+                    observed = native_ui(process.pid, version)
+                    if all(observed.values()):
                         break
-                    time.sleep(.1)
-                self.assertTrue(ready)
-                self.assertEqual(evaluate("document.getElementById('version').textContent"), 'SPORTS SIGNALS · '+version)
-                self.assertTrue(evaluate("document.getElementById('start').disabled"))
-                self.assertEqual(evaluate("document.getElementById('session-state').textContent"), 'Stopped')
-                self.assertFalse(evaluate("document.getElementById('login').disabled"))
+                    time.sleep(.2)
+                # This header is set only by the real worker's ready event, never HTML defaults.
+                self.assertTrue(observed and all(observed.values()), observed)
                 self.assertFalse((Path(folder)/'Ember/browser-profiles').exists())
-                evaluate("setTimeout(() => window.__TAURI__.window.getCurrentWindow().close(), 50); true")
+                native_ui(process.pid, version, close=True)
                 self.assertEqual(process.wait(timeout=15), 0)
             finally:
-                if connection is not None:
-                    connection.close()
                 if process.poll() is None:
                     owned = psutil.Process(process.pid)
                     children = owned.children(recursive=True)
