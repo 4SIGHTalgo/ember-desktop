@@ -38,9 +38,22 @@ def emit(stage, **fields):
 def chrome_version(binary):
     try:
         result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=20)
-        return (result.stdout or result.stderr).strip()[:120] or None
+        version = (result.stdout or result.stderr).strip()[:120]
+        if version:
+            return version
     except (OSError, subprocess.SubprocessError):
-        return None
+        pass
+    # shortcut: chrome.exe is a GUI-subsystem app and often prints nothing to
+    # a pipe on Windows; read the executable's file version instead.
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                      f"(Get-Item -LiteralPath '{binary}').VersionInfo.ProductVersion"],
+                                     capture_output=True, text=True, timeout=20)
+            return (result.stdout or "").strip()[:120] or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return None
 
 
 def fixture_server(marker):
