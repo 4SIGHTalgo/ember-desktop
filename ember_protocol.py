@@ -10,7 +10,7 @@ from conservative_policy import contract_id
 from execution_policy import allows_bet, allows_payload, ALLOWED_FAMILIES, DISTRIBUTION_FAMILIES, DISTRIBUTION_MARKETS
 from tt_market_semantics import entry_window, name_key, score_state
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 PROTOCOL = 1
 PROTOCOL_V2 = 2
 
