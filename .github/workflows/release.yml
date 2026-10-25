@@ -49,6 +49,11 @@ jobs:
         run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_client', 'test_ember_history', 'test_ember_opportunity', 'test_ember_device_test', 'test_ember_stream', 'test_ember_browser_preparation', 'test_ember_market_readiness.ReadinessBudgetTests', 'test_tt_market_semantics', 'test_tt_market_exec', 'test_execution_policy', 'test_draftkings_live'])"
       - run: python desktop/build_worker.py
       - run: python desktop/verify_bundle.py
+      - name: Discover Chrome for the packaged startup gate
+        run: python -c "from ember_browser_lifecycle import chrome_binary; import subprocess; binary = chrome_binary(); print(binary); print(subprocess.run([binary, '--version'], capture_output=True, text=True).stdout.strip())"
+      - name: Packaged worker startup smoke (required before publication)
+        run: python -m unittest desktop.test_startup_smoke -v
+        timeout-minutes: 30
       - run: npm ci
         working-directory: desktop
       - run: npx tauri icon icon.svg

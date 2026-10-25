@@ -3,10 +3,10 @@ import json
 import os
 import platform
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tomllib
-import runpy
 
 ROOT = Path(__file__).resolve().parent.parent
 DESKTOP = ROOT / "desktop"
@@ -31,16 +31,28 @@ if ENGINE != ROOT and (ENGINE/"ember_client.py").read_bytes().replace(b"\r\n", b
     raise SystemExit("The pinned client is stale; run desktop/snapshot_engine.py before building.")
 binary_dir = DESKTOP / "src-tauri/binaries"
 binary_dir.mkdir(parents=True, exist_ok=True)
-arguments = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile",
-             "--name", "ember-worker-" + target, "--distpath", str(binary_dir),
-             "--workpath", str(DESKTOP/"build/worker"), "--specpath", str(DESKTOP/"build"),
-             "--paths", str(ENGINE),               "--collect-all", "selenium", "--collect-all", "keyring",
-              "--hidden-import", "tt_market_semantics",
-              "--hidden-import", "draftkings_login",
-             "--add-data", str(ENGINE/"reveal_next_set.js") + ":.",
-             "--add-data", str(ENGINE/"start_draftkings.ps1") + ":.",
-             str(ENGINE/"ember_client.py")]
-# Keep the checkout's research modules out of PyInstaller's import precedence.
-# The entry point and every browser dependency must resolve from this snapshot.
-subprocess.run(arguments, check=True, cwd=ENGINE, env=dict(os.environ, PYTHONPATH=str(ENGINE)))
-print("Native worker built:", binary_dir / ("ember-worker-" + target + suffix))
+
+
+def build(engine, entry, name):
+    """Bundle one PyInstaller onefile binary with the pinned worker recipe.
+
+    shortcut: name only picks the output; every flag is shared with the
+    released worker bundle so startup stays representative.
+    """
+    arguments = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile",
+                 "--name", name, "--distpath", str(binary_dir),
+                 "--workpath", str(DESKTOP/"build/worker"), "--specpath", str(DESKTOP/"build"),
+                 "--paths", str(engine),               "--collect-all", "selenium", "--collect-all", "keyring",
+                 "--hidden-import", "tt_market_semantics",
+                 "--hidden-import", "draftkings_login",
+                 "--add-data", str(engine/"reveal_next_set.js") + ":.",
+                 "--add-data", str(engine/"start_draftkings.ps1") + ":.",
+                 str(entry)]
+    # Keep the checkout's research modules out of PyInstaller's import precedence.
+    # The entry point and every browser dependency must resolve from this snapshot.
+    subprocess.run(arguments, check=True, cwd=engine, env=dict(os.environ, PYTHONPATH=str(engine)))
+
+
+if __name__ == "__main__":
+    build(ENGINE, ENGINE/"ember_client.py", "ember-worker-" + target)
+    print("Native worker built:", binary_dir / ("ember-worker-" + target + suffix))
