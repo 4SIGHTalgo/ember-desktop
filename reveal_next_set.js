@@ -1,6 +1,6 @@
 // Reveal one exact market; selection buttons are never clicked.
 const config = arguments[0];
-const watcherVersion = 5;
+const watcherVersion = 6;
 let state = window.__ttNextSetWatch;
 if (state && (!config || state.key !== config.key || state.version !== watcherVersion)) {
     state.observer.disconnect();
@@ -26,6 +26,7 @@ if (!state) {
         state.status = 'waiting';
         state.reason = null;
         state.missingRow = false;
+        if (loadNotice()) { state.reason = 'provider load error; preparation paused'; return; }
         if (location.href.split('?')[0] !== state.config.pageUrl || Date.now() > state.config.validUntil) { state.reason = 'page changed or data expired'; return; }
         const scoreboards = [...document.querySelectorAll('.cms-event-scoreboard-container')];
         if (!scoreboards.some(scoreboard => scoreboard.getClientRects().length && state.config.players.every(p =>

@@ -137,6 +137,20 @@ class DashboardBrowserTests(unittest.TestCase):
         self.assertTrue(self.value("ev-value").startswith("−"))
         self.assertEqual(self.driver.find_element("id", "check-ev").get_attribute("data-passed"), "false")
 
+    def test_visible_current_odds_are_distinguished_from_a_stale_verified_score(self):
+        for stale_field,expected in (('score_at','Score stale'),('market_at','Quote stale')):
+            with self.subTest(stale_field=stale_field):
+                view=self.show()
+                view[stale_field]=(datetime.now(timezone.utc)-timedelta(seconds=20)).isoformat()
+                self.emit(kind='scanner',connected=True,healthy=True,server_offset=0,
+                    received_at=datetime.now(timezone.utc).isoformat(),snapshot={'opportunity':view})
+                self.assertEqual(self.value('opportunity-stage'),expected)
+                self.assertIn('2.00',self.value('market-name'))
+                self.assertIn('Quote last verified',self.value('decision-reason'))
+                self.assertIn('score last verified',self.value('decision-reason'))
+                self.assertEqual(self.value('ev-value'),'—')
+                self.assert_no_start()
+
     def test_strategy_kelly_and_balance_percent_reach_native_start_and_persist(self):
         from selenium.webdriver.support.ui import Select
         self.emit(kind="signed_in", enabled=True, supported=True)

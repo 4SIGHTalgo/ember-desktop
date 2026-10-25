@@ -56,6 +56,9 @@ class BrowserPreparation:
         if not feed_ready:
             self.publish("waiting_feed", "Live source connection is paused; browser preparation is waiting for fresh data.", self.key[0] if self.key else None)
             return
+        if self.market_readiness is not None and not self.market_readiness.provider_ready(driver):
+            self.publish('provider_loading', self.market_readiness.error_reason)
+            return
         if not hint or server_now >= timestamp(hint["expires_at"]):
             if hold:
                 self.no_hint_since = None

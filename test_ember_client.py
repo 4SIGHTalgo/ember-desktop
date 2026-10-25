@@ -244,6 +244,7 @@ class ProtocolV2Tests(unittest.TestCase):
         client.signals.get.side_effect = deliver
         client.signals.get_nowait.side_effect = queue.Empty
         driver = Mock(current_url=core.LEAGUE_URL)
+        driver.execute_script.return_value = {'present': False}
         owner = Mock(retained=False)
         owner.open.return_value = driver
         owner.recovery.return_value = "closed"
@@ -298,6 +299,7 @@ class ProtocolV2Tests(unittest.TestCase):
         client.signals.get.side_effect = deliver
         client.signals.get_nowait.side_effect = queue.Empty
         driver = Mock(current_url=core.LEAGUE_URL)
+        driver.execute_script.return_value = {'present': False}
         owner = Mock(retained=False)
         owner.open.return_value = driver
         owner.recovery.return_value = "closed"
@@ -467,7 +469,7 @@ class ProviderStartupTests(unittest.TestCase):
             client.device_test.begin(1)
             self.assertFalse(client.device_test.claim({"id": 1, "payload": {"event": {"eventId": "1"}}}))
         driver = Mock(current_url="about:blank")
-        driver.execute_script.return_value = {}
+        driver.execute_script.return_value = {'present': False}
         owner = Mock(retained=False)
         owner.open.return_value = driver
         owner.recovery.return_value = "closed"

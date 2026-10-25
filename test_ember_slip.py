@@ -177,6 +177,61 @@ class MultiLegBrowserTests(unittest.TestCase):
     def assert_unstaked(self):
         self.assertTrue(self.js("return [...document.querySelectorAll('input')].every(e=>Number(e.value)===0)"))
 
+    def native_tracking(self):
+        self.js("""for(const card of document.querySelectorAll('section')){
+            card.dataset.testid='single-card';
+            const remove=card.querySelector('[data-tracking]');
+            const selection=JSON.parse(remove.getAttribute('data-tracking'));
+            remove.setAttribute('data-tracking',JSON.stringify({event:'click',target:'Remove pick',
+                screen:'dk-web-betslip',selectionId:selection.selectionId}));
+            card.querySelector('.line').__reactFiber$fixture={memoizedProps:{selection},return:null};
+        }""")
+
+    def test_native_selection_only_tracking_uses_scoped_provider_identity_and_executes_exact_leg(self):
+        self.native_tracking()
+        snapshot = execution.read_plan_slip(self.driver)
+        self.assertEqual(snapshot['status'], 'present')
+        self.assertEqual([(r['eventId'],r['marketId'],r['selectionId']) for r in snapshot['legs']],
+                         [('10','m2','s1'),('10','m3','s2'),('11','m2','s3')])
+        self.assertEqual(self.js('return window.actions.length'), 0)
+        result = self.run_plan(1)
+        self.assertEqual(result['status'], 'placed')
+        self.assertEqual(self.js('return window.actions[0].length'), 1)
+        self.assertEqual(self.js('return window.actions[0][0].tracking.selectionId'), 's2')
+        self.assert_unstaked()
+
+    def test_native_identity_never_guesses_missing_conflicting_or_external_evidence(self):
+        mutations = (
+            "delete card.querySelector('.line').__reactFiber$fixture",
+            "delete record.marketId",
+            "record.selectionId='another-selection'",
+            "record.eventId=true",
+            "card.querySelector('input').__reactFiber$other={memoizedProps:{selection:{...record,eventId:'other'}},return:null}",
+            "remove.setAttribute('data-tracking',JSON.stringify({...record,eventId:'other'}))",
+            "card.querySelector('.line').__reactFiber$fixture={stateNode:document.body,memoizedProps:{selection:record},return:null}",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.reset()
+                self.native_tracking()
+                self.js("const card=document.querySelector('section'),remove=card.querySelector('[data-tracking]'),record=card.querySelector('.line').__reactFiber$fixture.memoizedProps.selection;"+mutation)
+                authorize = Mock()
+                self.assertEqual(execution.read_plan_slip(self.driver)['status'], 'unsupported')
+                self.assertEqual(self.run_plan(authorize=authorize)['submissionState'], 'not-submitted')
+                authorize.assert_not_called()
+                self.assertEqual(self.js('return window.actions.length'), 0)
+                self.assert_unstaked()
+
+    def test_provider_load_error_appearing_after_claim_aborts_without_a_submit_or_replay(self):
+        def authorize(quote):
+            self.js("const toast=document.createElement('div');toast.setAttribute('role','alert');toast.textContent=\"Oops-something didn't load right. We're on it. Try again in a sec.\";document.body.appendChild(toast)")
+            return {'stake':2.61,'min_decimal':2.0,'echo':'fixture'}
+        result = self.run_plan(authorize=authorize)
+        self.assertEqual(result['submissionState'], 'not-submitted')
+        self.assertIn('provider load error', result['reason'])
+        self.assertEqual(self.js('return window.actions.length'), 0)
+        self.assert_unstaked()
+
     def test_snapshot_and_ready_helpers_never_write_stakes_or_click(self):
         snapshot = execution.read_plan_slip(self.driver)
         self.assertTrue(snapshot['stagingSafe'])

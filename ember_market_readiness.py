@@ -1,7 +1,7 @@
 """Non-wager market warmup and deadline-bounded recovery of transient UI states."""
 import time
 
-from tt_market_exec import plan_slip_ready, read_plan_slip
+from tt_market_exec import LOAD_RECOVERY_SCRIPT, plan_slip_ready, read_plan_slip
 
 
 PROVIDER_HOST = "sportsbook.draftkings.com"
@@ -41,10 +41,28 @@ return {status:'ready',reason:null};
 class MarketReadiness:
     def __init__(self, core, clock=time.monotonic, sleep=time.sleep):
         self.core, self.clock, self.sleep = core, clock, sleep
+        self.retry_at = 0
+        self.load_errors = 0
+        self.error_reason = 'provider load error; preparation paused'
+
+    def provider_ready(self, driver):
+        if self.load_errors >= 3 or self.clock() < self.retry_at:
+            return False
+        state = driver.execute_script(LOAD_RECOVERY_SCRIPT, {})
+        if not isinstance(state, dict) or state.get('present') is not False:
+            self.retry_at = self.clock()+5
+            self.load_errors += 1
+            if self.load_errors >= 3:
+                self.error_reason = 'repeated provider load errors; press Stop then Start after the provider recovers'
+                driver.execute_script(self.core.REVEAL_SCRIPT, None)
+            return False
+        return True
 
     def prepare(self, driver, event, market, valid, remaining, plan=None, max_wait=.3, staging=False):
         """One shared FIFO turn; an exact ready slip leg needs no board at all."""
         deadline = self.clock()+max_wait
+        if not self.provider_ready(driver):
+            return {'status': 'not_ready', 'reason': self.error_reason, 'attempts': 0, 'wait_ms': 0}
         if plan is not None and valid() and plan_slip_ready(driver, event, market, plan):
             return {"status": "revealed", "staged": True, "attempts": 0, "wait_ms": 0}
         if plan is not None:
@@ -82,6 +100,8 @@ class MarketReadiness:
         return False
 
     def warm(self, driver, event, hint):
+        if not self.provider_ready(driver):
+            return {'status': 'waiting', 'reason': self.error_reason}
         family = hint.get("betType", "split")
         surface = self.core.market_surface(hint)
         if not self.core.correct_event(driver, event):
@@ -96,6 +116,8 @@ class MarketReadiness:
         return reading if isinstance(reading, dict) else {"status": "waiting", "reason": "market surface not ready"}
 
     def open(self, driver, event, market, valid, remaining, reserve=.6, max_wait=None):
+        if not self.provider_ready(driver):
+            return {'status': 'not_ready', 'reason': self.error_reason, 'attempts': 0, 'wait_ms': 0}
         started = self.clock()
         deadline = started+max(0, remaining()-reserve)
         if max_wait is not None:

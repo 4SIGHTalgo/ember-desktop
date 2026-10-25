@@ -37,6 +37,22 @@ class BrowserPreparationTests(unittest.TestCase):
         self.assertEqual(self.driver.current_url, self.core.LEAGUE_URL)
         self.assertEqual(self.notify.call_args.kwargs["state"], "league_standby")
 
+    def test_provider_load_error_prevents_navigation_and_warmup_until_rechecked(self):
+        readiness = Mock()
+        readiness.provider_ready.side_effect = [False, False, True]
+        readiness.warm.return_value = {'status':'ready'}
+        self.preparation.market_readiness = readiness
+        self.step(self.hint)
+        self.step(self.hint)
+        self.assertEqual(self.notify.call_args.kwargs['state'],'provider_loading')
+        self.assertEqual(self.events,[])
+        self.core.open_props.assert_not_called()
+        readiness.warm.assert_not_called()
+        self.step(self.hint)
+        self.assertEqual(self.events,['grace'])
+        self.core.open_props.assert_called_once()
+        readiness.warm.assert_called_once()
+
     def test_candidate_navigation_marks_login_loading_grace_before_opening_event(self):
         self.core.open_props.side_effect = lambda *args, **kwargs: self.events.append("event") or True
         self.step(self.hint)

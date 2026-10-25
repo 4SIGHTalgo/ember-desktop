@@ -57,7 +57,18 @@ BROWSER_SILENCE_LIMIT = 180
 # Losing the window or the session is the only browser state nothing can recover
 # from in place, so it still ends the run.
 FATAL_BROWSER_ERRORS = (InvalidSessionIdException, NoSuchWindowException, DriverConnectionLost)
-REVEAL_SCRIPT = (ROOT / "reveal_next_set.js").read_text(encoding="utf-8")
+VISIBLE_UI_JS = """
+const visibleUI = element => {
+    if (!element || !element.getClientRects().length) return false;
+    for (let node = element; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse'
+            || Number(style.opacity) === 0 || style.contentVisibility === 'hidden') return false;
+    }
+    return true;
+};
+"""
+REVEAL_SCRIPT = VISIBLE_UI_JS + SUBMISSION_UI_JS + (ROOT / "reveal_next_set.js").read_text(encoding="utf-8")
 
 
 def correct_event(browser, event):
@@ -340,7 +351,8 @@ class BrowserTroubles:
             self.last_notice = now
 
 
-CLICK_SCRIPT = """
+CLICK_SCRIPT = VISIBLE_UI_JS + SUBMISSION_UI_JS + """
+if(loadNotice())return {status:'blocked',reason:'provider load error; selection clicks paused'};
 const cfg = arguments[0];
 if (cfg.validUntil && Date.now() > cfg.validUntil) {
     return {status: 'aborted', reason: 'selection quote expired before the click'};
@@ -422,18 +434,6 @@ return result?{testId:result.testId,nativeClicks:result.nativeClicks,pointerDown
 # betslip-wager-box-input (name="stake") and submission is betslip-place-bet-button.
 # The button's label is dynamic (it reads "Accept Odds Changes" after a price move),
 # so it is matched by test id, never by text.
-VISIBLE_UI_JS = """
-const visibleUI = element => {
-    if (!element || !element.getClientRects().length) return false;
-    for (let node = element; node; node = node.parentElement) {
-        const style = getComputedStyle(node);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse'
-            || Number(style.opacity) === 0 || style.contentVisibility === 'hidden') return false;
-    }
-    return true;
-};
-"""
-
 MARKET_SECTION_SCRIPT = VISIBLE_UI_JS + """
 const normalize=s=>s.replace(/[\\s\\u2013\\u2014-]+/g,' ').trim().toLowerCase();
 const titles=(Array.isArray(arguments[0])?arguments[0]:[arguments[0]]).map(normalize);
@@ -740,6 +740,7 @@ check();
 """
 
 CONFIRM_PLAN_SCRIPT = LOCATION_READER_JS + PLAN_SLIP_READER_JS + SUBMISSION_UI_JS + """
+if(loadNotice())return {status:'aborted',uiRejected:true,notReady:true,reason:'provider load error before submission'};
 const locationState = readDkLocation();
 if (locationState.blocked) return {status: 'aborted', locationBlocked: true,
     location: locationState, reason: locationState.message};

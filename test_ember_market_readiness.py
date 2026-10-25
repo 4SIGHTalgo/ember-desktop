@@ -39,6 +39,7 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.core = SimpleNamespace(FATAL_BROWSER_ERRORS=(InvalidSessionIdException,), WebDriverException=WebDriverException,
             BrowserNavigationPending=Pending, REVEAL_SCRIPT="cancel", reveal_set_winner=Mock(), open_props=Mock(return_value=True))
         self.driver = Mock()
+        self.driver.execute_script.return_value = {'present': False}
         self.reader = MarketReadiness(self.core, clock=lambda: self.now, sleep=self.advance)
 
     def advance(self, duration):
@@ -120,6 +121,55 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.assertEqual(self.reader.prepare(self.driver, EVENT, MARKET, lambda: True, lambda: 5)['status'], 'revealed')
         self.core.open_props.assert_not_called()
 
+class ProviderErrorBudgetTests(unittest.TestCase):
+    def test_three_errors_cancel_the_observer_and_require_a_new_explicit_run(self):
+        now=[0.0]
+        driver=Mock();driver.execute_script.return_value={'present':True}
+        core=SimpleNamespace(REVEAL_SCRIPT='cancel',open_props=Mock(),reveal_set_winner=Mock())
+        reader=MarketReadiness(core,clock=lambda:now[0])
+        for second in (0,5,10):
+            now[0]=second
+            self.assertFalse(reader.provider_ready(driver))
+        driver.execute_script.assert_called_with('cancel',None)
+        calls=driver.execute_script.call_count
+        driver.execute_script.return_value={'present':False}
+        now[0]=100
+        self.assertFalse(reader.provider_ready(driver))
+        self.assertIn('Stop then Start',reader.error_reason)
+        self.assertEqual(driver.execute_script.call_count,calls)
+        core.open_props.assert_not_called()
+        core.reveal_set_winner.assert_not_called()
+        self.assertTrue(MarketReadiness(core,clock=lambda:now[0]).provider_ready(driver))
+
+    def test_load_notice_pauses_navigation_across_turns_and_resumes_only_after_positive_recheck(self):
+        now = [0.0]
+        driver = Mock()
+        driver.execute_script.side_effect = [{'present':True},{'present':False}]
+        core = SimpleNamespace(correct_event=Mock(return_value=True), open_props=Mock(),
+            reveal_set_winner=Mock(return_value={'status':'revealed'}))
+        reader = MarketReadiness(core,clock=lambda:now[0])
+        self.assertEqual(reader.prepare(driver,EVENT,MARKET,lambda:True,lambda:10)['status'],'not_ready')
+        now[0] = 4.999
+        self.assertEqual(reader.prepare(driver,EVENT,MARKET,lambda:True,lambda:10)['status'],'not_ready')
+        core.correct_event.assert_not_called()
+        core.open_props.assert_not_called()
+        core.reveal_set_winner.assert_not_called()
+        driver.execute_script.assert_called_once_with(execution.LOAD_RECOVERY_SCRIPT,{})
+        now[0] = 5
+        self.assertEqual(reader.prepare(driver,EVENT,MARKET,lambda:True,lambda:10)['status'],'revealed')
+        self.assertEqual(driver.execute_script.call_count,2)
+        core.reveal_set_winner.assert_called_once_with(driver,EVENT,MARKET)
+
+    def test_unknown_notice_probe_is_not_positive_readiness(self):
+        for result in (None,{},[],{'present':None},{'present':True}):
+            with self.subTest(result=result):
+                driver=Mock();driver.execute_script.return_value=result
+                reader=MarketReadiness(Mock(),clock=lambda:0)
+                self.assertFalse(reader.provider_ready(driver))
+                self.assertFalse(reader.provider_ready(driver))
+                driver.execute_script.assert_called_once_with(execution.LOAD_RECOVERY_SCRIPT,{})
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = f'''<!doctype html><html><body>
@@ -184,6 +234,20 @@ class MarketReadinessBrowserTests(unittest.TestCase):
     def assert_no_wager_actions(self):
         self.assertEqual(self.driver.execute_script("return window.selectionClicks"), 0)
         self.assertEqual(self.driver.execute_script("return window.submitClicks"), 0)
+
+    def test_oops_notice_blocks_expansion_and_observer_resumes_only_when_it_is_removed(self):
+        self.driver.execute_script("const toast=document.createElement('div');toast.id='provider-error';toast.setAttribute('role','alert');toast.textContent=\"Oops-something didn't load right. We're on it. Try again in a sec.\";document.body.appendChild(toast)")
+        result=core.reveal_set_winner(self.driver,self.event,self.market)
+        self.assertIn('provider load error',result['reason'])
+        for _ in range(3):
+            self.assertEqual(self.reader.warm(self.driver,self.event,{'betType':'split'})['status'],'waiting')
+        self.assertEqual(self.driver.execute_script('return window.expansions'),0)
+        self.driver.execute_script("document.getElementById('provider-error').remove()")
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline and not self.driver.execute_script("return window.__ttNextSetWatch.status==='revealed'"):
+            time.sleep(.05)
+        self.assertEqual(self.driver.execute_script('return window.expansions'),1)
+        self.assert_no_wager_actions()
 
     def test_reported_oliver_market_first_waits_then_recovers_when_async_expansion_finishes(self):
         first = core.reveal_set_winner(self.driver, self.event, self.market)

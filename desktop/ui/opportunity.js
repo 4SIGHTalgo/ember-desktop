@@ -79,7 +79,7 @@ window.EmberOpportunity = (() => {
     else if (!view.mapping_verified) { stage = 'Checking matchup'; stageTone = 'warning'; }
     else if (!view.entry_open) { stage = candidates.length ? 'Entry closed' : 'Watching match'; }
     else if (!known(best?.gate_ev)) { stage = 'Waiting for data'; }
-    else if (!pricesCurrent) { stage = 'Quote stale'; stageTone = 'warning'; reason = 'Waiting for current score and odds updates. Live EV is hidden.'; }
+    else if (!pricesCurrent) { stage = scoreAge === null || scoreAge > 5 ? 'Score stale' : 'Quote stale'; stageTone = 'warning'; reason = `Quote last verified ${quoteAge === null ? 'at an unknown time' : `${quoteAge}s ago`}; score last verified ${scoreAge === null ? 'at an unknown time' : `${scoreAge}s ago`}. Visible odds alone do not establish a current score or model EV. Live EV is hidden until both are current.`; }
     else if (view.qualifies) { stage = context.running && context.providerReady ? 'Signal qualified' : 'Qualified · execution stopped'; stageTone = 'positive'; reason = context.running && context.providerReady ? 'Model signal qualified. Local authentication, price, sizing, and entry conditions are checked before submission.' : 'The model signal qualifies. Execution is stopped or awaiting DraftKings readiness.'; }
     else if (!gatePassed) { stage = 'Below EV gate'; reason = view.reason; }
     else { stage = 'Waiting for entry checks'; stageTone = 'warning'; }

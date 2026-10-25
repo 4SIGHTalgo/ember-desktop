@@ -49,6 +49,40 @@ const slipContractText=root=>{
     return copy.textContent.replace(/\$\s*[\d,.]+/g,' ').replace(/\s+/g,' ').trim();
 };
 const zeroStake=input=>!input.value.trim()||/^\d+(?:\.\d+)?$/.test(input.value.trim())&&Number(input.value)===0;
+const slipIdentity=remove=>{
+    const fields=['selectionId','eventId','marketId'];
+    const valid=value=>['string','number'].includes(typeof value)&&String(value).trim()&&
+        (typeof value!=='number'||Number.isSafeInteger(value));
+    const identity=value=>Object.fromEntries(fields.map(k=>[k,String(value[k])]));
+    let tracking;try{tracking=JSON.parse(remove.getAttribute('data-tracking'));}catch(_){return null;}
+    if(!tracking||!valid(tracking.selectionId))return null;
+    const records=[];
+    if('eventId' in tracking||'marketId' in tracking){
+        if(!fields.every(k=>valid(tracking[k])))return null;
+        records.push(identity(tracking));
+    }
+    // Native remove tracking omits event/market; the scoped rendered selection supplies them.
+    const card=remove.closest('[data-testid="single-card"]'),seen=new Set();
+    if(card){
+        if(card.querySelectorAll(removeSelector).length!==1)return null;
+        const nodes=[card,...card.querySelectorAll('*')];
+        if(nodes.length>512)return null;
+        for(const node of nodes){
+            const keys=Object.keys(node).filter(k=>k.startsWith('__reactFiber$'));
+            if(keys.length>1)return null;
+            for(let fiber=node[keys[0]],n=0;fiber&&n<12;fiber=fiber.return,n++){
+                if(fiber.stateNode instanceof Element&&!card.contains(fiber.stateNode))break;
+                if(seen.has(fiber))break;seen.add(fiber);
+                const selection=fiber.memoizedProps?.selection;
+                if(!selection||typeof selection!=='object')continue;
+                if(!fields.every(k=>valid(selection[k]))||String(selection.selectionId)!==String(tracking.selectionId))return null;
+                records.push(identity(selection));
+            }
+        }
+    }
+    const unique=[...new Set(records.map(value=>JSON.stringify(value)))];
+    return unique.length===1?JSON.parse(unique[0]):null;
+};
 const writeSlipStake=(input,value)=>{
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,value);
     input.dispatchEvent(new Event('input',{bubbles:true}));
@@ -69,12 +103,8 @@ const exactSlipSnapshot=()=>{
         return bad('funded stake control outside the slip');
     const legs=[],ids=new Set();
     for(const remove of removes){
-        let tracking;
-        try{tracking=JSON.parse(remove.getAttribute('data-tracking'));}catch(_){return bad('malformed leg tracking');}
-        if(!tracking||['selectionId','eventId','marketId'].some(k=>
-            !['string','number'].includes(typeof tracking[k])||!String(tracking[k]).trim()||
-            typeof tracking[k]==='number'&&!Number.isSafeInteger(tracking[k])))return bad('incomplete leg tracking');
-        const identity=Object.fromEntries(['selectionId','eventId','marketId'].map(k=>[k,String(tracking[k])]));
+        const identity=slipIdentity(remove);
+        if(!identity)return bad('incomplete or conflicting leg identity');
         if(ids.has(identity.selectionId))return bad('duplicate selection ids');
         ids.add(identity.selectionId);
         // The minimal common ancestor must isolate exactly one remove, price and stake.
