@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: Retry an existing version tag using this workflow's corrected build-host setup
+        type: string
+        default: ''
       production_signing:
         description: Use configured OS publisher-signing credentials
         type: boolean
@@ -31,12 +35,19 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Bind publication to the checked-out version tag
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: python -c "import json, os; from pathlib import Path; assert os.environ['RELEASE_TAG'] == 'v'+json.loads(Path('desktop/src-tauri/tauri.conf.json').read_text())['version']"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -76,15 +87,24 @@ jobs:
         run: python build_native.py --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Native WebView receives packaged worker events (required before publication)
         if: runner.os == 'Windows'
-        run: python -m unittest desktop.test_native_smoke -v
+        shell: pwsh
+        run: |
+          # The test isolates LOCALAPPDATA; retain the actual host runtime location.
+          $roots = @("${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application", "$env:ProgramFiles\Microsoft\EdgeWebView\Application", "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application")
+          $runtime = $roots | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter msedgewebview2.exe -Recurse } | Sort-Object { [version]$_.VersionInfo.FileVersion } -Descending | Select-Object -First 1
+          if (!$runtime) { throw 'A native WebView2 runtime is required for the event integration gate' }
+          $env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = $runtime.DirectoryName
+          python -m unittest desktop.test_native_smoke -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Publish canonical release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF_NAME#v}"
+          VER="${RELEASE_TAG#v}"
           BUNDLE="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
           OUT="$(mktemp -d)"
           publish() {  # publish <file> <canonical-name>; sha256 sidecars for every artifact
@@ -111,12 +131,12 @@ jobs:
             publish "$BUNDLE/macos/Ember.app.tar.gz" "ember-${VER}-darwin-x86_64.app.tar.gz"
             publish "$BUNDLE/macos/Ember.app.tar.gz.sig" "ember-${VER}-darwin-x86_64.app.tar.gz.sig"
           fi
-          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes
-          gh release upload "$GITHUB_REF_NAME" "$OUT"/* -R "$GITHUB_REPOSITORY" --clobber
+          gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          gh release upload "$RELEASE_TAG" "$OUT"/* -R "$GITHUB_REPOSITORY" --clobber
   tap:
     needs: native
-    if: startsWith(github.ref, 'refs/tags/v') && vars.EMBER_TAP_REPO != ''
+    if: (startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '') && vars.EMBER_TAP_REPO != ''
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -125,7 +145,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.EMBER_TAP_TOKEN }}
           TAP_REPO: ${{ vars.EMBER_TAP_REPO }}
-          RELEASE: ${{ github.ref_name }}
+          RELEASE: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           VER="${RELEASE#v}"

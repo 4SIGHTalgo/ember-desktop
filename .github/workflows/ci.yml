@@ -67,4 +67,11 @@ jobs:
         run: python build_native.py --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Native WebView receives packaged worker events (no sign-in or wagers)
         if: runner.os == 'Windows'
-        run: python -m unittest desktop.test_native_smoke -v
+        shell: pwsh
+        run: |
+          $roots = @("${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application", "$env:ProgramFiles\Microsoft\EdgeWebView\Application", "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application")
+          $runtime = $roots | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter msedgewebview2.exe -Recurse } | Sort-Object { [version]$_.VersionInfo.FileVersion } -Descending | Select-Object -First 1
+          if (!$runtime) { throw 'A native WebView2 runtime is required for the event integration gate' }
+          $env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = $runtime.DirectoryName
+          python -m unittest desktop.test_native_smoke -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
