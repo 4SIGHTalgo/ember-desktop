@@ -578,7 +578,6 @@ class Client:
 
     def claim_values(self, signal):
         """Claim one observed quote; only the server may size the stake."""
-        plan = signal["payload"]["plan"]
 
         def authorize_values(quote):
             available = (quote.get("balance") or {}).get("availableBalance")
@@ -600,6 +599,10 @@ class Client:
                     self.last_authorize_reason = "claimed_elsewhere"
                 elif str(error) == "signal_expired":
                     self.last_authorize_reason = "signal_expired"
+                elif str(error) == "price_below_floor":
+                    self.last_authorize_reason = "odds_below_ev"
+                elif str(error) == "sizing_failed":
+                    self.last_authorize_reason = "sizing_failed"
                 else:
                     self.lease.revoke()
                 return {"denied": self.last_authorize_reason}
@@ -612,10 +615,11 @@ class Client:
             if (not isinstance(fields, dict) or set(fields) != {"stake_cents", "min_decimal", "echo"}
                     or type(fields.get("stake_cents")) is not int or not 1 <= fields["stake_cents"] <= 10_000_000
                     or type(fields.get("min_decimal")) not in (int, float) or not math.isfinite(fields["min_decimal"])
-                    or fields["min_decimal"] <= 1 or fields["min_decimal"] != plan["min_decimal"]
+                    or fields["min_decimal"] <= 1
                     or not isinstance(fields.get("echo"), str) or not 0 < len(fields["echo"]) <= 200):
                 return {"denied": "authorization_denied"}
-            # The plan floor is context-fixed; the claim only re-derives the stake.
+            # The claim is the sole authority; the signal plan's floor and stake
+            # were provisional display data at the 90% publication bound.
             return {"stake": fields["stake_cents"]/100, "min_decimal": fields["min_decimal"],
                     "echo": fields["echo"]}
 

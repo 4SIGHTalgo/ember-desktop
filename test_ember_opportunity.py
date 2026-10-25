@@ -14,11 +14,17 @@ def make_snapshot(decimal=2.0, closed=False, qualified=True):
                  "probability": .6, "lower_probability": .55, "implied_probability": .5,
                  "estimated_ev": 20.0, "conservative_ev": 10.0, "gate_ev": 10.0,
                  "sample_size": 30, "success_count": 18, "ev_passed": True, "line": None}
+    reason = "eligible"
+    if not qualified:
+        candidate.update(estimated_ev=-.4, conservative_ev=-.5, gate_ev=-.5, ev_passed=False)
+        reason = "conservative net EV does not strictly exceed the EV minimum"
     if closed:
         candidate.update(estimated_ev=None, conservative_ev=None, gate_ev=None)
+        reason = "next set has started; historical start-state window is closed"
     view = {"protocol": 1, "event_id": "10", "players": ["Piotr Zemla", "Tomasz Lojtek"],
-            "set_tally": [1, 0], "points": None, "period": "2nd", "market": "Game 2",
-            "bet_type": "split", "reason": "eligible", "mapping_verified": True,
+            "set_tally": [1, 0], "points": [1, 0] if closed else [0, 0],
+            "period": "2nd", "market": "Game 2",
+            "bet_type": "split", "reason": reason, "mapping_verified": True,
             "entry_open": not closed, "qualifies": qualified and not closed,
             "minimum_ev": 0, "ev_mode": "conservative", "confidence": 95, "history_count": 30,
             "candidates": [candidate],

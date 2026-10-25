@@ -336,7 +336,7 @@ class ProtocolV2Tests(unittest.TestCase):
             self.assertEqual(claim(quote), {"stake": 2.61, "min_decimal": 1.85, "echo": "e1"})
         cases = {"missing echo": {"stake_cents": 261, "min_decimal": 1.85},
                  "zero stake": {"stake_cents": 0, "min_decimal": 1.85, "echo": "e1"},
-                 "floor mismatch": {"stake_cents": 261, "min_decimal": 1.9, "echo": "e1"},
+                 "no floor": {"stake_cents": 261, "min_decimal": 1, "echo": "e1"},
                  "extra field": {"stake_cents": 261, "min_decimal": 1.85, "echo": "e1", "probability": .6}}
         for name, plan in cases.items():
             with self.subTest(case=name):
@@ -345,9 +345,16 @@ class ProtocolV2Tests(unittest.TestCase):
         with self.subTest(case="no plan"):
             with patch.object(client, "request", return_value=dict(lease)):
                 self.assertEqual(claim(quote), {"denied": "authorization_denied"})
+        with self.subTest(case="a stricter claim floor is the authority"):
+            with patch.object(client, "request",
+                              return_value={**lease, "plan": {"stake_cents": 130, "min_decimal": 1.9, "echo": "e2"}}):
+                self.assertEqual(claim(quote), {"stake": 1.30, "min_decimal": 1.9, "echo": "e2"})
         with self.subTest(case="claimed elsewhere"):
             with patch.object(client, "request", side_effect=RuntimeError("contract_claimed_by_another_client")):
                 self.assertEqual(claim(quote), {"denied": "claimed_elsewhere"})
+        with self.subTest(case="server floor refusal"):
+            with patch.object(client, "request", side_effect=RuntimeError("price_below_floor")):
+                self.assertEqual(claim(quote), {"denied": "odds_below_ev"})
         with self.subTest(case="unreadable quote"):
             self.assertEqual(claim({"balance": {}, "decimalOdds": None}), {"denied": "sizing_failed"})
 

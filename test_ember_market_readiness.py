@@ -15,6 +15,7 @@ from selenium.webdriver.chrome.options import Options
 
 from driver_lifecycle import create_owned_chrome
 from ember_market_readiness import MarketReadiness
+import tt_market_exec as core
 import tt_market_exec as execution
 
 
@@ -183,7 +184,7 @@ class MarketReadinessBrowserTests(unittest.TestCase):
         self.assert_no_wager_actions()
 
     def distribution_view(self, name, header, row_label=None):
-        from distribution_policy import MARKETS
+        from execution_policy import MARKET_FAMILIES as MARKETS
         self.market = deepcopy(MARKET)
         self.market['receivedAt'] = self.event['receivedAt']
         self.market.update(name=name, betType=MARKETS[name])
@@ -220,7 +221,7 @@ class MarketReadinessBrowserTests(unittest.TestCase):
                 self.assert_no_wager_actions()
 
     def test_distribution_warmup_uses_the_same_provider_headers_even_without_a_feed_name(self):
-        from distribution_policy import MARKETS
+        from execution_policy import MARKET_FAMILIES as MARKETS
         for name, header in (('Games Spread', 'Spread'), ('Points Spread', 'Spread'),
                              ('Correct Score', 'Correct Score BO5'), ('Total Points', 'Total')):
             with self.subTest(name=name):

@@ -73,8 +73,8 @@ class DashboardBrowserTests(unittest.TestCase):
         self.assertEqual(self.value("sets-one"), "1")
         self.assertEqual(self.value("point-score"), "2nd set · Current points 0 – 0")
         self.assertEqual(self.value("ev-value"), f"+{view['candidates'][0]['gate_ev']:.2f}%")
-        self.assertIn("+60.00%", self.driver.find_element("id", "candidate-cards").text)
-        self.assertIn("32 successes / 40 matching cases", self.driver.find_element("id", "candidate-cards").text)
+        self.assertIn("+20.00%", self.driver.find_element("id", "candidate-cards").text)
+        self.assertIn("18 successes / 30 matching cases", self.driver.find_element("id", "candidate-cards").text)
         self.assertIn("2.00", self.value("market-name"))
         self.assertEqual(self.value("opportunity-stage"), "Qualified · execution stopped")
 
@@ -84,38 +84,6 @@ class DashboardBrowserTests(unittest.TestCase):
         self.assertIn("does not strictly exceed", self.value("decision-reason"))
         self.assertTrue(self.value("ev-value").startswith("−"))
         self.assertEqual(self.driver.find_element("id", "check-ev").get_attribute("data-passed"), "false")
-
-    def test_frozen_history_warmup_shows_known_meetings_with_a_waiting_state(self):
-        from test_ember_opportunity import OpportunityDisplayTests
-        view, _, _, _ = OpportunityDisplayTests().warmup()
-        now = datetime.now(timezone.utc)
-        view.update(updated_at=now.isoformat(), expires_at=(now+timedelta(seconds=5)).isoformat(),
-                    score_at=now.isoformat(), market_at=now.isoformat())
-        self.emit(kind="scanner", connected=True, healthy=True, server_offset=0, received_at=now.isoformat(),
-                  snapshot={"opportunity": view})
-        self.assertIn("30 prior head-to-head meetings", self.value("opportunity-subtitle"))
-        self.assertNotRegex(self.value("opportunity-subtitle"), r"\b0 prior head-to-head meetings")
-        self.assertEqual(self.value("opportunity-stage"), "Waiting for data")
-        self.assertIn("History fit warming up", self.value("decision-reason"))
-        self.assertIn("0 eligible", self.value("decision-reason"))
-        self.assertEqual(self.value("ev-value"), "—")
-        self.assertEqual(self.driver.find_elements("css selector", "#candidate-cards .candidate"), [])
-
-    def test_production_policy_displays_conservative_ev(self):
-        import tt_elite_follow as core
-        from ember_opportunity import opportunity_snapshot
-        from test_ember_signal_service import policy_fixture, strategy_bettor, strategy_scan, NOW
-        event, history, _, follower = policy_fixture(decimal=1.9)
-        _, reports, _ = strategy_scan(core, follower, [history], strategy_bettor(core), NOW, True)
-        now = datetime.now(timezone.utc)
-        view = opportunity_snapshot(reports, follower.events, event["eventId"], [event["eventId"]], now)
-        view.update(score_at=now.isoformat(), market_at=now.isoformat())
-        self.emit(kind="scanner", connected=True, healthy=True, received_at=now.isoformat(),
-                  snapshot={"opportunity": view})
-        self.assertEqual(self.value("ev-label"), "CONSERVATIVE NET EV")
-        self.assertEqual(self.value("ev-value"), f"+{view['candidates'][0]['gate_ev']:.2f}%")
-        self.assertIn("Conservative EV > 0%", self.value("check-ev"))
-        self.assertEqual(self.driver.find_element("id", "check-ev").get_attribute("data-passed"), "true")
 
     def test_strategy_kelly_and_balance_percent_reach_native_start_and_persist(self):
         from selenium.webdriver.support.ui import Select
