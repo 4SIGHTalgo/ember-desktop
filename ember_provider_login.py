@@ -90,8 +90,10 @@ def browser_connection_lost(error):
 
 
 class ProviderLoginGate:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, *, recheck=None, active=None):
         self.clock = clock
+        self.recheck = recheck
+        self.active = active if active is not None else lambda: True
         self.grace_until = clock()+5
         self.open_requested = False
         self.phase = None
@@ -102,10 +104,19 @@ class ProviderLoginGate:
     def poll(self, driver, location_reader):
         state = provider_state(driver)
         location = location_reader(driver)
+        recheck_started = False
+        if self.recheck is not None and state.get('signed_in') and location.get('blocked') and self.active():
+            recheck_started = self.recheck.start(driver, location, validate=self.active)
+            if recheck_started:
+                self.navigation_started()
         confirmed_out = bool(state.get("explicit_signed_out") and self.clock() >= self.grace_until)
         if state.get("signed_in"):
             self.open_requested = False
-            ready = bool(state.get("provider_can_bet") and state.get("native_wagering_grant") and not location.get("blocked"))
+            ready = bool(state.get("provider_can_bet") and state.get("native_wagering_grant") and not location.get("blocked") and self.active())
+            if self.recheck is not None and self.recheck.report.get('attempted'):
+                ready = ready and state.get('document_ready') is True and self.clock() >= self.recheck.hold_until
+                if ready:
+                    self.recheck.permission_observed()
             phase = "ready" if ready else "awaiting_location"
         else:
             ready = False
@@ -115,19 +126,20 @@ class ProviderLoginGate:
             elif state.get("login_form_visible"):
                 self.open_requested = True
                 phase = "awaiting_signin"
-            elif confirmed_out and not self.open_requested and state.get("document_ready"):
+            elif confirmed_out and not self.open_requested and state.get("document_ready") and self.active():
                 # Reserve before the browser action; a lost reply never repeats
                 # a click into a form where the user may already be typing.
                 self.open_requested = True
                 result = driver.execute_script(OPEN_LOGIN_SCRIPT, {"origin": SPORTSBOOK_URL.rstrip("/")}) or {}
                 if result.get("status") == "ready":
                     try:
-                        result["button"].click()
+                        if self.active():
+                            result["button"].click()
                     except (InvalidSessionIdException, NoSuchWindowException, DriverConnectionLost):
                         raise
                     except WebDriverException:
                         pass  # Leave the browser available for ordinary user sign-in.
-                elif result.get("status") == "missing" and not state.get("auth_route"):
+                elif result.get("status") == "missing" and not state.get("auth_route") and self.active():
                     driver.get(LOGIN_URL)
                 phase = "awaiting_signin"
             else:
@@ -139,7 +151,8 @@ class ProviderLoginGate:
             "awaiting_location": "DraftKings sign-in confirmed. Complete its location verification; waiting for wagering permission.",
             "ready": "DraftKings sign-in and wagering permission confirmed.",
         }
-        message = messages[phase] if phase != self.phase else None
+        message = ('DraftKings location recheck opened; wagering remains paused until native permission returns.'
+                   if recheck_started else messages[phase] if phase != self.phase else None)
         self.phase = phase
         return {**state, "ready": ready, "phase": phase, "message": message,
                 "location": location, "signed_out_confirmed": confirmed_out}

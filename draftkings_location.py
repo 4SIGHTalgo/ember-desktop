@@ -4,7 +4,10 @@ import time
 
 # Shared by the periodic check, slip arming and the final submit command. Browser
 # permission is not evidence that GeoComply accepted the user's real location.
-LOCATION_READER_JS = r"""
+LOCATION_FAILURE_JS = r"""
+const dkLocationFailure = /(?:can(?:not|'t| not)|could(?: not|n't)|unable to|failed to)\s+(?:verify|confirm|determine|detect|establish)\s+(?:your\s+)?(?:current\s+|physical\s+)?location|(?:having )?trouble (?:verifying|confirming|determining) your (?:current )?location|(?:your\s+)?location\s+(?:(?:could|can) not be|cannot be|was not)\s+(?:verified|confirmed|determined)|location verification (?:has )?failed|outside (?:of )?(?:a |the )?(?:permitted|allowed|authorized) (?:area|location)|does(?:n.t| not) (?:look|seem) like you(?:.re| are)? (?:are )?(?:at|in) (?:a |the )?location where you can (?:place bets|bet)/i;
+"""
+LOCATION_READER_JS = LOCATION_FAILURE_JS + r"""
 const readDkLocation = () => {
     const metadata = {pageUrl: location.origin + location.pathname,
                       documentReady: document.readyState === 'complete'};
@@ -23,7 +26,7 @@ const readDkLocation = () => {
         .map(el => el.innerText || ''));
     const lines = [...notices, ...documents.flatMap(doc => (doc.body?.innerText || '').split(/\n/))]
         .map(line => line.replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, ' ').trim()).filter(Boolean);
-    const failure = /(?:can(?:not|'t| not)|could(?: not|n't)|unable to|failed to)\s+(?:verify|confirm|determine|detect|establish)\s+(?:your\s+)?(?:current\s+|physical\s+)?location|(?:having )?trouble (?:verifying|confirming|determining) your (?:current )?location|(?:your\s+)?location\s+(?:(?:could|can) not be|cannot be|was not)\s+(?:verified|confirmed|determined)|location verification (?:has )?failed|outside (?:of )?(?:a |the )?(?:permitted|allowed|authorized) (?:area|location)/i;
+    const failure = dkLocationFailure;
     const pending = /(?:verifying|checking|confirming) your (?:current )?location|location (?:check|verification) (?:is )?in progress/i;
     const required = /^(?:please )?verify your (?:current )?location[.!]?$|location verification (?:is )?required|(?:enable|allow|turn on) (?:your )?location (?:access|services)|(?:install|download|enable) (?:the )?(?:geocomply|player location check)/i;
     for (const [pattern, state] of [[failure, 'blocked'], [pending, 'checking'], [required, 'required']]) {
@@ -43,29 +46,36 @@ LOCATION_STATE_SCRIPT = LOCATION_READER_JS + "return readDkLocation();"
 
 # Verified on the actual failure banner. Return its normal link for a trusted
 # WebDriver click; never infer a retry control from a general "Recheck" label.
-LOCATION_RECHECK_SCRIPT = r"""
-const visible = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
-const matches = [...document.querySelectorAll('.user-status-banner__wrapper')].filter(visible)
-    .filter(el => /trouble verifying your location/i.test((el.innerText || '').replace(/\s+/g, ' ')))
-    .flatMap(el => [...el.querySelectorAll('a[aria-label="Recheck"]')]).filter(visible)
+LOCATION_RECHECK_SCRIPT = LOCATION_FAILURE_JS + r"""
+const origin=new URL(arguments[0]?.origin||'https://sportsbook.draftkings.com').origin;
+if(location.origin!==origin)return {status:'unavailable'};
+const visible = el => {if(!el?.getClientRects().length)return false;for(let p=el;p;p=p.parentElement){
+    const style=getComputedStyle(p);if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)return false;}return true;};
+const matches = [...new Set([...document.querySelectorAll('.user-status-banner__wrapper')].filter(visible)
+    .filter(el => dkLocationFailure.test((el.innerText || '').replace(/[\u2018\u2019]/g,"'").replace(/\s+/g, ' ')))
+    .flatMap(el => [...el.querySelectorAll('a[href]')]).filter(visible)
     .filter(el => {
         const url = new URL(el.href, location.href);
-        return url.origin === 'https://sportsbook.draftkings.com' && url.pathname === '/auth'
+        const label=el.getAttribute('aria-label')||el.textContent||'';
+        return /^(?:recheck|retry|(?:re-?verify|verify) (?:your )?location)$/i.test(label.trim())
+            && url.origin === origin
+            && !url.username && !url.password && url.pathname.replace(/\/$/,'') === '/auth'
             && (!el.target || el.target === '_self') && el.getAttribute('aria-disabled') !== 'true';
-    });
+    }))];
 return matches.length === 1 ? {status: 'ready', link: matches[0]} : {status: 'unavailable'};
 """
 
 
 class LocationRecheck:
-    """One official recheck per run, without resubmitting a wager or looping auth."""
+    """One official recheck until native permission returns; never resubmit a wager."""
 
-    def __init__(self, state=None):
+    def __init__(self, state=None, *, clock=None):
         self.report = dict(state or {"attempted": False})
         self.hold_until = 0
+        self.clock = clock if clock is not None else lambda: time.monotonic()
 
-    def start(self, driver, reading):
-        if self.report.get("attempted") or reading.get("state") != "blocked":
+    def start(self, driver, reading, validate=None):
+        if self.report.get("attempted") or reading.get("state") != "blocked" or validate is not None and not validate():
             return False
         result = driver.execute_script(LOCATION_RECHECK_SCRIPT)
         if not isinstance(result, dict) or result.get("status") != "ready" or result.get("link") is None:
@@ -73,11 +83,18 @@ class LocationRecheck:
         # Reserve the attempt before clicking: a lost WebDriver reply must not
         # replay the /auth action. No login credentials or wager is submitted.
         self.report = {"attempted": True, "status": "attempted", "sourceUrl": reading.get("pageUrl")}
-        self.hold_until = time.monotonic() + 2
+        self.hold_until = self.clock() + 2
+        if validate is not None and not validate():
+            self.report['status'] = 'cancelled'
+            return False
         result["link"].click()
         self.report["status"] = "started"
         print("Location recheck: opened DraftKings' official Recheck link once; waiting for verification.", flush=True)
         return True
+
+    def permission_observed(self):
+        self.report = {'attempted': False, 'status': 'permission_restored'}
+        self.hold_until = 0
 
 
 def update_location(driver, bettor, recheck=None, stage="periodic"):

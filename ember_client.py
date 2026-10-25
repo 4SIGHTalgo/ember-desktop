@@ -32,6 +32,7 @@ from ember_history import OpportunityJournal, reservations, result_reason
 from ember_staging import Staging
 from ember_board import display_board
 from tt_market_exec import read_plan_slip
+from draftkings_location import LocationRecheck
 from conservative_policy import (DEFAULT_LEVEL, DEFAULT_KELLY, DEFAULT_RISK_PERCENT,
                                   client_settings, validate_risk)
 
@@ -176,6 +177,7 @@ class Client:
         self.history_filter = "missed"
         self.history_offset = 0
         self.provider_phase = "waiting"
+        self.location_recheck = LocationRecheck()
         self.last_authorize_reason = "authorization_denied"
         timeout = int(os.environ.get("EMBER_DEVICE_TEST_TIMEOUT_SECONDS", "1200"))
         if not 120 <= timeout <= 7200:
@@ -834,7 +836,7 @@ class Client:
         tt_market_exec.SLIP_CAPTURE = self.data_dir / "last-slip.json"
         ledger = Ledger(self.data_dir / "execution.sqlite3")
         maintenance = SessionMaintenance(core.DEFAULT_KEEP_ALIVE)
-        login_gate = ProviderLoginGate()
+        login_gate = ProviderLoginGate(recheck=self.location_recheck, active=active)
         self.provider_ready.clear()
         table_prepared = False
         last_provider = None
@@ -914,7 +916,8 @@ class Client:
                 if self.device_test and not self.device_test.permits():
                     self.device_test.finish("timed_out")
                     break
-                provider = login_gate.poll(self.driver, core.location_status)
+                with redirect_stdout(QuietOutput()):
+                    provider = login_gate.poll(self.driver, core.location_status)
                 if not active():
                     break
                 signed_in = bool(provider.get("signed_in"))
@@ -1140,6 +1143,8 @@ class Client:
                 self.browser_alerted = False
                 self.browser_recovering = False
                 self.resume_run = resume
+                if not resume:
+                    self.location_recheck = LocationRecheck()
                 self.preserve_browser_on_exit = False
                 self.run_cancel.clear()
                 if self.device_test:

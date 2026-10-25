@@ -59,10 +59,11 @@ jobs:
       - name: Client test battery
         run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_client', 'test_ember_history', 'test_ember_opportunity', 'test_ember_device_test', 'test_ember_stream', 'test_ember_browser_preparation', 'test_ember_market_readiness.ReadinessBudgetTests', 'test_ember_market_readiness.ProviderErrorBudgetTests', 'test_tt_market_semantics', 'test_tt_market_exec', 'test_execution_policy', 'test_draftkings_login', 'test_draftkings_live'])"
       - run: python -m unittest test_ember_board -v
+      - run: python -m unittest test_draftkings_location.LocationRecheckTests -v
       - run: python -m unittest desktop.test_native_smoke.NativeCapabilityTests -v
       - name: Overlapping H2H actual-client scheduler and multi-leg browser fixtures
         if: runner.os == 'Windows'
-        run: python -m unittest test_ember_slip test_ember_staging test_ember_scheduling desktop.test_dashboard -v
+        run: python -m unittest test_ember_slip test_ember_staging test_ember_scheduling test_draftkings_location.LocationRecheckBrowserTests desktop.test_dashboard -v
       - run: python desktop/build_worker.py
       - run: python desktop/verify_bundle.py
       - name: Packaged worker startup smoke (required before publication)
