@@ -69,12 +69,25 @@ def allow_location_permissions(driver):
     # Chrome 155 separates local-network from the older local-network-access;
     # the old allowlist silently denied the very prompt needed by the helper.
     # Set only these individual permissions and leave all others unchanged.
+    # shortcut: Chrome 152/macOS rejects Target.getTargetInfo's browserContextId
+    # ("Failed to find browser context for id"); our owned page lives in the
+    # default context, so an unresolvable id falls back to it, once per run.
+    unresolved = []
+    def grant(permission):
+        if context and not unresolved:
+            permission = {**permission, "browserContextId": context}
+        try:
+            driver.execute_cdp_cmd("Browser.setPermission", permission)
+        except WebDriverException as error:
+            if (not context or unresolved
+                    or "Failed to find browser context" not in str(getattr(error, "msg", error))):
+                raise
+            unresolved.append(True)
+            driver.execute_cdp_cmd("Browser.setPermission",
+                {key: value for key, value in permission.items() if key != "browserContextId"})
     for origin in LOCATION_PERMISSION_ORIGINS:
         for name in LOCATION_PERMISSION_NAMES:
-            permission = {"origin": origin, "permission": {"name": name}, "setting": "granted"}
-            if context:
-                permission["browserContextId"] = context
-            driver.execute_cdp_cmd("Browser.setPermission", permission)
+            grant({"origin": origin, "permission": {"name": name}, "setting": "granted"})
 
 
 def goto_table_tennis(driver):

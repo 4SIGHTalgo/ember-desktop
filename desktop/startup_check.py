@@ -27,7 +27,7 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 MARKER_TIMEOUT = 30
-STAGES = ("started", "chrome_discovered", "browser_open", "permissions_ready",
+STAGES = ("started", "chrome_discovered", "browser_open", "permission_context", "permissions_ready",
           "navigated", "teardown_complete", "cleanup_verified", "success")
 
 
@@ -89,42 +89,27 @@ def error_reason(error):
     return str(getattr(error, "msg", error))[:120]
 
 
-def grant_location_permissions_isolated(driver):
-    """Run the production permission grants one call at a time.
+def permissions_and_setup(driver):
+    """The real production permission/setup calls, with redacted diagnostics.
 
-    Same commands, origins, and permission names as
-    draftkings_login.allow_location_permissions; each call is isolated so a
-    rejection names its exact command and argument instead of a bare stage.
+    draftkings_login.allow_location_permissions is the exact path a human
+    Start presses; it is never substituted or reimplemented here.
     """
-    from draftkings_login import LOCATION_PERMISSION_ORIGINS, LOCATION_PERMISSION_NAMES
+    from draftkings_login import allow_location_permissions
     info = driver.execute_cdp_cmd("Target.getTargetInfo", {})
     context = info.get("targetInfo", {}).get("browserContextId") if isinstance(info, dict) else None
     emit("permission_context", browser_context=bool(context))
-    failures = []
-    for origin in LOCATION_PERMISSION_ORIGINS:
-        for name in LOCATION_PERMISSION_NAMES:
-            permission = {"origin": origin, "permission": {"name": name}, "setting": "granted"}
-            if context:
-                permission["browserContextId"] = context
-            try:
-                driver.execute_cdp_cmd("Browser.setPermission", permission)
-            except Exception as error:
-                # The rejected arguments are this repository's public
-                # permission-name constants, never credentials or page data.
-                failures.append((origin, name, type(error).__name__, error_reason(error)))
-                emit("permission_failed", command="Browser.setPermission",
-                     origin=origin, permission=name, error_type=type(error).__name__,
-                     reason=error_reason(error))
-    if failures:
-        raise RuntimeError("permissions_failed: " + "; ".join(
-            f"{name}@{origin}: {kind} {reason}" for origin, name, kind, reason in failures))
-
-
-def prepare_browser_execution_isolated(driver):
-    import tt_market_exec as core
-    driver.set_page_load_timeout(15)
     try:
-        driver.execute_cdp_cmd("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        allow_location_permissions(driver)
+    except Exception as error:
+        # The rejected arguments are this repository's public permission-name
+        # constants, never credentials or page data.
+        emit("permission_failed", command="Browser.setPermission",
+             error_type=type(error).__name__, reason=error_reason(error))
+        raise
+    import tt_market_exec as core
+    try:
+        core.prepare_browser_execution(driver)
     except Exception as error:
         emit("permission_failed", command="Emulation.setFocusEmulationEnabled",
              error_type=type(error).__name__, reason=error_reason(error))
@@ -151,8 +136,7 @@ def run(stage):
         driver = browser.open(lambda: True)  # Chrome launch -> endpoint discovery -> ChromeDriver attach.
         emit("browser_open", port=browser.port, auto_port=browser.auto_port, profile=browser.profile.name)
         stage["name"] = "permissions_ready"
-        grant_location_permissions_isolated(driver)  # Production permission calls, one at a time.
-        prepare_browser_execution_isolated(driver)
+        permissions_and_setup(driver)  # Real production permission/setup path.
         emit("permissions_ready")
         stage["name"] = "navigated"
         previous = driver.current_url
