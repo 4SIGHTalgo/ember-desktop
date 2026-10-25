@@ -25,6 +25,7 @@ desktop/private/
 !package.json
 !package-lock.json
 !tauri.conf.json
+!desktop/src-tauri/capabilities/default.json
 
 # Logs
 logs/
