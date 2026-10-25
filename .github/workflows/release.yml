@@ -78,25 +78,25 @@ jobs:
           OUT="$(mktemp -d)"
           publish() {  # publish <file> <canonical-name>; sha256 sidecars for every artifact
             cp "$1" "$OUT/$2"
-            shasum -a 256 "$OUT/$2" | awk '{print $1"  "$2}' > "$OUT/$2.sha256"
+            sha256sum "$OUT/$2" | awk '{print $1"  "$2}' > "$OUT/$2.sha256"
           }
           if [ "${{ runner.os }}" = "Windows" ]; then
             NSIS="$BUNDLE/nsis/Ember_${VER}_x64-setup.exe"
             publish "$NSIS" "Ember_${VER}_x64-setup.exe"
             cp "$NSIS" "$OUT/Ember-Setup-x64.exe"
-            shasum -a 256 "$OUT/Ember-Setup-x64.exe" | awk '{print $1"  Ember-Setup-x64.exe"}' > "$OUT/Ember-Setup-x64.exe.sha256"
+            sha256sum "$OUT/Ember-Setup-x64.exe" | awk '{print $1"  Ember-Setup-x64.exe"}' > "$OUT/Ember-Setup-x64.exe.sha256"
             publish "$NSIS" "ember-${VER}-windows-x86_64.exe"
             publish "$NSIS.sig" "ember-${VER}-windows-x86_64.exe.sig"
           elif [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             publish "$BUNDLE/dmg/Ember_${VER}_aarch64.dmg" "Ember_${VER}_aarch64.dmg"
             cp "$BUNDLE/dmg/Ember_${VER}_aarch64.dmg" "$OUT/Ember-aarch64.dmg"
-            shasum -a 256 "$OUT/Ember-aarch64.dmg" | awk '{print $1"  Ember-aarch64.dmg"}' > "$OUT/Ember-aarch64.dmg.sha256"
+            sha256sum "$OUT/Ember-aarch64.dmg" | awk '{print $1"  Ember-aarch64.dmg"}' > "$OUT/Ember-aarch64.dmg.sha256"
             publish "$BUNDLE/macos/Ember.app.tar.gz" "ember-${VER}-darwin-aarch64.app.tar.gz"
             publish "$BUNDLE/macos/Ember.app.tar.gz.sig" "ember-${VER}-darwin-aarch64.app.tar.gz.sig"
           else
             publish "$BUNDLE/dmg/Ember_${VER}_x64.dmg" "Ember_${VER}_x64.dmg"
             cp "$BUNDLE/dmg/Ember_${VER}_x64.dmg" "$OUT/Ember-x64.dmg"
-            shasum -a 256 "$OUT/Ember-x64.dmg" | awk '{print $1"  Ember-x64.dmg"}' > "$OUT/Ember-x64.dmg.sha256"
+            sha256sum "$OUT/Ember-x64.dmg" | awk '{print $1"  Ember-x64.dmg"}' > "$OUT/Ember-x64.dmg.sha256"
             publish "$BUNDLE/macos/Ember.app.tar.gz" "ember-${VER}-darwin-x86_64.app.tar.gz"
             publish "$BUNDLE/macos/Ember.app.tar.gz.sig" "ember-${VER}-darwin-x86_64.app.tar.gz.sig"
           fi
