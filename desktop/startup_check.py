@@ -84,10 +84,55 @@ def lifecycle_rows(data_dir):
         return []
 
 
+def error_reason(error):
+    """Selenium keeps the CDP rejection text in .msg, never in Exception.args."""
+    return str(getattr(error, "msg", error))[:120]
+
+
+def grant_location_permissions_isolated(driver):
+    """Run the production permission grants one call at a time.
+
+    Same commands, origins, and permission names as
+    draftkings_login.allow_location_permissions; each call is isolated so a
+    rejection names its exact command and argument instead of a bare stage.
+    """
+    from draftkings_login import LOCATION_PERMISSION_ORIGINS, LOCATION_PERMISSION_NAMES
+    info = driver.execute_cdp_cmd("Target.getTargetInfo", {})
+    context = info.get("targetInfo", {}).get("browserContextId") if isinstance(info, dict) else None
+    emit("permission_context", browser_context=bool(context))
+    failures = []
+    for origin in LOCATION_PERMISSION_ORIGINS:
+        for name in LOCATION_PERMISSION_NAMES:
+            permission = {"origin": origin, "permission": {"name": name}, "setting": "granted"}
+            if context:
+                permission["browserContextId"] = context
+            try:
+                driver.execute_cdp_cmd("Browser.setPermission", permission)
+            except Exception as error:
+                # The rejected arguments are this repository's public
+                # permission-name constants, never credentials or page data.
+                failures.append((origin, name, type(error).__name__, error_reason(error)))
+                emit("permission_failed", command="Browser.setPermission",
+                     origin=origin, permission=name, error_type=type(error).__name__,
+                     reason=error_reason(error))
+    if failures:
+        raise RuntimeError("permissions_failed: " + "; ".join(
+            f"{name}@{origin}: {kind} {reason}" for origin, name, kind, reason in failures))
+
+
+def prepare_browser_execution_isolated(driver):
+    import tt_market_exec as core
+    driver.set_page_load_timeout(15)
+    try:
+        driver.execute_cdp_cmd("Emulation.setFocusEmulationEnabled", {"enabled": True})
+    except Exception as error:
+        emit("permission_failed", command="Emulation.setFocusEmulationEnabled",
+             error_type=type(error).__name__, reason=error_reason(error))
+        raise
+
+
 def run(stage):
     from ember_browser_lifecycle import OwnedBrowser, chrome_binary
-    from draftkings_login import allow_location_permissions
-    import tt_market_exec as core
 
     marker = "ember-startup-" + uuid.uuid4().hex
     server = fixture_server(marker)
@@ -106,8 +151,8 @@ def run(stage):
         driver = browser.open(lambda: True)  # Chrome launch -> endpoint discovery -> ChromeDriver attach.
         emit("browser_open", port=browser.port, auto_port=browser.auto_port, profile=browser.profile.name)
         stage["name"] = "permissions_ready"
-        allow_location_permissions(driver)  # Production permission/setup calls; CDP only.
-        core.prepare_browser_execution(driver)
+        grant_location_permissions_isolated(driver)  # Production permission calls, one at a time.
+        prepare_browser_execution_isolated(driver)
         emit("permissions_ready")
         stage["name"] = "navigated"
         previous = driver.current_url
@@ -166,9 +211,8 @@ def main():
     try:
         run(stage)
     except Exception as error:
-        detail = error.args[0] if error.args and isinstance(error.args[0], str) else None
-        emit("failed", failed_stage=stage["name"], error_type=type(error).__name__,
-             detail=detail[:60] if detail else None)
+        detail = error_reason(error)
+        emit("failed", failed_stage=stage["name"], error_type=type(error).__name__, detail=detail)
         return 1
     emit("success")
     return 0

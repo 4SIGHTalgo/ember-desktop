@@ -47,8 +47,6 @@ jobs:
         run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_provider_login', 'test_ember_browser_lifecycle.BrowserLifecycleTests', 'test_ember_browser_lifecycle.ClientRecoveryTests', 'test_ember_browser_lifecycle.OwnedBrowserFaultTests', 'test_ember_browser_lifecycle.NativeBrowserStartupTests', 'test_ember_market_readiness.MarketReadinessBrowserTests', 'test_tt_bet_slip.PlanExecutionBrowserTests', 'desktop.test_dashboard'])"
       - run: python desktop/build_worker.py
       - run: python desktop/verify_bundle.py
-      - name: Discover Chrome for the packaged startup gate
-        run: python -c "from ember_browser_lifecycle import chrome_binary; import subprocess; binary = chrome_binary(); print(binary); print(subprocess.run([binary, '--version'], capture_output=True, text=True).stdout.strip())"
       - name: Packaged worker startup smoke (startup gate for every native host)
         run: python -m unittest desktop.test_startup_smoke -v
         timeout-minutes: 30
