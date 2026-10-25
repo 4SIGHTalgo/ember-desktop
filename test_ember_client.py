@@ -255,6 +255,7 @@ class ProtocolV2Tests(unittest.TestCase):
             for setting in (patch("ember_client.emit"), patch("ember_client.validation_ticket", return_value=None),
                 patch("ember_client.Ledger"), patch("ember_client.OwnedBrowser", return_value=owner),
                 patch("ember_client.ActiveSessionPower"),
+                patch.object(client.staging, 'add', return_value={'status': 'selected'}),
                 patch("draftkings_login.allow_location_permissions"),
                 patch("draftkings_login.goto_tt_elite"), patch("ember_provider_login.ProviderLoginGate", return_value=gate),
                 patch("draftkings_session.SessionMaintenance"), patch.object(core, "prepare_browser_execution"),
@@ -309,6 +310,7 @@ class ProtocolV2Tests(unittest.TestCase):
             for setting in (patch("ember_client.emit"), patch("ember_client.validation_ticket", return_value=None),
                 patch("ember_client.Ledger"), patch("ember_client.OwnedBrowser", return_value=owner),
                 patch("ember_client.ActiveSessionPower"),
+                patch.object(client.staging, 'add', return_value={'status': 'selected'}),
                 patch("draftkings_login.allow_location_permissions"),
                 patch("draftkings_login.goto_tt_elite"), patch("ember_provider_login.ProviderLoginGate", return_value=gate),
                 patch("draftkings_session.SessionMaintenance"), patch.object(core, "prepare_browser_execution"),
@@ -559,6 +561,11 @@ class ProviderStartupTests(unittest.TestCase):
                                   ("provider", False), ("provider", True), ("signal_wait", True)])
         self.assertFalse(self.client.provider_ready.is_set())
 
+    def test_live_board_holds_initial_league_navigation_but_still_rechecks_provider(self):
+        self.client.scanner = {'board': {'events': [{'event_id': '100'}]}}
+        _, events = self.run_startup([self.state(True, signed_in=True), self.state(True, signed_in=True)], readiness_only=False)
+        self.assertEqual(events, [('provider', True), ('provider', True), ('signal_wait', True)])
+
     def test_scan_only_can_prepare_a_verified_match_without_reading_or_claiming_a_wager(self):
         now = datetime.now(timezone.utc)
         self.client.last_feed = True
@@ -590,6 +597,10 @@ class SlipStagingTests(unittest.TestCase):
                                   "access_until": (now+timedelta(hours=1)).isoformat(), "lease_seconds": 5})
         self.client.last_feed = True
         self.event = {"eventId": "100", "player1": "Piotr Zemla", "player2": "Tomasz Lojtek"}
+        self.client.lease.running = True
+        self.client.provider_ready.set()
+        self.inventory = {"status": "present", "stagingSafe": True, "legs": []}
+        self.stack.enter_context(patch('ember_staging.read_plan_slip', return_value=self.inventory))
         self.client.preparation = {"protocol": 1, "event": self.event, "market_hint": {"betType": "split"},
                                    "expires_at": (now+timedelta(seconds=15)).isoformat()}
         import tt_market_exec as core
@@ -604,8 +615,9 @@ class SlipStagingTests(unittest.TestCase):
         self.market_readiness = Mock()
         self.market_readiness.open.return_value = {"status": "opened"}
         self.market_readiness.wait.return_value = {"status": "revealed"}
-        self.hint = ClientProtocolTests.stage(event_id="100")
-        self.client.scanner = {"healthy": True, "counts": {}, "stage": self.hint}
+        self.market_readiness.prepare.return_value = {"status": "revealed"}
+        self.hint = ClientProtocolTests.stage(event_id="100", event=self.event)
+        self.client.scanner = {"healthy": True, "counts": {}, "stages": [self.hint]}
 
     def maintain(self, mono=1.0):
         return self.client.maintain_staging(self.driver, self.core, self.browser_preparation,
@@ -615,58 +627,174 @@ class SlipStagingTests(unittest.TestCase):
         self.client.stage_due = 0.0
         staged = self.maintain()
         self.assertEqual(staged, self.hint)
-        self.assertEqual(self.client.staged, self.hint)
         self.core.click_selection.assert_called_once()
         driver, event, outcome, market = self.core.click_selection.call_args.args[:4]
         self.assertEqual(event["eventId"], "100")
         self.assertEqual((outcome["selectionId"], outcome["label"], outcome["points"]),
                          ("s2", "Tomasz Lojtek", None))
         self.assertEqual((market["name"], market["marketId"]), ("Game 2", "200"))
-        self.core.ensure_slip_open.assert_called_once_with(self.driver, allow_empty=False)
         # Staging clicks the odds button only; no stake write, no submit, no bettor.
-        self.assertEqual(self.core.click_selection.call_args.kwargs.get("timeout"), 1.0)
+        self.assertLessEqual(self.core.click_selection.call_args.kwargs["timeout"], .3)
         self.assertIsNone(self.client.bettor)
 
-    def test_stale_hint_never_stages_and_a_staged_leg_is_cleared(self):
+    def test_stale_hint_never_stages_or_clears_existing_legs(self):
         self.client.stage_due = 0.0
         self.client.scanner = {"healthy": True, "counts": {},
-                               "stage": ClientProtocolTests.stage(event_id="100",
-                                   expires_at=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),
-                                   updated_at=(datetime.now(timezone.utc)-timedelta(seconds=30)).isoformat())}
+                               "stages": [ClientProtocolTests.stage(event_id="100", event=self.event,
+                                    expires_at=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),
+                                    updated_at=(datetime.now(timezone.utc)-timedelta(seconds=30)).isoformat())]}
         self.assertIsNone(self.maintain())
         self.core.click_selection.assert_not_called()
         self.core.clear_slip.assert_not_called()
-        # A previously staged leg is cleared once its opportunity is gone.
-        self.client.staged = dict(self.hint)
+        self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2'}]
         self.assertIsNone(self.maintain())
-        self.core.clear_slip.assert_called_once()
+        self.core.clear_slip.assert_not_called()
+        self.assertTrue(self.client.hold_preparation())
 
-    def test_a_moved_hint_clears_and_restages_the_new_anticipated_selection(self):
+    def test_a_moved_hint_adds_a_leg_without_clearing_others(self):
         self.client.stage_due = 0.0
-        self.client.staged = dict(self.hint)
-        self.client.scanner["stage"] = ClientProtocolTests.stage(event_id="100", selection_id="s1")
-        self.assertIsNone(self.maintain())
-        self.core.clear_slip.assert_called_once()
-        self.assertIsNone(self.client.staged)
-        # The next pass stages the newly anticipated selection.
+        self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2'}]
+        self.client.scanner['stages'] = [ClientProtocolTests.stage(event_id='100', selection_id='s1', event=self.event)]
         moved = self.maintain()
         self.assertEqual(moved["selection_id"], "s1")
         self.assertEqual(self.core.click_selection.call_args.args[2]["selectionId"], "s1")
+        self.core.clear_slip.assert_not_called()
 
-    def test_hint_applies_only_to_the_event_the_browser_is_prepared_on(self):
+    def test_full_hint_can_stage_another_event_without_preparation_authority(self):
         self.client.stage_due = 0.0
         self.browser_preparation.key = ("999", "closeout")
-        self.assertIsNone(self.maintain())
-        self.core.click_selection.assert_not_called()
-        self.browser_preparation.key = None
-        self.assertIsNone(self.maintain())
-        self.core.click_selection.assert_not_called()
+        self.assertEqual(self.maintain(), self.hint)
+        self.assertEqual(self.market_readiness.prepare.call_args.args[1], self.event)
 
     def test_unhealthy_feed_never_stages(self):
         self.client.stage_due = 0.0
         self.client.last_feed = False
         self.assertIsNone(self.maintain())
         self.core.click_selection.assert_not_called()
+
+
+class PlanRenewalTests(unittest.TestCase):
+    setUp = ProtocolV2Tests.setUp
+    plan_signal = staticmethod(plan_signal)
+
+    def status(self, signal=None):
+        now = datetime.now(timezone.utc)
+        return {'enabled': True, 'client_supported': True, 'server_time': now.isoformat(),
+                'access_until': (now+timedelta(hours=1)).isoformat(), 'lease_seconds': 5,
+                **({'signal': signal} if signal else {})}
+
+    def test_expired_envelope_can_renew_before_expiry_gate_and_preserves_plan_reference(self):
+        from copy import deepcopy
+        signal = self.plan_signal()
+        renewed = deepcopy(signal)
+        signal['expires_at'] = signal['payload']['plan']['deadline'] = (datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()
+        plan = signal['payload']['plan']
+        self.client.provider_ready.set()
+        with patch.object(self.client, 'request', return_value=self.status(renewed)) as request:
+            self.assertTrue(self.client.authorize(signal))
+        self.assertIs(signal['payload']['plan'], plan)
+        self.assertEqual(plan['deadline'], renewed['payload']['plan']['deadline'])
+        self.assertEqual(signal['expires_at'], renewed['expires_at'])
+        self.assertLessEqual(request.call_args.kwargs['timeout'], .3)
+
+    def test_renewal_rejects_contract_selection_score_or_plan_drift_atomically(self):
+        from copy import deepcopy
+        changes = [lambda s: s.update(id=2), lambda s: s.update(contract='other'),
+                   lambda s: s['payload']['market'].update(marketId='999'),
+                   lambda s: s['payload']['plan'].update(selectionId='301'),
+                   lambda s: s['payload']['plan'].update(min_decimal=2),
+                   lambda s: s['payload']['plan'].update(stake_cents=500),
+                   lambda s: s['payload']['event']['currentSet'].update(home=2)]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                signal = self.plan_signal()
+                saved = deepcopy(signal)
+                renewed = deepcopy(signal)
+                change(renewed)
+                with self.assertRaises((ValueError, KeyError)):
+                    self.client.renew_signal(signal, {'signal': renewed})
+                self.assertEqual(signal, saved)
+
+    def test_quote_reserves_durably_before_claim_and_renewal_updates_the_envelope(self):
+        from copy import deepcopy
+        self.client.provider_ready.set()
+        signal = self.plan_signal()
+        plan = signal['payload']['plan']
+        renewed = deepcopy(signal)
+        renewed['expires_at'] = (datetime.now(timezone.utc)+timedelta(seconds=6)).isoformat()
+        renewed['payload']['plan']['deadline'] = renewed['expires_at']
+        ledger = Ledger(self.client.data_dir/'execution.sqlite3')
+        self.addCleanup(ledger.connection.close)
+        calls = []
+        def request(*args, **kwargs):
+            calls.append(args)
+            self.assertEqual(ledger.connection.execute('SELECT status FROM attempts').fetchall(), [('reserved_or_unconfirmed',)])
+            return {**self.status(renewed), 'plan': {'stake_cents': 261, 'min_decimal': 1.85, 'echo': 'fixture'}}
+        claim = self.client.claim_values(signal, ledger)
+        with patch.object(self.client, 'request', side_effect=request):
+            self.assertEqual(claim({'balance': {}, 'decimalOdds': 2.5}), {'denied': 'sizing_failed'})
+            self.assertEqual(ledger.connection.execute('SELECT * FROM attempts').fetchall(), [])
+            for _ in range(2):
+                self.assertEqual(claim({'balance': {'availableBalance': 100}, 'decimalOdds': 2.5})['stake'], 2.61)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(signal['expires_at'], renewed['expires_at'])
+        self.assertIs(signal['payload']['plan'], plan)
+        self.assertEqual(plan['deadline'], renewed['expires_at'])
+        self.assertFalse(self.client.defer_readiness(signal, {'retryable': True}))
+        duplicate = self.plan_signal()
+        with patch.object(self.client, 'request') as request:
+            self.assertEqual(self.client.claim_values(duplicate, ledger)(
+                {'balance': {'availableBalance': 100}, 'decimalOdds': 2.5}), {'denied': 'already_attempted'})
+        request.assert_not_called()
+
+    def test_response_without_renewed_signal_never_invents_a_new_deadline(self):
+        signal = self.plan_signal()
+        saved = signal['expires_at']
+        self.client.renew_signal(signal, self.status())
+        self.assertEqual(signal['expires_at'], saved)
+        signal['expires_at'] = signal['payload']['plan']['deadline'] = (datetime.now(timezone.utc)+timedelta(seconds=self.client.lease.server_offset+.05)).isoformat()
+        self.assertLessEqual(self.client.authorization_timeout(signal), .051)
+
+    def test_preclaim_timeout_yields_without_revoking_a_positive_feed_lease(self):
+        import requests
+        self.client.provider_ready.set()
+        signal = self.plan_signal()
+        until = self.client.lease.until
+        with patch.object(self.client, 'request', side_effect=requests.Timeout):
+            self.assertFalse(self.client.authorize(signal))
+        self.assertEqual(self.client.lease.until, until)
+        self.assertEqual(self.client.last_authorize_reason, 'authorization_unavailable')
+        other = self.plan_signal()
+        other.update(id=2, contract='other')
+        self.client.signals.put_latest(other)
+        self.assertTrue(self.client.defer_readiness(signal, {'status': 'authorization_timeout'}))
+        self.assertIs(self.client.signals.get_nowait(), other)
+        self.assertIs(self.client.signals.get_nowait(), signal)
+
+    def test_expired_plan_cannot_consume_a_durable_reservation_even_with_live_envelope(self):
+        self.client.provider_ready.set()
+        signal = self.plan_signal(deadline=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat())
+        ledger = Mock()
+        with patch.object(self.client, 'request') as request:
+            result = self.client.claim_values(signal, ledger)({'balance': {'availableBalance': 100}, 'decimalOdds': 2.5})
+        self.assertEqual(result, {'denied': 'signal_expired'})
+        ledger.reserve_signal.assert_not_called()
+        request.assert_not_called()
+
+    def test_quote_claim_can_wait_for_its_reply_without_lengthening_preclaim_turns(self):
+        self.client.provider_ready.set()
+        signal = self.plan_signal()
+        status = {**self.status(), 'plan': {'stake_cents': 261, 'min_decimal': 1.85, 'echo': 'fixture'}}
+        with patch.object(self.client, 'request', return_value=status) as request:
+            self.assertTrue(self.client.authorize(signal))
+            self.assertEqual(self.client.claim_values(signal)(
+                {'balance': {'availableBalance': 100}, 'decimalOdds': 2.5})['stake'], 2.61)
+        preclaim, claim = [call.kwargs['timeout'] for call in request.call_args_list]
+        self.assertLessEqual(preclaim, .3)
+        self.assertGreater(claim, preclaim)
+        self.assertLessEqual(claim, 1)
+        signal['payload']['plan']['deadline'] = (datetime.now(timezone.utc)+timedelta(seconds=self.client.lease.server_offset+.05)).isoformat()
+        self.assertLessEqual(self.client.authorization_timeout(signal), .051)
 
 
 if __name__ == "__main__":

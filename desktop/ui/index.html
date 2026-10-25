@@ -28,6 +28,18 @@
     <button id="dismiss-alert" class="quiet">Dismiss</button>
   </aside>
 
+  <section class="match-board panel" aria-labelledby="board-heading">
+    <div class="panel-heading board-heading"><div><p class="eyebrow">MATCH DESK</p><h1 id="board-heading">All matches <span id="board-count" class="pill">0</span></h1></div>
+      <div class="board-filters" role="group" aria-label="Match filter"><button type="button" data-filter="all" aria-pressed="true">All</button><button type="button" data-filter="live" aria-pressed="false">Live</button><button type="button" data-filter="staged" aria-pressed="false">Staged</button><button type="button" data-filter="mine" aria-pressed="false">Mine</button></div>
+    </div>
+    <p id="board-status" class="small" role="status">Waiting for the match board. Legacy scanner details appear below.</p>
+    <div class="board-columns" aria-hidden="true"><span>Match / observed score</span><span>Market / selection</span><span>Decimal odds</span><span>Conservative EV</span></div>
+    <div id="board-events" class="board-events"></div>
+    <p id="board-empty" class="history-empty">No matches received yet.</p>
+    <p class="small board-note">EV is net % of stake, supplied by the scanner at the selected confidence. Entry EV is historical, never a current midgame estimate. Slip observations stay until verified match completion; only legs in the latest current slip are marked Staged. Position tracking describes observed scores, not provider settlement.</p>
+  </section>
+
+  <details id="opportunity-diagnostics" class="diagnostics" open><summary>Single-match evaluation &amp; diagnostics</summary>
   <section class="opportunity panel" aria-labelledby="opportunity-heading">
     <div class="panel-heading"><div><p class="eyebrow">CURRENT OPPORTUNITY</p><h1 id="opportunity-heading">Waiting for a verified match</h1></div><span id="opportunity-stage" class="pill">Standby</span></div>
     <p id="opportunity-subtitle" class="muted">Sign in to see the match, live score, odds, and expected value being evaluated.</p>
@@ -61,6 +73,7 @@
     </div>
     <div id="opportunity-empty" class="empty-state"><div class="empty-mark" aria-hidden="true">◎</div><h2>No verified opportunity yet</h2><p>Ember will show the match and its EV here as soon as the scanner can evaluate it.</p></div>
   </section>
+  </details>
 
   <div class="detail-grid">
     <section class="panel compact"><p class="eyebrow">DRAFTKINGS BROWSER</p><p id="browser" class="browser-state">Press Start to sign in to DraftKings and open the TT Elite match list.</p><p class="small">Complete login, SMS, and location checks directly in the local browser.</p><button id="test-sound" class="text-button">Test browser-close sound</button></section>
@@ -79,6 +92,7 @@
 </main>
 <script src="opportunity.js"></script>
 <script src="history.js"></script>
+<script src="board.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

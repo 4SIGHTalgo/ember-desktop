@@ -1,6 +1,8 @@
 """Non-wager market warmup and deadline-bounded recovery of transient UI states."""
 import time
 
+from tt_market_exec import plan_slip_ready, read_plan_slip
+
 
 PROVIDER_HOST = "sportsbook.draftkings.com"
 WARM_MARKET_SCRIPT = r"""
@@ -39,6 +41,28 @@ return {status:'ready',reason:null};
 class MarketReadiness:
     def __init__(self, core, clock=time.monotonic, sleep=time.sleep):
         self.core, self.clock, self.sleep = core, clock, sleep
+
+    def prepare(self, driver, event, market, valid, remaining, plan=None, max_wait=.3, staging=False):
+        """One shared FIFO turn; an exact ready slip leg needs no board at all."""
+        deadline = self.clock()+max_wait
+        if plan is not None and valid() and plan_slip_ready(driver, event, market, plan):
+            return {"status": "revealed", "staged": True, "attempts": 0, "wait_ms": 0}
+        if plan is not None:
+            snapshot = read_plan_slip(driver)
+            legs = snapshot.get('legs', [])
+            if isinstance(legs, list) and any(leg.get('eventId') == event['eventId'] and
+                    leg.get('marketId') == market['marketId'] and leg.get('selectionId') == plan['selectionId']
+                    and leg.get('suspended') is True for leg in legs):
+                return {'status': 'not_ready', 'reason': 'target leg suspended', 'attempts': 0, 'wait_ms': 0}
+        if not hasattr(self.core, 'correct_event') or not self.core.correct_event(driver, event):
+            opening = self.open(driver, event, market, valid, remaining, max_wait=max(0, deadline-self.clock()))
+            if opening.get("status") != "opened":
+                return opening
+        if plan is not None:
+            market = {**market, 'outcomes': [row for row in market.get('outcomes', [])
+                                           if row.get('selectionId') == plan['selectionId']]}
+        return self.wait(driver, event, market, valid, remaining,
+                         max_wait=max(0, deadline-self.clock()), staging=staging)
 
     def fallback_tab(self, driver, event, market):
         """Leave a summary view only after the exact requested row is missing."""
@@ -96,7 +120,7 @@ class MarketReadiness:
         return {"status": "expired" if not valid() else "not_ready", "reason": "event identity not ready",
                 "attempts": attempts, "wait_ms": round(1000*(self.clock()-started), 1)}
 
-    def wait(self, driver, event, market, valid, remaining, reserve=.6, max_wait=None):
+    def wait(self, driver, event, market, valid, remaining, reserve=.6, max_wait=None, staging=False):
         """Retry only pre-submit reveal/expansion; never retry a wager command."""
         started = self.clock()
         deadline = started+max(0, remaining()-reserve)
@@ -106,9 +130,13 @@ class MarketReadiness:
         fallback_attempted = False
         last = {"status": "waiting", "reason": "market surface not ready"}
         while valid():
+            if self.clock() >= deadline or remaining() <= reserve:
+                break
             attempts += 1
             try:
-                reading = self.core.reveal_set_winner(driver, event, market)
+                reading = (self.core.reveal_set_winner(driver, event, market, staging=True)
+                           if staging and market.get('name') == 'Moneyline' else
+                           self.core.reveal_set_winner(driver, event, market))
                 last = reading if isinstance(reading, dict) else {"status": "waiting", "reason": "market surface not ready"}
             except self.core.FATAL_BROWSER_ERRORS:
                 raise

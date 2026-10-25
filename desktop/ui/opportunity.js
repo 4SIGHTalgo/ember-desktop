@@ -61,15 +61,16 @@ window.EmberOpportunity = (() => {
     text('sets-one', view.set_tally?.[0] ?? '—'); text('sets-two', view.set_tally?.[1] ?? '—');
     text('point-score', `${view.period ? `${view.period} set · ` : ''}Current points ${view.points ? view.points.join(' – ') : 'unavailable'}`);
     const mode = view.ev_mode === 'point' ? 'POINT-ESTIMATE NET EV' : view.confidence === 95 ? 'VERY CONSERVATIVE NET EV' : 'CONSERVATIVE NET EV';
-    text('ev-label', mode); text('ev-value', percent(best?.gate_ev, view.minimum_ev));
-    const tone = known(best?.gate_ev) ? best.gate_ev > 0 ? 'positive' : 'negative' : '';
+    const shownEV = active && view.entry_open ? best?.gate_ev : null;
+    text('ev-label', mode); text('ev-value', percent(shownEV, view.minimum_ev));
+    const tone = known(shownEV) ? shownEV > 0 ? 'positive' : 'negative' : '';
     $('ev-value').dataset.tone = tone;
     document.querySelector('.ev-card').dataset.tone = tone;
     text('ev-comparison', `Gate: strictly above ${percent(view.minimum_ev)}`);
     const position = value => Math.max(0, Math.min(300, (value + 50) / 150 * 300));
-    $('ev-meter-fill').setAttribute('width', known(best?.gate_ev) ? position(best.gate_ev) : 0);
+    $('ev-meter-fill').setAttribute('width', known(shownEV) ? position(shownEV) : 0);
     for (const attribute of ['x1', 'x2']) $('ev-meter-threshold').setAttribute(attribute, position(view.minimum_ev));
-    text('ev-profit', known(best?.gate_ev) ? `Expected net per $1: ${best.gate_ev >= 0 ? '+' : '−'}$${Math.abs(best.gate_ev / 100).toFixed(3)} at the feed quote. Final slip is rechecked.` : 'EV is unavailable until a valid start-state sample and matching quote are present.');
+    text('ev-profit', known(shownEV) ? `Expected net per $1: ${shownEV >= 0 ? '+' : '−'}$${Math.abs(shownEV / 100).toFixed(3)} at the feed quote. Final slip is rechecked.` : 'EV is unavailable until a valid start-state sample and matching current quote are present.');
     text('selection-name', best ? selection(best) : 'Waiting for a strategy selection');
     text('market-name', `${view.market || (view.bet_type === 'closeout' ? 'Moneyline' : 'Next game winner')}${best ? ` · ${odds(best)}` : ''}`);
     let stage = 'Evaluating', stageTone = '', reason = view.reason;
@@ -78,7 +79,7 @@ window.EmberOpportunity = (() => {
     else if (!view.mapping_verified) { stage = 'Checking matchup'; stageTone = 'warning'; }
     else if (!view.entry_open) { stage = candidates.length ? 'Entry closed' : 'Watching match'; }
     else if (!known(best?.gate_ev)) { stage = 'Waiting for data'; }
-    else if (!pricesCurrent) { stage = 'Quote stale'; stageTone = 'warning'; reason = 'Waiting for current score and odds updates. The EV shown uses the last quote.'; }
+    else if (!pricesCurrent) { stage = 'Quote stale'; stageTone = 'warning'; reason = 'Waiting for current score and odds updates. Live EV is hidden.'; }
     else if (view.qualifies) { stage = context.running && context.providerReady ? 'Signal qualified' : 'Qualified · execution stopped'; stageTone = 'positive'; reason = context.running && context.providerReady ? 'Model signal qualified. Local authentication, price, sizing, and entry conditions are checked before submission.' : 'The model signal qualifies. Execution is stopped or awaiting DraftKings readiness.'; }
     else if (!gatePassed) { stage = 'Below EV gate'; reason = view.reason; }
     else { stage = 'Waiting for entry checks'; stageTone = 'warning'; }
@@ -89,9 +90,10 @@ window.EmberOpportunity = (() => {
     text('check-history', `${view.history_count ?? 'Unknown'} prior meetings · min 30`);
     text('check-ev', `${view.ev_mode === 'point' ? 'Point' : 'Conservative'} EV > ${view.minimum_ev}%`);
     text('opportunity-age', `Quote: ${quoteAge === null ? 'not received' : `${quoteAge}s ago`} · Score: ${scoreAge === null ? 'not received' : `${scoreAge}s ago`} · Snapshot: ${age(view.updated_at, now) ?? '—'}s ago`);
-    const signature = JSON.stringify([candidates, view.confidence]);
+    const shownCandidates = active && view.entry_open ? candidates : candidates.map(row => ({...row, estimated_ev: null, conservative_ev: null}));
+    const signature = JSON.stringify([shownCandidates, view.confidence]);
     if ($('candidate-cards').dataset.signature !== signature) {
-      $('candidate-cards').replaceChildren(...candidates.map(candidate => candidateCard(candidate, view.confidence)));
+      $('candidate-cards').replaceChildren(...shownCandidates.map(candidate => candidateCard(candidate, view.confidence)));
       $('candidate-cards').dataset.signature = signature;
     }
   }

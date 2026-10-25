@@ -70,6 +70,16 @@ selection.addEventListener('click', event => {
 """
 
 
+PLAN_SETUP = SETUP.replace(
+    'slip.innerHTML = `<div>',
+    '''slip.innerHTML = `<section><button data-testid="betslip-selection-card-ex-button"
+        data-tracking='{"selectionId":"selection2","eventId":"10","marketId":"m2"}'>Remove</button><div>'''
+).replace('<button data-testid="betslip-place-bet-button" disabled>',
+          '</section><button data-testid="betslip-place-bet-button" disabled>').replace(
+              "const submit = slip.querySelector('button');",
+              "const submit = slip.querySelector('[data-testid=betslip-place-bet-button]');")
+
+
 class PlanExecutionBrowserTests(unittest.TestCase):
     """Protocol 2: quote, arm and confirm compare authorized values only."""
 
@@ -93,7 +103,7 @@ class PlanExecutionBrowserTests(unittest.TestCase):
             setting.start()
             self.addCleanup(setting.stop)
         self.driver.get("about:blank")
-        self.driver.execute_script("document.body.innerHTML=arguments[0];" + SETUP, HTML)
+        self.driver.execute_script("document.body.innerHTML=arguments[0];" + PLAN_SETUP, HTML)
 
     def market(self):
         return {"marketId": "m2", "eventId": "10", "name": "Game 2", "isSuspended": False}
@@ -114,16 +124,19 @@ class PlanExecutionBrowserTests(unittest.TestCase):
         self.assertIn(click.get("status"), ("clicked", "selected"))
         self.assertTrue(execution.ensure_slip_open(self.driver, allow_empty=False))
 
+    def identity(self):
+        return execution.plan_slip_config(bet_event(), self.market(), self.plan())
+
     def test_plan_quote_reads_the_balance_and_price_without_writing_a_stake(self):
         self.open_slip()
         quote = self.driver.execute_async_script(execution.WAIT_FOR_PLAN_ARM_SCRIPT,
-                                                 {"readOnly": True, "timeoutMs": 2000, "fallbackMs": 50}) or {}
+                                                 {**self.identity(), "readOnly": True, "timeoutMs": 2000, "fallbackMs": 50}) or {}
         self.assertEqual(quote["status"], "armed")
         self.assertEqual(quote["balance"]["availableBalance"], 100)
         self.assertAlmostEqual(quote["decimalOdds"], 2.1)
         self.assertFalse(quote["stakeValue"])
         armed = self.driver.execute_async_script(execution.WAIT_FOR_PLAN_ARM_SCRIPT,
-                                                 {"stake": 2.61, "timeoutMs": 2000, "fallbackMs": 50}) or {}
+                                                 {**self.identity(), "stake": 2.61, "timeoutMs": 2000, "fallbackMs": 50}) or {}
         self.assertEqual(armed["status"], "armed")
         self.assertEqual(armed["stakeValue"], "2.61")
         self.assertFalse(armed["placeDisabled"])
@@ -134,9 +147,9 @@ class PlanExecutionBrowserTests(unittest.TestCase):
                 self.setUp()
                 self.open_slip()
                 self.driver.execute_async_script(execution.WAIT_FOR_PLAN_ARM_SCRIPT,
-                                                 {"stake": 2.61, "timeoutMs": 2000, "fallbackMs": 50})
+                                                 {**self.identity(), "stake": 2.61, "timeoutMs": 2000, "fallbackMs": 50})
                 result = self.driver.execute_script(execution.CONFIRM_PLAN_SCRIPT,
-                        {"stake": 2.61, "minDecimal": floor, "echo": "e1",
+                        {**self.identity(), "stake": 2.61, "minDecimal": floor, "echo": "e1",
                          "selectionLabel": "Tomasz Lojtek", "marketName": "Game 2"}) or {}
                 self.assertEqual(result["status"], expected)
                 if expected == "submitted":
@@ -152,10 +165,10 @@ class PlanExecutionBrowserTests(unittest.TestCase):
     def test_plan_confirm_treats_a_changed_stake_as_resize_never_a_submit(self):
         self.open_slip()
         self.driver.execute_async_script(execution.WAIT_FOR_PLAN_ARM_SCRIPT,
-                                         {"stake": 2.61, "timeoutMs": 2000, "fallbackMs": 50})
+                                         {**self.identity(), "stake": 2.61, "timeoutMs": 2000, "fallbackMs": 50})
         self.driver.execute_script("document.querySelector('input[data-testid=betslip-wager-box-input]').value='5.00'")
         result = self.driver.execute_script(execution.CONFIRM_PLAN_SCRIPT,
-                {"stake": 2.61, "minDecimal": 2.0, "selectionLabel": "Tomasz Lojtek",
+                {**self.identity(), "stake": 2.61, "minDecimal": 2.0, "selectionLabel": "Tomasz Lojtek",
                  "marketName": "Game 2"}) or {}
         self.assertEqual(result["status"], "resize")
         self.assertEqual(self.driver.execute_script("return window.submitClicks"), 0)

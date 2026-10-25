@@ -1,6 +1,6 @@
-"""The five enabled production families; historical grading remains separate."""
+"""Enabled production families; historical grading remains separate."""
 
-ALLOWED_FAMILIES = frozenset({'split', 'complement', 'closeout', 'set_handicap', 'point_handicap'})
+ALLOWED_FAMILIES = frozenset({'split', 'closeout', 'set_handicap', 'point_handicap'})
 DISTRIBUTION_MARKETS = {'Games Spread': 'set_handicap', 'Points Spread': 'point_handicap'}
 DISTRIBUTION_FAMILIES = frozenset(DISTRIBUTION_MARKETS.values())
 # Provider market names carry no strategy; surface navigation needs all four.

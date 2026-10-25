@@ -51,12 +51,16 @@ class BrowserPreparation:
         self.open_league(driver)
         self.key = None
 
-    def step(self, driver, hint, feed_ready, server_now):
+    def step(self, driver, hint, feed_ready, server_now, hold=False):
         now = self.clock()
         if not feed_ready:
             self.publish("waiting_feed", "Live source connection is paused; browser preparation is waiting for fresh data.", self.key[0] if self.key else None)
             return
         if not hint or server_now >= timestamp(hint["expires_at"]):
+            if hold:
+                self.no_hint_since = None
+                self.publish("waiting_candidate", "Retaining staged live matches while waiting for fresh signals.", self.key[0] if self.key else None)
+                return
             self.no_hint_since = now if self.no_hint_since is None else self.no_hint_since
             if now >= self.next_attempt and ((self.key and now-self.no_hint_since >= 3) or (self.key is None and not self.at_league(driver))):
                 try:
@@ -100,7 +104,7 @@ class BrowserPreparation:
             self.monitor(driver, event, market)
             return
         self.failures += 1
-        if self.failures >= 5:
+        if self.failures >= 5 and not hold:
             try:
                 self.league(driver)
             except self.core.FATAL_BROWSER_ERRORS:

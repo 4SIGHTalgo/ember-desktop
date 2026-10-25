@@ -12,6 +12,7 @@ never carry exception text, page DOM, credentials, or absolute home paths.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -22,9 +23,13 @@ import time
 import uuid
 from pathlib import Path
 
+import psutil
+
 if not getattr(sys, "frozen", False):
     # Source mode: resolve the pinned engine modules from the repository root.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from ember_browser_lifecycle import argument
 
 MARKER_TIMEOUT = 30
 STAGES = ("started", "chrome_discovered", "browser_open", "permission_context", "permissions_ready",
@@ -72,19 +77,103 @@ def fixture_server(marker):
     return ThreadingHTTPServer(("127.0.0.1", 0), FixturePage)
 
 
-def owned_leftovers(profile):
+def chrome_process(name):
+    name = name.lower()
+    return ("chrome" in name or "chromium" in name) and "chromedriver" not in name
+
+
+def profile_key(profile):
+    return os.path.normcase(str(Path(profile).resolve()))
+
+
+def owned_leftovers(profile, nonce):
     """Only processes carrying this run's exact temporary profile are test-owned."""
-    import psutil
-    from ember_browser_lifecycle import argument
+    if not nonce:
+        return []
     found = []
     for process in psutil.process_iter(["pid", "name", "cmdline"]):
         arguments = process.info.get("cmdline") or []
-        name = (process.info.get("name") or "").lower()
-        if "chrome" not in name and "chromium" not in name:
+        if not chrome_process(process.info.get("name") or "") or argument(arguments, "--type"):
             continue
-        if argument(arguments, "--user-data-dir") == str(profile):
+        current = argument(arguments, "--user-data-dir")
+        if (current and profile_key(current) == profile_key(profile)
+                and argument(arguments, "--ember-owned-browser") == nonce):
             found.append(process)
     return found
+
+
+def owned_process_snapshot(profile, nonce):
+    """Capture children while their exact profile/nonce-verified parent still exists."""
+    pending = owned_leftovers(profile, nonce)
+    found = {}
+    while pending:
+        process = pending.pop()
+        try:
+            identity = (process.pid, process.create_time())
+            if identity in found or not process.is_running():
+                continue
+            arguments = process.cmdline()
+            current = argument(arguments, "--user-data-dir")
+            marker = argument(arguments, "--ember-owned-browser")
+            if (not chrome_process(process.name()) or current and profile_key(current) != profile_key(profile)
+                    or marker and marker != nonce):
+                continue
+            found[identity] = process
+            pending.extend(process.children())
+        except psutil.NoSuchProcess:
+            pass
+    return found
+
+
+def same_process(process, identity):
+    try:
+        return process.is_running() and (process.pid, process.create_time()) == identity
+    except psutil.NoSuchProcess:
+        return False
+
+
+def wait_owned_processes(snapshot):
+    identities = {id(process): identity for identity, process in snapshot.items()}
+    alive = list(snapshot.values())
+    for action, timeout in ((None, 20), ("terminate", 5), ("kill", 5)):
+        alive = [process for process in alive if same_process(process, identities[id(process)])]
+        if not alive:
+            return
+        if action:
+            for process in alive:
+                try:
+                    getattr(process, action)()
+                except psutil.NoSuchProcess:
+                    pass
+        _, alive = psutil.wait_procs(alive, timeout=timeout)
+    if alive:
+        raise RuntimeError("startup_cleanup_process_timeout")
+
+
+def cleanup_owned_browser(browser):
+    snapshot = {}
+    try:
+        snapshot = owned_process_snapshot(browser.profile, browser.nonce)
+    finally:
+        try:
+            browser.release(close=True)
+        finally:
+            snapshot.update(owned_process_snapshot(browser.profile, browser.nonce))
+            wait_owned_processes(snapshot)
+            if browser.process is not None and any(pid == browser.process.pid for pid, _ in snapshot):
+                browser.process.wait(timeout=0)
+
+
+def remove_data_dir(data_dir):
+    deadline = time.monotonic()+15
+    while True:
+        try:
+            shutil.rmtree(data_dir)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("startup_cleanup_directory_failed") from None
+            time.sleep(.2)
 
 
 def lifecycle_rows(data_dir):
@@ -95,11 +184,6 @@ def lifecycle_rows(data_dir):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     except (OSError, ValueError):
         return []
-
-
-def error_reason(error):
-    """Selenium keeps the CDP rejection text in .msg, never in Exception.args."""
-    return str(getattr(error, "msg", error))[:120]
 
 
 def permissions_and_setup(driver):
@@ -115,17 +199,15 @@ def permissions_and_setup(driver):
     try:
         allow_location_permissions(driver)
     except Exception as error:
-        # The rejected arguments are this repository's public permission-name
-        # constants, never credentials or page data.
         emit("permission_failed", command="Browser.setPermission",
-             error_type=type(error).__name__, reason=error_reason(error))
+             error_type=type(error).__name__)
         raise
     import tt_market_exec as core
     try:
         core.prepare_browser_execution(driver)
     except Exception as error:
         emit("permission_failed", command="Emulation.setFocusEmulationEnabled",
-             error_type=type(error).__name__, reason=error_reason(error))
+             error_type=type(error).__name__)
         raise
 
 
@@ -171,35 +253,26 @@ def run(stage):
         emit("navigated", previous_url=previous, url=driver.current_url, marker_observed=True)
         stage["name"] = "browser_closed"
     finally:
-        if browser is not None:
-            try:
-                browser.release(close=True)  # Detach the driver, then close the owned Chrome.
-            except Exception:
-                pass
-        emit("teardown_complete", lifecycle=lifecycle_rows(data_dir))
-        for process in owned_leftovers(data_dir):  # Strictly this run's profile: terminate, then kill.
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-        for attempt in range(20):
-            try:
-                shutil.rmtree(data_dir)
-                break
-            except OSError:
-                if attempt == 19:
-                    emit("cleanup_failed")
-                    raise
-                time.sleep(.2)
-        if server_thread is not None:
-            server.shutdown()
-        server.server_close()
-        if server_thread is not None:
-            server_thread.join(timeout=5)
+        body_failed = sys.exc_info()[0] is not None
+        cleanup_stage = "teardown_complete"
+        try:
+            if browser is not None:
+                cleanup_owned_browser(browser)
+            emit("teardown_complete", lifecycle=lifecycle_rows(data_dir))
+            cleanup_stage = "cleanup_verified"
+            if not body_failed:
+                stage["name"] = cleanup_stage
+            remove_data_dir(data_dir)
+        except Exception as error:
+            stage["name"] = cleanup_stage
+            emit("cleanup_failed", error_type=type(error).__name__)
+            raise
+        finally:
+            if server_thread is not None:
+                server.shutdown()
+            server.server_close()
+            if server_thread is not None:
+                server_thread.join(timeout=5)
     emit("cleanup_verified")
 
 
@@ -208,8 +281,7 @@ def main():
     try:
         run(stage)
     except Exception as error:
-        detail = error_reason(error)
-        emit("failed", failed_stage=stage["name"], error_type=type(error).__name__, detail=detail)
+        emit("failed", failed_stage=stage["name"], error_type=type(error).__name__)
         return 1
     emit("success")
     return 0

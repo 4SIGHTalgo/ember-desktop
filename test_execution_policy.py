@@ -1,4 +1,4 @@
-"""The five enabled production families; pure policy tables."""
+"""Approved production families; conditional complements stay disabled."""
 import unittest
 
 from execution_policy import (ALLOWED_FAMILIES, DISTRIBUTION_MARKETS, EXCLUDED_FAMILIES,
@@ -6,11 +6,11 @@ from execution_policy import (ALLOWED_FAMILIES, DISTRIBUTION_MARKETS, EXCLUDED_F
 
 
 class FiveFamilyPolicyTests(unittest.TestCase):
-    def test_exactly_five_families_and_only_positive_one_point_five_sets(self):
-        self.assertEqual(ALLOWED_FAMILIES, {'split', 'complement', 'closeout', 'set_handicap', 'point_handicap'})
+    def test_only_complement_is_disabled_and_only_positive_one_point_five_sets(self):
+        self.assertEqual(ALLOWED_FAMILIES, {'split', 'closeout', 'set_handicap', 'point_handicap'})
         for family in ('split', 'complement'):
             for target in (2, 3, 4, 5):
-                self.assertTrue(allows_bet({'betType': family, 'nextSet': target}, {'name': f'Game {target}'}))
+                self.assertEqual(allows_bet({'betType': family, 'nextSet': target}, {'name': f'Game {target}'}), family == 'split')
         self.assertTrue(allows_bet({'betType': 'closeout'}, {'name': 'Moneyline'}))
         self.assertTrue(allows_bet({'betType': 'point_handicap'}, {'name': 'Points Spread'}))
         for line in (1.5, -1.5, 2.5, None):

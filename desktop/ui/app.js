@@ -31,16 +31,20 @@ function render() {
       `Last history update: ${snapshot.last_history_at || 'not received yet'}`, snapshot.detail || 'Waiting for scanner telemetry.'].join('\n');
   }
   const offset = scannerState?.server_offset || 0;
+  window.EmberBoard.render({connected, healthy, serverOffset: offset, confidence: $('conservative-level').value === 'very_conservative' ? 95 : 90});
   if (signalView && Date.parse(signalView.expires_at) <= Date.now() + offset * 1000) signalView = null;
   window.EmberOpportunity.render(signalView || snapshot.opportunity, {connected, healthy, heartbeatAge: seconds,
     serverOffset: offset, running, providerReady, browserClosed, browserEvent});
 }
 const savedApi = localStorage.getItem('ember-api');
-if (savedApi) $('api').value = savedApi;
+const previousApis = new Set();
+if (savedApi && !previousApis.has(savedApi.replace(/\/+$/, '')) && !/\.trycloudflare\.com(?:\/|$)/i.test(savedApi)) $('api').value = savedApi;
+else if (savedApi) localStorage.setItem('ember-api', $('api').value);
 $('login').onclick = async () => {
   $('login').disabled = true;
   $('sync-missed').disabled = true;
   window.EmberHistory.update({records: [], counts: {}, queued: 0, sync_state: 'idle'});
+  window.EmberBoard.reset();
   localStorage.setItem('ember-api', $('api').value.trim());
   const result = await run('login', {api: $('api').value.trim()});
   if (!result.ok) $('login').disabled = false;
@@ -48,7 +52,7 @@ $('login').onclick = async () => {
 for (const id of ['conservative-level', 'kelly', 'cap']) {
   const saved = localStorage.getItem(`ember-${id}`);
   if (saved !== null && (id === 'cap' ? Number(saved) > 0 && Number(saved) <= 100 : [...$(id).options].some(option => option.value === saved))) $(id).value = saved;
-  $(id).onchange = () => localStorage.setItem(`ember-${id}`, $(id).value);
+  $(id).onchange = () => { localStorage.setItem(`ember-${id}`, $(id).value); render(); };
 }
 $('start').onclick = () => {
   if (!$('cap').reportValidity()) return;
@@ -73,7 +77,9 @@ $('test-sound').onclick = async () => {
   $('test-sound').textContent = result.ok && result.value ? 'Sound played · test again' : 'Sound unavailable · check your system audio';
 };
 window.__TAURI__.event.listen('worker', ({payload}) => {
-  if (payload.kind === 'scanner') scannerState = payload;
+  if (payload.kind === 'scanner') { scannerState = payload; window.EmberBoard.scan(payload.snapshot); }
+  if (payload.kind === 'slip') window.EmberBoard.slip(payload);
+  if (payload.kind === 'positions') window.EmberBoard.positions(payload);
   if (payload.kind === 'missed_history') window.EmberHistory.update(payload);
   if (payload.kind === 'opportunity') signalView = payload.snapshot;
   if (payload.kind === 'session') {

@@ -97,6 +97,29 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.assertAlmostEqual(self.now, .35)
         self.assertTrue(all(call.kwargs['timeout'] <= .35 for call in self.core.open_props.call_args_list))
 
+    def test_open_and_reveal_share_one_turn_rather_than_two_wait_budgets(self):
+        def opening(*args, **kwargs):
+            self.advance(.2)
+            return True
+        self.core.open_props.side_effect = opening
+        self.core.reveal_set_winner.return_value = {'status': 'waiting', 'reason': 'expanding winner section'}
+        result = self.reader.prepare(self.driver, EVENT, MARKET, lambda: True, lambda: 5-self.now)
+        self.assertEqual(result['status'], 'not_ready')
+        self.assertAlmostEqual(self.now, .3)
+
+    def test_exact_ready_staged_leg_bypasses_open_and_reveal_entirely(self):
+        with patch('ember_market_readiness.plan_slip_ready', return_value=True):
+            result = self.reader.prepare(self.driver, EVENT, MARKET, lambda: True, lambda: 5, plan={})
+        self.assertTrue(result['staged'])
+        self.core.open_props.assert_not_called()
+        self.core.reveal_set_winner.assert_not_called()
+
+    def test_verified_event_does_not_reopen_the_page_on_every_readiness_turn(self):
+        self.core.correct_event = Mock(return_value=True)
+        self.core.reveal_set_winner.return_value = {'status': 'revealed'}
+        self.assertEqual(self.reader.prepare(self.driver, EVENT, MARKET, lambda: True, lambda: 5)['status'], 'revealed')
+        self.core.open_props.assert_not_called()
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = f'''<!doctype html><html><body>

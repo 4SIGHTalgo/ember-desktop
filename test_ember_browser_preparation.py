@@ -88,6 +88,23 @@ class BrowserPreparationTests(unittest.TestCase):
         self.assertEqual(readiness.warm.call_count, 2)
         self.assertEqual(self.core.open_props.call_count, 1)
 
+    def test_staged_matches_or_live_board_hold_league_navigation_after_hint_expiry(self):
+        self.step(self.hint)
+        self.events.clear()
+        self.clock[0] = 30
+        self.preparation.step(self.driver, None, True, self.server_now, hold=True)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.preparation.key, ('100', 'closeout'))
+        self.preparation.step(self.driver, self.hint, False, self.server_now, hold=True)
+        self.assertEqual(self.events, [])
+
+    def test_live_inventory_also_blocks_failed_event_league_recovery(self):
+        self.core.open_props.return_value = False
+        for second in (0, 2, 4, 6, 8):
+            self.clock[0] = second
+            self.preparation.step(self.driver, self.hint, True, self.server_now, hold=True)
+        self.assertNotIn('league', self.events)
+
 
 if __name__ == "__main__":
     unittest.main()

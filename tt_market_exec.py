@@ -31,12 +31,14 @@ from wager_submission import SUBMISSION_UI_JS, LOAD_RECOVERY_JS, recover_load_no
 from execution_timing import ExecutionTiming
 from tt_market_semantics import closeout_state, name_key, score_state
 from execution_policy import MARKET_FAMILIES
+from ember_slip import EXACT_SLIP_READER_JS, plan_slip_config
 
 ROOT = Path(__file__).resolve().parent
 
 LEAGUE_URL = "https://sportsbook.draftkings.com/leagues/tabletennis/tt-elite-series"
 DISPATCH_TARGET_MS = 1000
 SLIP_ARM_TIMEOUT = 10
+PLAN_READY_TIMEOUT = .25
 SELECTION_CLICK_TIMEOUT = 2.0
 SELECTION_DELIVERY_TIMEOUT = 2.0
 SLIP_ARM_INTERVAL = .1  # Browser-side fallback; DOM mutations wake readiness immediately.
@@ -254,14 +256,14 @@ def open_props(driver, event, market=None, timeout=15):
     return True
 
 
-def reveal_set_winner(driver, event, market, display=None):
+def reveal_set_winner(driver, event, market, display=None, *, staging=False):
     if not correct_event(driver, event):
         driver.execute_script(REVEAL_SCRIPT, None)
         return {"status": "wrong event", "missingRow": False}
     moneyline = market.get("name") == "Moneyline"
     MARKETS = MARKET_FAMILIES
     distribution = market.get("name") in MARKETS
-    if moneyline and (market["name"] != "Moneyline" or closeout_state(event) is None
+    if moneyline and staging is not True and (market["name"] != "Moneyline" or closeout_state(event) is None
                       or market.get("scoreState") != score_state(event)):
         return {"status": "wrong event", "missingRow": False,
                 "reason": "Moneyline is not a verified close-out state"}
@@ -541,7 +543,8 @@ return {slip: 'present', empty: !!slip.querySelector('[data-testid="betslip-empt
 # any edge is proven. Reading the staged selection IDs lets the submit path reuse
 # that leg (place the size and submit) instead of clearing and re-clicking it,
 # and lets idle maintenance clear it once the opportunity is gone.
-SLIP_LEGS_SCRIPT = VISIBLE_UI_JS + """
+SLIP_LEGS_SCRIPT = VISIBLE_UI_JS + BALANCE_READER_JS + EXACT_SLIP_READER_JS + """
+if(arguments[0]?.exact)return publicSlipSnapshot();
 const panels = [...document.querySelectorAll('[data-testid="betslip-content-wrapper"]')].filter(visibleUI);
 if (panels.length !== 1) return {status: 'missing', legs: []};
 const slip = panels[0];
@@ -552,7 +555,8 @@ const legs = [...slip.querySelectorAll('[data-testid="betslip-selection-card-ex-
         catch (_) { return null; }
     })
     .filter(Boolean)
-    .map(tracking => ({selectionId: tracking.selectionId ?? null}));
+    .map(tracking => ({selectionId: tracking.selectionId ?? null,
+        eventId: tracking.eventId ?? null, marketId: tracking.marketId ?? null}));
 return {status: 'present', legs};
 """
 
@@ -615,40 +619,54 @@ return window.__dkKeepAlive || null;
 # Protocol 2 execution surface. The plan arrives already validated; the browser
 # only re-verifies identity at the last instant. No EV, probability or sizing
 # arithmetic ever runs here — the server computed the floor and the stake.
-PLAN_ARM_READER_JS = LOCATION_READER_JS + VISIBLE_UI_JS + BALANCE_READER_JS + """
+PLAN_SLIP_READER_JS = VISIBLE_UI_JS + BALANCE_READER_JS + EXACT_SLIP_READER_JS
+PLAN_SLIP_SNAPSHOT_SCRIPT = SLIP_LEGS_SCRIPT
+PLAN_SLIP_READY_SCRIPT = LOCATION_READER_JS + PLAN_SLIP_READER_JS + """
+const leg=readExactPlanLeg(arguments[0]);
+return {ready:!readDkLocation().blocked&&leg.status==='ready'&&exactSlipSnapshot().stagingSafe===true};
+"""
+PLAN_CLEAR_STAKE_SCRIPT = PLAN_SLIP_READER_JS + """
+const owned=window.__ttPlanStake,cfg=arguments[0];
+if(!owned||owned.token!==cfg.stakeToken)return {cleared:true};
+let input=owned.input;
+if(!input.isConnected){
+    const leg=readExactPlanLeg(cfg,true);
+    if(leg.status!=='ready')return {cleared:false};
+    input=leg.input;
+}
+writeSlipStake(input,'');
+const cleared=input.value===''&&exactSlipSnapshot().stagingSafe===true&&
+    [...document.querySelectorAll(stakeSelector)].every(zeroStake);
+if(cleared)window.__ttPlanStake=null;
+return {cleared};
+"""
+
+PLAN_ARM_READER_JS = LOCATION_READER_JS + PLAN_SLIP_READER_JS + """
 const armPlanSlip = cfg => {
 const locationState = readDkLocation();
 if (locationState.blocked) return {status: 'waiting', locationBlocked: true,
     location: locationState, reason: locationState.message};
 const notices = [...document.querySelectorAll('[role="alert"], [data-testid*="toast"]')]
     .filter(e => e.getClientRects().length).map(e => (e.innerText || '').trim().slice(0, 600)).filter(Boolean);
-const panels = [...document.querySelectorAll('[data-testid="betslip-content-wrapper"]')].filter(visibleUI);
-if (panels.length !== 1) return {status: 'waiting', slipVisible: false,
-    reason: panels.length ? 'multiple visible bet slips' : 'bet slip is hidden or not mounted', notices};
-const slip = panels[0];
-if (slip.querySelector('[data-testid="betslip-empty-state-title"]')) {
-    return {status: 'waiting', empty: true, reason: 'bet slip is empty; the selection never landed on it',
-            slipText: slip.innerText, notices};
-}
-const buttons = [...slip.querySelectorAll('button[data-testid="betslip-place-bet-button"]')].filter(visibleUI);
-if (buttons.length !== 1) return {status: 'waiting', reason: 'waiting for one visible place-bet button', notices};
-const button = buttons[0];
+const leg=readExactPlanLeg(cfg);
+if(leg.status!=='ready')return leg;
+const {slip,input,button}=leg;
 const label = (button.innerText || '').trim();
 if (/log\\s*in|sign\\s*in/i.test(label)) return {status: 'waiting', signIn: true,
     slipVisible: true, submitVisible: true, placeText: label,
     reason: 'the visible submit control asks to sign in', notices};
-const inputs = [...slip.querySelectorAll('input[data-testid="betslip-wager-box-input"]')].filter(visibleUI);
-if (inputs.length !== 1) return {status: 'waiting', reason: 'waiting for one visible stake input', notices};
-const input = inputs[0];
-const decimalOdds = slipDecimal(slip);
+const decimalOdds = leg.decimalOdds;
 const balance = readAvailableBalance();
 const common = {slipVisible: true, submitVisible: true, placeText: label, decimalOdds, balance,
+        targetFingerprint:leg.fingerprint,
         placeDisabled: button.disabled || button.getAttribute('aria-disabled') === 'true',
         acceptsOddsChange: /accept\\s+(?:odds|price)\\s+changes?/i.test(label),
-        odds: [...slip.querySelectorAll('[data-testid="betslip-odds-standard"]')]
+        odds: [...leg.root.querySelectorAll('[data-testid="betslip-odds-standard"]')]
             .filter(visibleUI).map(e => (e.innerText || '').trim()).filter(Boolean),
-        slipText: slip.innerText, html: slip.outerHTML.slice(0, 40000), notices};
+        slipText: leg.text, notices};
 if (cfg.readOnly) {
+    if (!cfg.expectedFingerprint && !zeroStake(input)) return {...common, status:'aborted',
+        quoteRejected:true, reason:'the staged target stake is not zero'};
     if (balance.reason) return {...common, status: 'aborted', quoteRejected: true, reason: balance.reason};
     if (decimalOdds === null) return {...common, status: 'aborted', quoteRejected: true,
         reason: 'the slip price is unreadable'};
@@ -659,6 +677,8 @@ if (!Number.isFinite(stake) || stake < .01) return {...common, status: 'aborted'
     quoteRejected: true, reason: 'the authorized stake is invalid'};
 const stakeWritten = !input.value.trim() || Number(input.value) !== stake;
 if (stakeWritten) {
+    if(cfg.continuation)return {...common,status:'aborted',reason:'continuation stake changed; no rearming after submission'};
+    window.__ttPlanStake={token:cfg.stakeToken,input};
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
     setter.call(input, String(stake));
     input.dispatchEvent(new Event('input', {bubbles: true}));
@@ -680,7 +700,8 @@ PLAN_ARM_SCRIPT = PLAN_ARM_READER_JS + "return armPlanSlip(arguments[0]);"
 WAIT_FOR_PLAN_ARM_SCRIPT = PLAN_ARM_READER_JS + """
 const cfg = arguments[0], done = arguments[arguments.length - 1];
 const start = performance.now();
-let observer, deadline, fallback, scheduled, finished = false, checks = 0, stakeWrites = 0;
+const timeoutMs=Math.max(0,Math.min(250,cfg.timeoutMs||0,cfg.validUntil-Date.now()));
+let observer, deadline, fallback, scheduled, last, finished = false, checks = 0, stakeWrites = 0;
 const finish = (result, timedOut = false) => {
     if (finished) return;
     finished = true;
@@ -692,6 +713,7 @@ const read = () => {
     checks++;
     const result = armPlanSlip(cfg);
     if (result.stakeWritten) stakeWrites++;
+    last=result;
     return result;
 };
 const check = () => {
@@ -711,13 +733,13 @@ observer = new MutationObserver(() => {
 });
 scheduled = null;
 observer.observe(document.documentElement, {subtree: true, childList: true, attributes: true, characterData: true});
-deadline = setTimeout(() => finish(read(), true), cfg.timeoutMs);
-const emptyDeadline = Math.min(cfg.timeoutMs,cfg.emptyTimeoutMs || cfg.timeoutMs);
+deadline = setTimeout(() => finish(last||{status:'waiting',notReady:true}, true), timeoutMs);
+const emptyDeadline = Math.min(timeoutMs,cfg.emptyTimeoutMs ?? timeoutMs);
 fallback = setInterval(check, cfg.fallbackMs);
 check();
 """
 
-CONFIRM_PLAN_SCRIPT = LOCATION_READER_JS + VISIBLE_UI_JS + BALANCE_READER_JS + SUBMISSION_UI_JS + """
+CONFIRM_PLAN_SCRIPT = LOCATION_READER_JS + PLAN_SLIP_READER_JS + SUBMISSION_UI_JS + """
 const locationState = readDkLocation();
 if (locationState.blocked) return {status: 'aborted', locationBlocked: true,
     location: locationState, reason: locationState.message};
@@ -726,23 +748,29 @@ if (!Number.isFinite(cfg.stake) || cfg.stake < .01
         || !Number.isFinite(cfg.minDecimal) || cfg.minDecimal <= 1) {
     return {status: 'aborted', planRejected: true, reason: 'the authorized stake or price floor is invalid'};
 }
-const panels = [...document.querySelectorAll('[data-testid="betslip-content-wrapper"]')].filter(visibleUI);
-if (panels.length !== 1) return {status: 'aborted', uiRejected: true, reason: 'bet slip is hidden or ambiguous'};
-const slip = panels[0];
+const leg=readExactPlanLeg(cfg);
+if(leg.status!=='ready')return leg;
+const {slip}=leg;
+if(cfg.continuation&&JSON.stringify(window.__ttSubmitFlow?.planIdentity)!==JSON.stringify({
+    eventId:cfg.eventId,marketId:cfg.marketId,selectionId:cfg.selectionId,selectionLabel:cfg.selectionLabel,
+    marketName:cfg.marketName,selectionLine:cfg.selectionLine}))
+    return {status:'aborted',uiRejected:true,reason:'continuation target identity changed'};
 const continuationError=checkSubmissionContinuation(cfg,slip);
 if(continuationError)return continuationError;
 const limit=cfg.continuation?.kind==='stake-limit'?stakeLimitPrompt():null;
 if(cfg.continuation?.kind==='stake-limit'&&(!limit||limit.maximum!==cfg.providerStakeLimit))
     return {status:'aborted',reason:'provider maximum stake changed'};
 const surface=limit?.root||slip;
+// A detached limit dialog has no independently verified contract identity.
+if(limit&&limit.root!==leg.root)return {status:'aborted',uiRejected:true,reason:'unsupported unscoped stake-limit confirmation'};
 const normalizeSubmission=s=>s.toLowerCase().replace(/[łøđ]/g,c=>({ł:'l',ø:'o',đ:'d'})[c])
     .normalize('NFKD').replace(/\\p{M}/gu,'').replace(/[^\\p{L}\\p{N}]+/gu,' ').trim();
-const containsSubmission=value=>(' '+normalizeSubmission(submissionText(surface))+' ').includes(' '+normalizeSubmission(value)+' ');
+const containsSubmission=value=>(' '+normalizeSubmission(submissionText(leg.root))+' ').includes(' '+normalizeSubmission(value)+' ');
 const marketNames=cfg.marketName==='Moneyline'?['Moneyline','Match Winner']:[cfg.marketName];
 if(cfg.selectionLabel&&(!containsSubmission(cfg.selectionLabel)||!marketNames.some(containsSubmission)))
     return {status:'aborted',uiRejected:true,reason:'confirmation does not match the selected player and market'};
 if(cfg.selectionLine!==undefined&&cfg.selectionLine!==null){
-    const text=submissionText(surface).replace(/\\u2212|\\u2013/g,'-').replace(/\\$\\s*[\\d,.]+/g,' ');
+    const text=submissionText(leg.root).replace(/\\u2212|\\u2013/g,'-').replace(/\\$\\s*[\\d,.]+/g,' ');
     const numbers=[...text.matchAll(/(?<![\\d.+-])([+\\-]?\\d+(?:\\.\\d+)?)(?![\\d.])/g)].map(m=>Number(m[1]));
     if(!numbers.some(value=>Math.abs(value-cfg.selectionLine)<1e-9))
         return {status:'aborted',uiRejected:true,reason:'confirmation handicap or total line changed'};
@@ -766,7 +794,7 @@ if (/log\\s*in|sign\\s*in/i.test(label)) return {status: 'aborted', signIn: true
 if (!/place\\s*bet|accept\\s+(?:odds|price)\\s+changes?/i.test(label)) {
     return {status: 'aborted', uiRejected: true, reason: 'submit control label changed'};
 }
-const odds = [...(surface?.querySelectorAll('[data-testid="betslip-odds-standard"]') || [])]
+const odds = [...leg.root.querySelectorAll('[data-testid="betslip-odds-standard"]')]
     .filter(visibleUI).map(e => (e.innerText || '').trim()).filter(Boolean);
 const decimals = odds.map(text => {
     const cleaned = text.replace(/\\u2212|\\u2013/g, '-');
@@ -787,15 +815,17 @@ if (decimalOdds < cfg.minDecimal) {
             minDecimal: cfg.minDecimal, echo: cfg.echo,
             reason: 'the final slip price is below the authorized price floor'};
 }
-const inputs = [...surface.querySelectorAll('input[data-testid="betslip-wager-box-input"],input[name="stake"],input[inputmode="decimal"]')].filter(visibleUI);
+const inputs = [leg.input];
 if (inputs.length !== 1 || !inputs[0].value.trim() || !Number.isFinite(Number(inputs[0].value))) {
     return {status: 'aborted', planRejected: true, reason: 'final slip stake is missing or ambiguous'};
 }
-if (Math.abs(Number(inputs[0].value) - cfg.stake) > .001) {
+if (Number(inputs[0].value) !== cfg.stake) {
     return {status: 'resize', reason: 'the authorized stake changed on the slip'};
 }
 const submitKind = limit?'accept-stake-limit':submissionKind(button);
 recordSubmissionClick(cfg,slip,surface,button,submitKind,limit?.maximum);
+window.__ttSubmitFlow.planIdentity={eventId:cfg.eventId,marketId:cfg.marketId,selectionId:cfg.selectionId,
+    selectionLabel:cfg.selectionLabel,marketName:cfg.marketName,selectionLine:cfg.selectionLine};
 const submittedAt = new Date().toISOString();
 button.click();
 return {status: 'submitted', placeText: label, odds, decimalOdds,
@@ -819,9 +849,10 @@ class LocationRequired(BetSlipError):
 class BetNotSubmitted(BetSlipError):
     """The attempt failed before submission; later sets and games can still bet."""
 
-    def __init__(self, message, comparison=None):
+    def __init__(self, message, comparison=None, *, not_ready=False):
         super().__init__(message)
         self.comparison = comparison
+        self.not_ready = not_ready
 
 
 def signed_in_state(driver):
@@ -993,6 +1024,24 @@ def read_slip_legs(driver):
                      if isinstance(leg, dict)]}
 
 
+def read_plan_slip(driver):
+    """Non-wager snapshot of tracked legs and whether all stake boxes are zero."""
+    result = driver.execute_script(PLAN_SLIP_SNAPSHOT_SCRIPT, {"exact": True})
+    return result if isinstance(result, dict) else {"status": "unsupported", "stagingSafe": False, "legs": []}
+
+
+def plan_slip_ready(driver, event, market, plan):
+    """Whether the exact unstaked leg can execute without any board navigation."""
+    if getattr(driver, "_tt_plan_uncertain", False) is True or getattr(driver, "_tt_plan_stopped", False) is True:
+        return False
+    try:
+        config = plan_slip_config(event, market, plan)
+    except (KeyError, TypeError, ValueError):
+        return False
+    result = driver.execute_script(PLAN_SLIP_READY_SCRIPT, config)
+    return isinstance(result, dict) and result.get("ready") is True
+
+
 def _authorize_values(authorize_values, quote):
     """Values the plan executes with, or a denial the caller records verbatim."""
     values = authorize_values(quote)
@@ -1007,38 +1056,92 @@ def _authorize_values(authorize_values, quote):
     return values
 
 
-def place_plan(driver, event, market, plan, outcome, authorize_values, validate=None, timing=None):
+def place_plan(driver, event, market, plan, outcome, authorize_values, validate=None, timing=None, *, deadline_budget=None):
     """Execute one validated server plan by comparison; no strategy math runs here.
 
     authorize_values receives each observed slip quote (balance + decimal odds)
     and returns the authoritative {"stake", "min_decimal", "echo"} — or
     {"denied": reason} when the server withholds the wager. The browser never
     re-derives a stake or a price floor; it only verifies them at the last instant.
+    deadline_budget is an optional remaining dispatch budget in seconds. DOM waits
+    are capped at 250 ms; a submitted wager still requires receipt reconciliation.
     """
     trace = timing or ExecutionTiming(event, market)
+    if getattr(driver, "_tt_plan_uncertain", False) is True or getattr(driver, "_tt_plan_stopped", False) is True:
+        return {"status": "stopped", "reason": "a previous plan submission is uncertain; reconcile before resuming",
+                "submitted": False, "submissionState": "uncertain" if getattr(driver, "_tt_plan_uncertain", False) is True
+                else "not-submitted", "retryable": False, "notReady": False}
+    transaction = {"uncertain": False, "touched": False, "lost": False}
+    result = None
     try:
-        result = _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace)
-        if result is not None:
-            result["timing"] = trace.snapshot(result.get("status"))
-        return result
+        transaction["target"] = plan_slip_config(event, market, plan, outcome)
+        transaction["target"]["stakeToken"] = str(time.time_ns())
+        if deadline_budget is not None:
+            if type(deadline_budget) not in (int, float) or not math.isfinite(deadline_budget) or deadline_budget < 0:
+                raise ValueError("deadline_budget must be finite nonnegative seconds")
+            transaction["target"]["validUntil"] = min(transaction["target"]["validUntil"],
+                                                       (time.time() + deadline_budget) * 1000)
+        transaction["expires"] = time.monotonic() + max(0, transaction["target"]["validUntil"] / 1000 - time.time())
+        result = _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace, transaction)
     except FATAL_BROWSER_ERRORS:
+        transaction["lost"] = True
+        driver._tt_plan_stopped = True
         raise
+    except (KeyError, TypeError, ValueError) as error:
+        result = {"status": "unconfirmed" if transaction["uncertain"] else "skipped",
+                "reason": str(error), "submitted": transaction["uncertain"]}
     except SignInRequired as error:
-        return {"status": "paused", "reason": str(error), "eventId": event["eventId"],
+        result = {"status": "paused", "reason": str(error), "eventId": event["eventId"],
                 "market": market["name"], "label": outcome["label"], "submitted": False}
     except LocationRequired as error:
-        return {"status": "paused", "reason": str(error), "eventId": event["eventId"],
+        result = {"status": "paused", "reason": str(error), "eventId": event["eventId"],
                 "market": market["name"], "label": outcome["label"], "submitted": False}
     except BetNotSubmitted as error:
-        return {"status": "skipped", "reason": str(error), "eventId": event["eventId"],
+        result = {"status": "skipped", "reason": str(error), "eventId": event["eventId"],
                 "market": market["name"], "label": outcome["label"], "submitted": False,
-                "comparison": error.comparison}
+                "comparison": error.comparison, "notReady": error.not_ready}
     except (BetSlipError, WebDriverException) as error:
-        return {"status": "stopped", "reason": f"{type(error).__name__}: {error}",
-                "eventId": event["eventId"], "market": market["name"], "submitted": False}
+        result = {"status": "unconfirmed" if transaction["uncertain"] else "stopped",
+                "reason": f"{type(error).__name__}: {error}",
+                "eventId": event["eventId"], "market": market["name"], "submitted": transaction["uncertain"]}
+    finally:
+        if transaction["uncertain"]:
+            driver._tt_plan_uncertain = True
+        if transaction["touched"] and not transaction["uncertain"] and not transaction["lost"]:
+            try:
+                cleared = driver.execute_script(PLAN_CLEAR_STAKE_SCRIPT, transaction["target"]) or {}
+            except FATAL_BROWSER_ERRORS:
+                driver._tt_plan_stopped = True
+                raise
+            except WebDriverException:
+                cleared = {}
+            if cleared.get("cleared") is not True:
+                driver._tt_plan_stopped = True
+                result = {"status": "stopped", "submitted": False, "cleanupFailed": True,
+                          "reason": "the target stake could not be cleared; stop before another signal"}
+    if result is not None:
+        if transaction["uncertain"]:
+            result.update(status="unconfirmed", submitted=True)
+        result["submissionState"] = "uncertain" if transaction["uncertain"] else (
+            "placed" if result.get("status") == "placed" else "not-submitted")
+        result.setdefault("notReady", False)
+        result["retryable"] = result["notReady"] and result["submissionState"] == "not-submitted"
+        result["timing"] = trace.snapshot(result.get("status"))
+    return result
 
 
-def _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace):
+def _plan_wait_ms(transaction):
+    remaining = min(transaction["expires"] - time.monotonic(),
+                    transaction["target"]["validUntil"] / 1000 - time.time())
+    if remaining <= 0:
+        raise BetNotSubmitted("plan deadline or dispatch budget expired")
+    return min(PLAN_READY_TIMEOUT, SLIP_ARM_TIMEOUT, remaining) * 1000
+
+
+def _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace, transaction):
+    target = transaction["target"]
+    if time.time() * 1000 >= target["validUntil"]:
+        raise BetNotSubmitted("plan deadline expired")
     if validate is not None and not trace.call("planLiveValidation", validate):
         return {"status": "skipped", "reason": "the live authorization expired before the plan",
                 "submitted": False, "denied": "authorization_denied"}
@@ -1047,27 +1150,33 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     location = trace.call("planLocationCheck", location_status, driver)
     if location.get("blocked"):
         raise LocationRequired(location.get("message") or location["state"])
-    if not trace.call("planLoadRecovery", recover_load_notice, driver, LOAD_RECOVERY_SCRIPT):
-        raise BetNotSubmitted("DraftKings page load error did not clear before submission")
-    if not trace.call("planSlipOpen", ensure_slip_open, driver):
-        raise BetNotSubmitted("the bet-slip accordion did not open")
-    legs = trace.call("planSlipLegs", read_slip_legs, driver) or {}
-    staged = legs.get("legs") if legs.get("status") == "present" else []
-    if staged != [outcome["selectionId"]] and not trace.call("planSlipClear", clear_slip, driver):
-        raise BetSlipError("could not empty the bet slip before the plan")
+    if not trace.call("planLoadRecovery", recover_load_notice, driver, LOAD_RECOVERY_SCRIPT, timeout=0):
+        raise BetNotSubmitted("DraftKings page load error did not clear before submission", not_ready=True)
+    if not trace.call("planSlipOpen", ensure_slip_open, driver, timeout=_plan_wait_ms(transaction) / 1000):
+        raise BetNotSubmitted("the bet-slip accordion did not open", not_ready=True)
+    snapshot = trace.call("planSlipLegs", read_plan_slip, driver)
+    if snapshot.get("status") not in ("empty", "present") or not snapshot.get("stagingSafe"):
+        raise BetNotSubmitted(snapshot.get("reason") or "the staged slip is unsupported or has stakes")
+    staged = any(all(leg.get(key) == target[key] for key in ("eventId", "marketId", "selectionId"))
+                 for leg in snapshot.get("legs", []))
+    if snapshot.get("status") == "present" and not staged:
+        raise BetNotSubmitted("the exact target is absent from the staged slip", not_ready=True)
     values = armed = None
-    for attempt in (1, 2):
-        clicked = trace.call("planSelectionClick", click_selection, driver, event, outcome, market, validate)
+    for attempt in (1,):
+        clicked = ({"status": "selected", "reason": "exact staged leg"} if staged else
+                   trace.call("planSelectionClick", click_selection, driver, event, outcome, market, validate,
+                              timeout=_plan_wait_ms(transaction) / 1000))
         if not clicked or clicked.get("status") not in ("clicked", "selected", "not-delivered"):
             raise BetNotSubmitted((clicked or {}).get("reason", "selection click failed"))
         if clicked.get("status") == "not-delivered":
             armed = {"status": "waiting", "empty": True, "reason": clicked["reason"]}
         else:
-            if not trace.call("planSelectedSlipOpen", ensure_slip_open, driver, allow_empty=False):
-                raise BetNotSubmitted("the selected bet slip did not become visible")
+            if not staged and not trace.call("planSelectedSlipOpen", ensure_slip_open, driver, allow_empty=False,
+                                             timeout=_plan_wait_ms(transaction) / 1000):
+                raise BetNotSubmitted("the selected bet slip did not become visible", not_ready=True)
             quote = trace.call("planSlipQuote", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                               {"readOnly": True, "timeoutMs": SLIP_ARM_TIMEOUT * 1000,
-                                "emptyTimeoutMs": SELECTION_DELIVERY_TIMEOUT * 1000,
+                               {**target, "readOnly": True, "timeoutMs": _plan_wait_ms(transaction),
+                                "emptyTimeoutMs": 0 if staged else _plan_wait_ms(transaction),
                                 "fallbackMs": SLIP_ARM_INTERVAL * 1000}) or {}
             if quote.get("signIn"):
                 raise SignInRequired(f"the visible submit control asks to sign in ({quote.get('placeText')!r})")
@@ -1075,15 +1184,22 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
                 raise LocationRequired(quote.get("reason", "location verification required"))
             if quote.get("status") == "aborted":
                 raise BetNotSubmitted(quote.get("reason", "the slip quote could not be read"),
-                                      {"slipDecimal": quote.get("decimalOdds"), "balance": quote.get("balance")})
+                                      {"slipDecimal": quote.get("decimalOdds"), "balance": quote.get("balance")},
+                                      not_ready=quote.get("notReady") is True)
             if quote.get("status") != "armed":
-                raise BetNotSubmitted(quote.get("reason", "the slip quote did not become ready"))
+                raise BetNotSubmitted(quote.get("reason", "the slip quote did not become ready"), not_ready=True)
+            if (not isinstance(quote.get("targetFingerprint"), str) or not quote["targetFingerprint"]
+                    or type(quote.get("decimalOdds")) not in (int, float)
+                    or not math.isfinite(quote["decimalOdds"]) or quote["decimalOdds"] <= 1):
+                raise BetNotSubmitted("the exact leg quote evidence is incomplete")
             values = _authorize_values(authorize_values, quote)
             if "denied" in values:
                 return {"status": "skipped", "reason": f"the server withheld the wager ({values['denied']})",
                         "submitted": False, "denied": values["denied"]}
+            target.update(expectedFingerprint=quote.get("targetFingerprint"), expectedDecimal=quote.get("decimalOdds"))
+            transaction["touched"] = True
             armed = trace.call("planSlipArming", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                               {"stake": values["stake"], "timeoutMs": SLIP_ARM_TIMEOUT * 1000,
+                               {**target, "stake": values["stake"], "timeoutMs": _plan_wait_ms(transaction),
                                 "fallbackMs": SLIP_ARM_INTERVAL * 1000}) or {}
         if armed.get("signIn"):
             raise SignInRequired(f"the visible submit control asks to sign in ({armed.get('placeText')!r})")
@@ -1096,11 +1212,9 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
                            "capturedAt": datetime.now(timezone.utc).isoformat()})
         if armed.get("status") == "armed" and not armed.get("placeDisabled"):
             break
-        if attempt == 1 and armed.get("empty") is True:
-            if validate is not None and not validate():
-                raise BetNotSubmitted("the score, price or entry window changed before selection recovery")
-            continue
-        raise BetNotSubmitted(armed.get("reason", "bet slip did not arm"))
+        raise BetNotSubmitted(armed.get("reason") or "bet slip did not arm",
+                              not_ready=armed.get("status") == "waiting" or armed.get("notReady") is True
+                              or armed.get("placeDisabled") is True)
     if armed is None or values is None:
         raise BetNotSubmitted("the plan did not arm")
     label = armed.get("placeText") or ""
@@ -1120,17 +1234,24 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
         raise BetSlipError("place-bet button is disabled")
     confirmed = None
     for resize_attempt in range(3):
+        _plan_wait_ms(transaction)
+        if validate is not None and not trace.call("planFinalLiveValidation", validate):
+            raise BetNotSubmitted("the live authorization expired before submission")
+        transaction["uncertain"] = True
+        driver._tt_plan_uncertain = True
         confirmed = trace.call("planFinalSubmit", driver.execute_script, CONFIRM_PLAN_SCRIPT,
-                               {"stake": values["stake"], "minDecimal": values["min_decimal"],
+                               {**target, "stake": values["stake"], "minDecimal": values["min_decimal"],
                                 "echo": values.get("echo"), "selectionLabel": outcome["label"],
                                 "marketName": market["name"],
-                                "selectionLine": (plan.get("specification") or {}).get("line")}) or {}
+                                 "selectionLine": (plan.get("specification") or {}).get("line")}) or {}
+        transaction["uncertain"] = confirmed.get("status") not in ("aborted", "resize")
+        driver._tt_plan_uncertain = transaction["uncertain"]
         if confirmed.get("status") != "resize":
             break
         if resize_attempt == 2:
             raise BetNotSubmitted("the authorized stake kept changing before submission")
         quote = trace.call("planResizeQuote", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                           {"readOnly": True, "timeoutMs": 1000, "fallbackMs": 50}) or {}
+                           {**target, "readOnly": True, "timeoutMs": _plan_wait_ms(transaction), "fallbackMs": 50}) or {}
         if quote.get("status") != "armed" or quote.get("placeDisabled"):
             raise BetNotSubmitted("the changed stake did not re-read")
         values = _authorize_values(authorize_values, quote)
@@ -1138,7 +1259,7 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
             return {"status": "skipped", "reason": f"the server withheld the changed quote ({values['denied']})",
                     "submitted": False, "denied": values["denied"]}
         rearm = trace.call("planStakeResize", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                           {"stake": values["stake"], "timeoutMs": 1000, "fallbackMs": 50}) or {}
+                           {**target, "stake": values["stake"], "timeoutMs": _plan_wait_ms(transaction), "fallbackMs": 50}) or {}
         if rearm.get("status") != "armed" or rearm.get("placeDisabled"):
             raise BetNotSubmitted("the changed stake did not re-arm")
         if validate is not None and not trace.call("planResizeLiveValidation", validate):
@@ -1155,42 +1276,37 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
                                   {"slipDecimal": confirmed.get("decimalOdds"),
                                    "minDecimal": confirmed.get("minDecimal"), "odds": confirmed.get("odds")})
         if confirmed.get("uiRejected") or confirmed.get("planRejected") or confirmed.get("quoteRejected"):
-            raise BetNotSubmitted(confirmed.get("reason", "the final slip is not usable"))
+            raise BetNotSubmitted(confirmed.get("reason", "the final slip is not usable"),
+                                  not_ready=confirmed.get("notReady") is True)
         raise BetSlipError(confirmed.get("reason", "place-bet click failed"))
     trace.note_submission(confirmed)
     state = {"stake": values["stake"], "minDecimal": values["min_decimal"], "echo": values.get("echo")}
 
     def continue_plan(step):
-        # Subsequent prompts belong to this one reserved wager. They may only
-        # reduce its authorized exposure or re-authorize a changed price.
+        # Only an explicit prompt for the same claimed quote may continue this wager.
         if validate is not None and not trace.call("planConfirmationLiveValidation", validate):
             return {"status": "aborted", "reason": "the live authorization expired during confirmation"}
         provider_limit = None
         if step["kind"] == "stake-limit":
-            maximum = step["maximum"]
-            if not math.isfinite(maximum) or maximum <= 0 or maximum >= state["stake"]:
-                return {"status": "aborted", "reason": "provider maximum did not reduce the authorized stake"}
-            state["stake"] = maximum
-            provider_limit = maximum
-            limited = trace.call("planLimitReArm", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                                 {"stake": maximum, "timeoutMs": 1000, "fallbackMs": 50}) or {}
-            if limited.get("status") != "armed":
-                return {"status": "aborted", "reason": "the provider-reduced stake did not arm"}
+            return {"status": "aborted", "reason": "unsupported unscoped stake-limit confirmation"}
         else:
+            try:
+                wait_ms = _plan_wait_ms(transaction)
+            except BetNotSubmitted as error:
+                return {"status": "aborted", "reason": str(error)}
             quote = trace.call("planContinuationQuote", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                               {"readOnly": True, "timeoutMs": 1000, "fallbackMs": 50}) or {}
+                               {**target, "readOnly": True, "continuation": step,
+                                "timeoutMs": wait_ms, "fallbackMs": 50}) or {}
             if quote.get("status") != "armed":
-                return {"status": "aborted", "reason": "the changed-price quote did not re-read"}
+                return {"status": "aborted", "reason": quote.get("reason", "the changed-price quote did not re-read")}
             fresh = _authorize_values(authorize_values, quote)
             if "denied" in fresh:
                 return {"status": "aborted", "reason": f"the server withheld the changed price ({fresh['denied']})"}
-            limited = trace.call("planContinuationReArm", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
-                                 {"stake": fresh["stake"], "timeoutMs": 1000, "fallbackMs": 50}) or {}
-            if limited.get("status") != "armed":
-                return {"status": "aborted", "reason": "the changed-price stake did not re-arm"}
+            if fresh["stake"] != state["stake"]:
+                return {"status": "aborted", "reason": "continuation stake changed; no rearming after submission"}
             state.update(stake=fresh["stake"], minDecimal=fresh["min_decimal"], echo=fresh.get("echo"))
         response = trace.call("planConfirmationFollowup", driver.execute_script, CONFIRM_PLAN_SCRIPT,
-                             {"stake": state["stake"], "minDecimal": state["minDecimal"], "echo": state["echo"],
+                             {**target, "stake": state["stake"], "minDecimal": state["minDecimal"], "echo": state["echo"],
                               "selectionLabel": outcome["label"], "marketName": market["name"],
                               "selectionLine": (plan.get("specification") or {}).get("line"),
                               "continuation": step, "providerStakeLimit": provider_limit}) or {}
@@ -1204,6 +1320,9 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     save_slip_capture({"stage": "plan_receipt", "armed": armed, "confirmed": confirmed, "receipt": receipt,
                        "eventId": event["eventId"], "plan": plan, "timing": trace.snapshot()})
     placed = bool(receipt.get("placed"))
+    if placed:
+        driver._tt_plan_uncertain = False
+        transaction.update(uncertain=False, touched=False)
     location_blocked = receipt.get("locationBlocked")
     return {"status": "placed" if placed else "unconfirmed", "stake": state["stake"],
             "sizingMode": "server_plan", "selectionId": outcome["selectionId"],

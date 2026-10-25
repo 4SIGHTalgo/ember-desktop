@@ -84,7 +84,8 @@ def offer(signal):
             "market": market.get("name"), "selection": plan["selection"],
             "decimal_odds": finite(matches[0].get("decimal")) if len(matches) == 1 else None,
             "point_ev": None, "minimum_ev": None, "ev_mode": None,
-            "score_state": plan["scoreState"], "historical_meetings": None}
+            "score_state": plan["scoreState"], "historical_meetings": None,
+            "bet_type": plan["betType"], "specification": plan["specification"], "target_game": plan["nextSet"]}
     context, outcome, settings = (payload[key] for key in ("context", "outcome", "settings"))
     decimal = outcome["decimal"]
     try:

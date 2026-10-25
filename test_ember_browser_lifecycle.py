@@ -431,6 +431,9 @@ class ClientRecoveryTests(unittest.TestCase):
         def place(driver, event, *_args, **_kwargs):
             seen.append(event["eventId"])
             if driver is drivers[0]:
+                ledger = Ledger(client.data_dir/"execution.sqlite3")
+                self.assertTrue(ledger.reserve_signal(client.account, original))
+                ledger.connection.close()
                 driver.execute_script(core.CONFIRM_PLAN_SCRIPT)
             client.request_stop()
             return {"status": "skipped", "submitted": False,
@@ -444,6 +447,7 @@ class ClientRecoveryTests(unittest.TestCase):
                 patch("ember_provider_login.ProviderLoginGate", return_value=gate), patch("draftkings_session.SessionMaintenance"),
                 patch.object(core, "prepare_browser_execution"), patch.object(core, "ROOT", client.data_dir),
                 patch.object(core, "SLIP_CAPTURE", client.data_dir/"slip.json"),
+                patch("ember_market_readiness.MarketReadiness.prepare", return_value={"status": "revealed", "staged": True}),
                 patch("ember_market_readiness.MarketReadiness.open", return_value={"status": "opened"}),
                 patch("ember_market_readiness.MarketReadiness.wait", return_value={"status": "revealed"}),
                 patch.object(client, "authorize", side_effect=lambda signal, claim=False: client.permits(signal)),
@@ -451,8 +455,11 @@ class ClientRecoveryTests(unittest.TestCase):
                 stack.enter_context(setting)
             stack.enter_context(patch.object(core, "place_plan", side_effect=place))
             client.execute()
-        self.assertEqual(seen, ["100", "200"])
-        self.assertEqual(checked, [((False, 0, True), True, True)])
+        self.assertEqual(seen, ["100"])
+        self.assertEqual(checked, [])
+        owner.open.assert_called_once()
+        owner.recovery.assert_not_called()
+        self.assertFalse(client.lease.running)
         rows = {row["contract"]: row for row in client.history.snapshot(client.history_scope())["records"]}
         self.assertEqual(rows["100:split"]["outcome"], "uncertain")
         ledger = Ledger(client.data_dir/"execution.sqlite3")
@@ -642,7 +649,12 @@ class OwnedBrowserFaultTests(unittest.TestCase):
     def test_stop_then_explicit_start_reuses_durable_profile(self):
         self.driver.execute_script("localStorage.setItem('fixture','saved-after-stop')")
         profile = self.browser.profile
+        process = self.browser.process
+        children = psutil.Process(process.pid).children(recursive=True)
         self.browser.release(close=True)
+        # Chrome child shutdown can outlast the main process; do not race profile reuse.
+        process.wait(timeout=30)
+        psutil.wait_procs(children, timeout=15)
         self.browser = OwnedBrowser(self.directory, ("https://example.com", "fixture"), headless=True)
         self.driver = self.browser.open(lambda: True)
         self.driver.get(self.url)
@@ -666,7 +678,7 @@ class OwnedBrowserFaultTests(unittest.TestCase):
         with self.assertRaises(BrowserClosed):
             self.browser.open(lambda: True)
         self.browser.release(close=True)  # Explicit fixture teardown may close a no-window background process.
-        previous_worker.process.wait(timeout=15)
+        previous_worker.process.wait(timeout=30)
 
 
 if __name__ == "__main__":

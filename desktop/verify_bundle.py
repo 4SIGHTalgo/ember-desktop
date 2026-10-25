@@ -17,6 +17,10 @@ names = set(archive.toc)
 if not {"reveal_next_set.js", "start_draftkings.ps1"} <= names:
     raise SystemExit("Required browser resources are missing from the worker bundle.")
 modules = set(archive.open_embedded_archive("PYZ.pyz").toc)
+if not {"ember_board", "ember_slip", "ember_staging"} <= modules:
+    raise SystemExit("The worker is missing the slip-first board or staging modules.")
+if {"bet_value", "distribution_policy", "frozen_h2h", "tt_elite_follow"} & modules:
+    raise SystemExit("Private strategy modules must not enter the public worker.")
 if not {"execution_policy", "conservative_policy", "tt_market_semantics", "tt_market_exec", "wager_sizing", "wager_submission", "ember_protocol", "ember_opportunity", "ember_history", "ember_market_readiness", "ember_browser_lifecycle", "psutil", "ember_provider_login", "ember_browser_preparation"} <= modules:
     raise SystemExit("The worker is missing the updated submission or sizing modules.")
 for name in names:

@@ -6,11 +6,12 @@ import threading
 import time
 
 from ember_opportunity import validate_opportunity
+from ember_board import validate_board
 from conservative_policy import contract_id
 from execution_policy import allows_bet, allows_payload, ALLOWED_FAMILIES, DISTRIBUTION_FAMILIES, DISTRIBUTION_MARKETS
 from tt_market_semantics import entry_window, name_key, score_state
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 PROTOCOL = 1
 PROTOCOL_V2 = 2
 
@@ -28,13 +29,13 @@ def validate_stage(value):
     """Strict wire check for the optional scanner pre-open hint."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != STAGE_FIELDS or value["protocol"] != PROTOCOL:
+    if not isinstance(value, dict) or set(value) not in (STAGE_FIELDS, STAGE_FIELDS | {"event"}) or value["protocol"] != PROTOCOL:
         raise ValueError("Invalid pre-open hint")
     for field in ("event_id", "market_id", "selection_id"):
         item = value[field]
-        if not isinstance(item, str) or not item.isascii() or len(item) > 64:
+        if not isinstance(item, str) or not item.isascii() or not 0 < len(item) <= 64:
             raise ValueError("Invalid pre-open identity")
-    if value["bet_type"] not in STAGE_BET_TYPES:
+    if value["bet_type"] not in STAGE_BET_TYPES or value["bet_type"] not in ALLOWED_FAMILIES:
         raise ValueError("Invalid pre-open family")
     if not isinstance(value["market_name"], str) or not 0 < len(value["market_name"]) <= 80:
         raise ValueError("Invalid pre-open market")
@@ -46,8 +47,19 @@ def validate_stage(value):
         raise ValueError("Invalid pre-open line")
     updated = datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00"))
     expires = datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00"))
-    if not timedelta(0) < expires-updated <= timedelta(seconds=15):
+    if updated.tzinfo is None or expires.tzinfo is None or not timedelta(0) < expires-updated <= timedelta(seconds=15):
         raise ValueError("Invalid pre-open lifetime")
+    if "event" in value:
+        event = value["event"]
+        if (not isinstance(event, dict) or event.get("eventId") != value["event_id"]
+                or event.get("status") != "STARTED"
+                or any(not isinstance(event.get(k), str) or not 0 < len(event[k]) <= 200 for k in ("player1", "player2"))
+                or value["label"] not in (event["player1"], event["player2"])):
+            raise ValueError("Invalid staged event identity")
+        target = int(value["market_name"][-1]) if value["market_name"] in {"Game 2", "Game 3", "Game 4", "Game 5"} else 5
+        if not allows_bet({"betType": value["bet_type"], "nextSet": target, "specification": {"line": line}},
+                          {"name": value["market_name"]}, {"points": line}):
+            raise ValueError("Disabled staged market")
     return value
 
 
@@ -102,6 +114,19 @@ def validate_scanner(value):
         result["stage"] = validate_stage(value.get("stage"))
     except (ValueError, TypeError, KeyError, OverflowError):
         result["stage"] = None
+    try:
+        stages = value.get("stages", [])
+        if not isinstance(stages, list) or len(stages) > 128:
+            raise ValueError("Invalid stage catalog")
+        result["stages"] = [validate_stage(stage) for stage in stages]
+        if any(not stage or "event" not in stage for stage in result["stages"]):
+            raise ValueError("Catalog needs event identity")
+    except (ValueError, TypeError, KeyError, OverflowError):
+        result["stages"] = []
+    try:
+        result["board"] = validate_board(value.get("board"))
+    except (ValueError, TypeError, KeyError, OverflowError):
+        result["board"] = None
     return result
 
 

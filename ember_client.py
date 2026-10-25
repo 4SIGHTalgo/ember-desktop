@@ -1,5 +1,6 @@
 """Cross-platform desktop sidecar. Secrets stay in OS keychain/native process memory."""
 import base64
+from copy import deepcopy
 from collections import deque
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,9 @@ from ember_browser_session import validation_ticket
 from ember_browser_lifecycle import (ActiveSessionPower, BrowserCancelled, LifecycleLog, OwnedBrowser,
                                      startup_stage)
 from ember_history import OpportunityJournal, reservations, result_reason
+from ember_staging import Staging
+from ember_board import display_board
+from tt_market_exec import read_plan_slip
 from conservative_policy import (DEFAULT_LEVEL, DEFAULT_KELLY, DEFAULT_RISK_PERCENT,
                                   client_settings, validate_risk)
 
@@ -139,8 +143,7 @@ class Client:
         self.signals = SignalQueue(maxsize=100)
         self.pending_contracts = set()
         self.preparation = None
-        self.staged = None          # The scanner-hinted selection pre-opened on the slip.
-        self.stage_due = 0.0
+        self.staging = Staging()
         self.stop = threading.Event()
         self.run_cancel = threading.Event()
         self.run_generation = 0
@@ -204,12 +207,15 @@ class Client:
         return (datetime.now(timezone.utc)+timedelta(seconds=self.lease.server_offset)).isoformat()
 
     def history_outcome(self, signal, outcome, reason, result=None):
+        if outcome in {'placed', 'missed', 'handled', 'uncertain', 'observed_only'}:
+            signal.setdefault('_timing', {}).setdefault('finished', time.monotonic())
         scope = signal.get("_history_scope") or self.history_scope()
         if scope:
             self.history_call(self.history.transition, scope, signal, outcome, reason, now=self.history_time(), result=result)
             self.history_wake.set()
 
     def receive_opportunity(self, signal, scope):
+        signal.setdefault('_timing', {})['received'] = time.monotonic()
         signal["_history_scope"] = scope
         signal["_history_handled"] = False
         if not scope:
@@ -240,6 +246,12 @@ class Client:
         if signature != self.history_signature:
             self.history_signature = signature
             emit("missed_history", **snapshot)
+        positions = []
+        if scope:
+            for outcome in ("placed", "uncertain"):
+                page = self.history_call(self.history.snapshot, scope, outcome=outcome, limit=100)
+                positions.extend((page or {}).get("records", []))
+        emit("positions", records=positions)
 
     def sync_history_once(self):
         scope = self.history_scope()
@@ -360,9 +372,13 @@ class Client:
             self.history_wake.set()
 
 
-    def request(self, path, body=None, authenticated=False):
+    def request(self, path, body=None, authenticated=False, timeout=15):
+        started = time.monotonic()
         if authenticated:
-            self.ensure_access()
+            self.ensure_access(timeout=timeout)
+        timeout -= time.monotonic()-started
+        if timeout <= 0:
+            raise RuntimeError('request_timeout')
         headers = {"X-Ember-Version": VERSION}
         if authenticated:
             headers["Authorization"] = "Bearer " + self.access_token
@@ -370,7 +386,7 @@ class Client:
         if session is None:
             session = self.http_local.session = requests.Session()
         response = session.request("POST" if body is not None else "GET", self.api+path, json=body,
-                                   headers=headers, timeout=15, allow_redirects=False)
+                                   headers=headers, timeout=timeout, allow_redirects=False)
         if response.status_code >= 300:
             code = response.json().get("error", "request_failed") if "json" in response.headers.get("Content-Type", "") else "request_failed"
             raise RuntimeError(code)
@@ -383,17 +399,23 @@ class Client:
         # The Rust host intercepts this message. It is never emitted to the UI.
         emit("credential", token=self.access_token)
 
-    def ensure_access(self):
+    def ensure_access(self, timeout=15):
         if not self.api:
             raise RuntimeError("sign_in_required")
-        with self.auth_lock:
+        started = time.monotonic()
+        if not self.auth_lock.acquire(timeout=timeout):
+            raise RuntimeError('request_timeout')
+        try:
             if self.access_token and time.monotonic() < self.token_until:
                 return
             refresh = self.keyring.get_password("Ember Desktop", self.api)
             if not refresh:
                 raise RuntimeError("sign_in_required")
-            tokens = self.request("/api/v1/token/refresh/", {"refresh_token": refresh})
+            tokens = self.request("/api/v1/token/refresh/", {"refresh_token": refresh},
+                                  timeout=max(.001, timeout-(time.monotonic()-started)))
             self.install_tokens(tokens)
+        finally:
+            self.auth_lock.release()
 
     def login(self, api):
         if not self.login_lock.acquire(blocking=False):
@@ -458,8 +480,6 @@ class Client:
     def feed_disconnected(self, reason, scope=None):
         self.lease.revoke()
         self.preparation = None
-        # The record only; the execution loop clears the leg on its next pass.
-        self.staged = None
         self.last_feed = None
         self.stream_connected = False
         scope = scope or self.history_scope()
@@ -487,6 +507,7 @@ class Client:
         changed = not self.stream_connected or healthy != self.last_feed
         self.stream_connected = True
         self.last_feed = healthy
+        self.scanner = display_board(self.scanner, self.conservative_level)
         if self.device_test:
             self.device_test.update(feed_connected=healthy)
         emit("scanner", connected=True, healthy=healthy, reason="connected",
@@ -547,7 +568,7 @@ class Client:
                                 self.device_test.update(observed_signals=len(self.observed_signals), signal_id=signal["id"],
                                                         event_id=signal["payload"]["event"]["eventId"])
                             emit("status", message=f"Observed model signal {signal['id']} in scan-only mode; no wager will be submitted.")
-                        elif self.permits(signal) and not signal.get("_history_handled"):
+                        elif self.run_permitted() and not signal.get("_history_handled"):
                             try:
                                 self.signals.put_latest(signal)
                             except queue.Full:
@@ -566,21 +587,61 @@ class Client:
                         pass  # A failed close must not kill the reconnect thread.
             self.stop.wait(retry_delay)
 
+    def run_permitted(self):
+        return (not self.readiness_only and not self.run_cancel.is_set() and not self.stop.is_set()
+                and self.provider_ready.is_set() and self.lease.running and self.lease.clock() < self.lease.until)
+
+    def renew_signal(self, signal, status):
+        """Renew time only on the same validated server contract, in place."""
+        if 'signal' not in status:
+            return
+        renewed = validate_signal(status['signal'])
+        def identity(value):
+            value = deepcopy({key: value[key] for key in ('protocol', 'id', 'contract', 'payload')})
+            payload = value['payload']
+            if 'plan' in payload:
+                payload['plan'].pop('deadline')
+            for key in ('event', 'market'):
+                payload[key].pop('receivedAt', None)
+            return value
+        if (identity(renewed) != identity(signal)
+                or timestamp(renewed['expires_at']) < timestamp(signal['expires_at'])
+                or ('plan' in signal['payload'] and timestamp(renewed['payload']['plan']['deadline']) <
+                    timestamp(signal['payload']['plan']['deadline']))):
+            raise ValueError('authorization_contract_changed')
+        signal['expires_at'] = renewed['expires_at']
+        if 'plan' in signal['payload']:
+            signal['payload']['plan']['deadline'] = renewed['payload']['plan']['deadline']
+
+    def authorization_timeout(self, signal, renewal=False):
+        """Yield preclaim turns quickly; a reserved quote gets a longer reply budget."""
+        left = self.lease.until-self.lease.clock()
+        expiry = timestamp(signal['expires_at'])-time.time()-self.lease.server_offset
+        plan = signal['payload'].get('plan')
+        if plan:
+            expiry = min(expiry, timestamp(plan['deadline'])-time.time()-self.lease.server_offset)
+        return max(.001, min(.3 if renewal else .75, left, .3 if renewal and expiry <= 0 else expiry))
+
     def authorize(self, signal, claim=False):
         self.last_authorize_reason = "authorization_denied"
-        if not self.permits(signal):
+        if not self.run_permitted():
             self.last_authorize_reason = ("signal_expired" if timestamp(signal["expires_at"]) <= time.time()+self.lease.server_offset
                 else "session_stopped" if not self.lease.running else "browser_not_ready" if not self.provider_ready.is_set() else "lease_expired")
             return False
         try:
-            status = self.request(f"/api/v1/signals/{signal['id']}/authorize/", {"claim": claim}, authenticated=True)
+            status = self.request(f"/api/v1/signals/{signal['id']}/authorize/", {"claim": claim}, authenticated=True,
+                                  timeout=self.authorization_timeout(signal, renewal=True))
             self.lease.update(status)
+            self.renew_signal(signal, status)
             permitted = self.permits(signal)
             if not permitted:
                 self.last_authorize_reason = ("signal_expired" if timestamp(signal['expires_at']) <= time.time()+self.lease.server_offset
                     else "session_stopped" if not self.lease.running else "browser_not_ready" if not self.provider_ready.is_set() else "lease_expired")
             return permitted
         except Exception as error:
+            if not claim and (isinstance(error, requests.Timeout) or str(error) == 'request_timeout'):
+                self.last_authorize_reason = 'authorization_unavailable'
+                return False
             if str(error) == "contract_claimed_by_another_client":
                 self.last_authorize_reason = "claimed_elsewhere"
                 return False
@@ -590,7 +651,7 @@ class Client:
             self.lease.revoke()
             return False
 
-    def claim_values(self, signal):
+    def claim_values(self, signal, ledger=None):
         """Claim one observed quote; only the server may size the stake."""
 
         def authorize_values(quote):
@@ -600,6 +661,13 @@ class Client:
                     or type(decimal) not in (int, float) or not math.isfinite(decimal) or decimal <= 1):
                 return {"denied": "sizing_failed"}
             self.last_authorize_reason = "authorization_denied"
+            if (not self.permits(signal) or timestamp(signal['payload']['plan']['deadline']) <=
+                    time.time()+self.lease.server_offset):
+                return {"denied": "signal_expired"}
+            if ledger is not None and not signal.get('_reserved'):
+                if not ledger.reserve_signal(self.account, signal):
+                    return {"denied": "already_attempted"}
+                signal['_reserved'] = True
             try:
                 status = self.request(f"/api/v1/signals/{signal['id']}/authorize/",
                                       {"claim": True, "observed": {"decimal": decimal,
@@ -607,7 +675,7 @@ class Client:
                                        "sizing": {"kelly_multiplier": self.kelly_multiplier,
                                                   "max_bankroll_risk_percent": self.max_bankroll_risk_percent,
                                                   "conservative_level": self.conservative_level}},
-                                      authenticated=True)
+                                      authenticated=True, timeout=self.authorization_timeout(signal))
             except Exception as error:
                 if str(error) == "contract_claimed_by_another_client":
                     self.last_authorize_reason = "claimed_elsewhere"
@@ -621,6 +689,11 @@ class Client:
                     self.lease.revoke()
                 return {"denied": self.last_authorize_reason}
             self.lease.update(status)
+            try:
+                self.renew_signal(signal, status)
+            except (ValueError, TypeError, KeyError, OverflowError):
+                self.lease.revoke()
+                return {"denied": "authorization_denied"}
             if not self.permits(signal):
                 self.last_authorize_reason = ("signal_expired" if timestamp(signal['expires_at']) <= time.time()+self.lease.server_offset
                     else "session_stopped" if not self.lease.running else "browser_not_ready" if not self.provider_ready.is_set() else "lease_expired")
@@ -641,14 +714,17 @@ class Client:
 
     def defer_readiness(self, signal, readiness):
         """Yield only before claim/reservation/submission, within the original expiry."""
-        if not self.permits(signal) or min(self.lease.until-self.lease.clock(),
+        if signal.get('_reserved') or not self.permits(signal) or min(self.lease.until-self.lease.clock(),
                 timestamp(signal['expires_at'])-time.time()-self.lease.server_offset) <= .6:
             return False
         try:
+            waiting = self.signals.empty()
             self.signals.put_latest(signal)
         except queue.Full:
             return False
         self.history_outcome(signal, 'pending', 'waiting', result={'readiness': readiness})
+        if waiting:
+            self.stop.wait(.03)
         return True
 
     def execute(self):
@@ -716,62 +792,32 @@ class Client:
                 power.release()
                 self.stopped()
 
-    @staticmethod
-    def stage_key(stage):
-        return (stage["event_id"], stage["market_id"], stage["selection_id"], stage["line"])
-
     def maintain_staging(self, driver, core, browser_preparation, market_readiness, mono):
-        """Pre-open the scanner's anticipated selection on the open slip.
+        stages = (self.scanner or {}).get('stages', [])
+        result = self.staging.step(driver, core, market_readiness, stages,
+            valid=lambda: self.run_permitted() and self.last_feed is True,
+            server_now=time.time()+self.lease.server_offset)
+        self.publish_slip(driver)
+        return result
 
-        Staging clicks the odds button only. It never writes a stake and never
-        submits: a validated signal stays the only execution authority, and the
-        submit path reuses a staged leg only when its selection matches the
-        signal's exactly. When the anticipated opportunity moves or expires,
-        the staged leg is cleared from the slip.
-        """
-        stage = (self.scanner or {}).get("stage") if self.last_feed is True else None
-        fresh = bool(stage and timestamp(stage["expires_at"]) > time.time()+self.lease.server_offset)
-        prepared = bool(fresh and browser_preparation.key and browser_preparation.key[0] == stage["event_id"]
-                        and self.preparation and self.preparation.get("event", {}).get("eventId") == stage["event_id"])
-        if self.staged is not None and (not prepared or self.stage_key(self.staged) != self.stage_key(stage)):
-            try:
-                if core.clear_slip(driver, timeout=2):
-                    self.staged = None
-            except core.FATAL_BROWSER_ERRORS:
-                raise
-            except core.WebDriverException:
-                pass
-            return self.staged
-        if not prepared or self.staged is not None or mono < self.stage_due:
-            return self.staged
-        self.stage_due = mono+2
-        event = self.preparation["event"]
-        market = {"name": stage["market_name"], "marketId": stage["market_id"],
-                  "receivedAt": stage["updated_at"],
-                  "outcomes": [{"selectionId": stage["selection_id"], "label": stage["label"],
-                                "points": stage["line"]}]}
-        if market["name"] == "Moneyline":
-            market["scoreState"] = core.score_state(event)
-        outcome = market["outcomes"][0]
+    def publish_slip(self, driver):
+        snapshot = read_plan_slip(driver)
+        if snapshot.get("status") not in ("empty", "present"):
+            return
+        stages = (self.scanner or {}).get("stages", [])
+        legs = []
+        for leg in snapshot.get("legs", []):
+            hint = next((s for s in stages if (s["event_id"], s["market_id"], s["selection_id"]) ==
+                         (leg["eventId"], leg["marketId"], leg["selectionId"])), {})
+            legs.append({"event_id": leg["eventId"], "market_id": leg["marketId"],
+                         "selection_id": leg["selectionId"], "label": hint.get("label", leg["text"]),
+                         "market": hint.get("market_name", ""), "line": hint.get("line"),
+                         "decimal_odds": leg.get("decimalOdds"), "status": "suspended" if leg.get("suspended") else "ready"})
+        emit("slip", legs=legs, checked_at=self.history_time())
 
-        def still_current():
-            current = self.scanner.get("stage") if self.last_feed is True and isinstance(self.scanner, dict) else None
-            return bool(current and self.stage_key(current) == self.stage_key(stage)
-                        and timestamp(current["expires_at"]) > time.time()+self.lease.server_offset)
-
-        remaining = lambda: time.monotonic()+2
-        if market_readiness.open(driver, event, market, still_current, remaining, max_wait=.35).get("status") != "opened":
-            return self.staged
-        if market_readiness.wait(driver, event, market, still_current, remaining, max_wait=.35).get("status") != "revealed":
-            return self.staged
-        click = core.click_selection(driver, event, outcome, market, validate=still_current, timeout=1.0)
-        if click.get("status") not in ("clicked", "selected"):
-            return self.staged
-        core.ensure_slip_open(driver, allow_empty=False)
-        self.staged = dict(stage)
-        emit("status", message=f"Pre-opened {stage['label']} ({stage['bet_type']}) on the bet slip "
-                               "while waiting for a qualifying signal; no stake was entered.")
-        return self.staged
+    def hold_preparation(self):
+        scanner = self.scanner or {}
+        return bool(self.staging.inventory or scanner.get('stages') or (scanner.get('board') or {}).get('events'))
 
     def execute_browser(self, owner, active):
         import tt_market_exec as core
@@ -847,6 +893,7 @@ class Client:
                     previous_submission = submission_may_have_run
                     submission_may_have_run = True
                     self.history_outcome(current, "submitting", "waiting")
+                    current.setdefault('_timing', {})['submitted'] = time.monotonic()
                     response = original_execute(script, *args)
                     if (not previous_submission and isinstance(response, dict)
                             and response.get("status") in {"aborted", "resize", "skipped", "waiting"}):
@@ -861,6 +908,9 @@ class Client:
             while active():
                 current = None
                 submission_may_have_run = False
+                if any(getattr(self.driver, flag, False) is True for flag in ('_tt_plan_uncertain', '_tt_plan_stopped')):
+                    self.lease.running = False
+                    break
                 if self.device_test and not self.device_test.permits():
                     self.device_test.finish("timed_out")
                     break
@@ -899,6 +949,9 @@ class Client:
                     continue
                 if not table_prepared:
                     self.provider_ready.clear()
+                    if self.hold_preparation():
+                        table_prepared = True
+                        continue
                     try:
                         with redirect_stdout(QuietOutput()):
                             login_gate.navigation_started()
@@ -941,19 +994,23 @@ class Client:
                     self.stop.wait(.5)
                     continue
                 try:
-                    signal = self.signals.get(timeout=.5)
+                    signal = self.signals.get(timeout=.05)
                 except queue.Empty:
                     with redirect_stdout(QuietOutput()):
+                        self.maintain_staging(self.driver, core, browser_preparation, market_readiness, time.monotonic())
                         browser_preparation.step(self.driver, self.preparation,
                             self.lease.clock() < self.lease.until and self.last_feed is True,
-                            time.time()+self.lease.server_offset)
-                        self.maintain_staging(self.driver, core, browser_preparation, market_readiness, time.monotonic())
+                            time.time()+self.lease.server_offset, hold=self.hold_preparation())
                     continue
                 current = signal
+                signal.setdefault('_timing', {}).setdefault('dequeued', time.monotonic())
                 self.pending_contracts.discard(signal["contract"])
                 submission_may_have_run = False
                 self.history_outcome(signal, "processing", "waiting")
-                if not (signal.get('_preflight_authorized') and self.permits(signal)) and not self.authorize(signal):
+                if not (signal.get('_preflight_authorized') and self.permits(signal) and
+                        timestamp(signal['payload']['plan']['deadline']) > time.time()+self.lease.server_offset+.6) and not self.authorize(signal):
+                    if self.last_authorize_reason == 'authorization_unavailable' and self.defer_readiness(signal, {'status': 'authorization_timeout'}):
+                        continue
                     self.history_outcome(signal, "handled" if self.last_authorize_reason == "claimed_elsewhere" else "missed", self.last_authorize_reason)
                     continue
                 signal['_preflight_authorized'] = True
@@ -965,42 +1022,24 @@ class Client:
                 browser_preparation.publish("validating_signal", f"Validating model signal {signal['id']} for {event['player1']} vs {event['player2']}.", event["eventId"])
                 try:
                     with redirect_stdout(QuietOutput()):
-                        login_gate.navigation_started()
-                        plan_deadline = timestamp(plan["deadline"])-time.time()-self.lease.server_offset
-                        remaining = lambda: min(self.lease.until-self.lease.clock(), plan_deadline,
+                        remaining = lambda: min(self.lease.until-self.lease.clock(),
+                                                timestamp(plan['deadline'])-time.time()-self.lease.server_offset,
                                                 timestamp(signal["expires_at"])-time.time()-self.lease.server_offset)
                         if remaining() <= .6:
                             self.history_outcome(signal, "missed", "signal_expired")
                             continue
-                        opening = market_readiness.open(self.driver, event, market,
-                            valid=lambda: self.permits(signal), remaining=remaining, max_wait=.35)
-                        if opening.get("status") != "opened":
-                            if self.defer_readiness(signal, opening):
-                                continue
-                            authorized = self.authorize(signal)
-                            reason = "event_unavailable" if authorized else self.last_authorize_reason
-                            self.history_outcome(signal, "handled" if reason == "claimed_elsewhere" else "missed", reason,
-                                                 result={"readiness": opening})
-                            continue
-                        if not self.permits(signal):
-                            self.authorize(signal)
-                            self.history_outcome(signal, "handled" if self.last_authorize_reason == "claimed_elsewhere" else "missed", self.last_authorize_reason)
-                            continue
-                        readiness = market_readiness.wait(self.driver, event, market,
-                            valid=lambda: self.permits(signal), remaining=remaining, max_wait=.35)
+                        turn_until = time.monotonic()+.3
+                        readiness = market_readiness.prepare(self.driver, event, market,
+                            valid=lambda: self.permits(signal), remaining=remaining, plan=plan)
                         if readiness.get("status") != "revealed":
                             if self.defer_readiness(signal, readiness):
                                 continue
-                            authorized = self.authorize(signal)
-                            reason = "market_unavailable" if authorized else self.last_authorize_reason
+                            reason = "market_unavailable" if self.permits(signal) else "signal_expired"
                             self.history_outcome(signal, "handled" if reason == "claimed_elsewhere" else "missed", reason,
                                                  result={"readiness": readiness})
                             continue
                         self.history_outcome(signal, "processing", "waiting", result={"readiness": readiness})
                         # Protocol 2 claims only with the observed quote, inside the plan flow.
-                        if not ledger.reserve_signal(self.account, signal):
-                            self.history_outcome(signal, "handled", "already_attempted")
-                            continue
                         if self.device_test and not self.device_test.claim(signal):
                             self.lease.running = False
                             continue
@@ -1011,13 +1050,24 @@ class Client:
                         if outcome is None:
                             self.history_outcome(signal, "missed", "execution_error")
                             continue
+                        if not readiness.get('staged'):
+                            selected = self.staging.add(self.driver, core, event, market, outcome,
+                                lambda: self.permits(signal), max(.001, turn_until-time.monotonic()))
+                            if selected.get('status') not in ('clicked', 'selected'):
+                                if self.defer_readiness(signal, selected):
+                                    continue
+                                self.history_outcome(signal, 'missed', 'market_unavailable')
+                                continue
                         result = core.place_plan(self.driver, event, market, plan, outcome,
-                                                 authorize_values=self.claim_values(signal),
-                                                 validate=lambda: self.authorize(signal))
-                        # The attempt consumed, reused or cleared the slip itself.
-                        self.staged = None
+                                                 authorize_values=self.claim_values(signal, ledger),
+                                                 validate=lambda: self.permits(signal),
+                                                 deadline_budget=max(0, remaining()))
                     state = (result or {}).get("status", "not_submitted")
+                    if ((result or {}).get('retryable') is True and (result or {}).get('submissionState') == 'not-submitted'
+                            and not submission_may_have_run and self.defer_readiness(signal, result)):
+                        continue
                     ledger.finish(self.account, signal["contract"], state)
+                    signal.setdefault('_timing', {})['finished'] = time.monotonic()
                     if (result or {}).get("denied"):
                         # The denial reason is authoritative; the result payload
                         # would otherwise be re-interpreted as a non-submission.
@@ -1027,8 +1077,10 @@ class Client:
                         continue
                     if state == "placed":
                         self.history_outcome(signal, "placed", "placed", result=result)
-                    elif state == "unconfirmed" or (submission_may_have_run and (result or {}).get("submitted") is not False):
+                    elif state == "unconfirmed" or (result or {}).get('submissionState') == 'uncertain' or (submission_may_have_run and (result or {}).get("submitted") is not False):
                         self.history_outcome(signal, "uncertain", "submission_uncertain", result=result)
+                        self.lease.running = False
+                        self.lease.revoke()
                     else:
                         self.history_outcome(signal, "missed", result_reason(result), result=result)
                     if self.device_test:
@@ -1037,6 +1089,9 @@ class Client:
                         self.lease.revoke()
                     emit("execution", status=state, message=f"Signal {signal['id']}: {state}")
                 except Exception as error:
+                    if submission_may_have_run or getattr(self.driver, '_tt_plan_uncertain', False) is True:
+                        self.lease.running = False
+                        self.lease.revoke()
                     self.history_outcome(signal, "uncertain" if submission_may_have_run else "missed",
                         "submission_uncertain" if submission_may_have_run else "browser_not_ready" if browser_connection_lost(error) else "execution_error")
                     if self.device_test and not self.readiness_only:
