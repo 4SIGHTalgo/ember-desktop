@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 import psutil
 import websocket
@@ -35,7 +35,8 @@ class NativeSmokeTests(unittest.TestCase):
             port = listener.getsockname()[1]
         with tempfile.TemporaryDirectory(prefix='ember-native-smoke-', ignore_cleanup_errors=True) as folder:
             environment = dict(os.environ, LOCALAPPDATA=folder, WEBVIEW2_USER_DATA_FOLDER=str(Path(folder)/'webview'),
-                WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=f'--remote-debugging-port={port}')
+                WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=f'--remote-debugging-port={port}'+
+                    (' --no-sandbox --disable-gpu' if os.environ.get('GITHUB_ACTIONS')=='true' else ''))
             for key in ('EMBER_DEVICE_TEST_ONCE', 'EMBER_DEVICE_TEST_LOGIN_ONLY', 'EMBER_DEVICE_TEST_SCAN_ONLY',
                         'EMBER_DEVICE_BROWSER_TICKET'):
                 environment.pop(key, None)
@@ -56,21 +57,27 @@ class NativeSmokeTests(unittest.TestCase):
                         return result['result'].get('value')
             try:
                 deadline = time.monotonic()+45
+                opener = build_opener(ProxyHandler({}))
+                probe = {'stage':'debug_endpoint'}
                 while time.monotonic() < deadline:
                     self.assertIsNone(process.poll(), 'Native app exited before its WebView became ready')
                     try:
-                        with urlopen(f'http://127.0.0.1:{port}/json/list', timeout=1) as response:
+                        with opener.open(f'http://127.0.0.1:{port}/json/list', timeout=1) as response:
                             pages = json.load(response)
+                        probe = {'stage':'page_target','types':[p.get('type') for p in pages]}
                         page = next(p for p in pages if p['type']=='page' and 'tauri.localhost' in p['url'])
-                        connection = websocket.create_connection(page['webSocketDebuggerUrl'], timeout=30, suppress_origin=True)
+                        probe = {'stage':'debug_connection'}
+                        connection = websocket.create_connection(page['webSocketDebuggerUrl'], timeout=30, suppress_origin=True,
+                            http_no_proxy=['127.0.0.1','localhost'])
                         if evaluate("typeof window.__TAURI__==='object' && !!document.getElementById('status')"):
                             break
                         connection.close()
                         connection = None
-                    except (OSError, StopIteration, websocket.WebSocketException):
-                        pass
+                    except (OSError, StopIteration, websocket.WebSocketException) as error:
+                        probe['error_type'] = type(error).__name__
                     time.sleep(.2)
-                self.assertIsNotNone(connection, 'Native WebView did not expose its local UI')
+                children = [child.name() for child in psutil.Process(process.pid).children(recursive=True)]
+                self.assertIsNotNone(connection, f'Native WebView did not expose its local UI: {probe}; children={children}')
                 observed = evaluate("""(async()=>{
                     let received,timer;
                     const response=new Promise(resolve=>received=resolve);

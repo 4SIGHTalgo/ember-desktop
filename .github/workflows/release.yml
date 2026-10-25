@@ -88,7 +88,14 @@ jobs:
       - name: Native WebView receives packaged worker events (required before publication)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          HARNESS_REVISION: ${{ github.sha }}
         run: |
+          # Workflow-only retries test the unchanged tagged binary with this pinned harness.
+          git fetch --depth=1 origin "$env:HARNESS_REVISION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import os, subprocess; from pathlib import Path; Path('desktop/test_native_smoke.py').write_bytes(subprocess.check_output(['git','show',os.environ['HARNESS_REVISION']+':desktop/test_native_smoke.py']))"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The test isolates LOCALAPPDATA; retain the actual host runtime location.
           $roots = @("${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application", "$env:ProgramFiles\Microsoft\EdgeWebView\Application", "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application")
           $runtime = $roots | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter msedgewebview2.exe -Recurse } | Sort-Object { [version]$_.VersionInfo.FileVersion } -Descending | Select-Object -First 1
