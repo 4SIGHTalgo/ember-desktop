@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ember</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header class="app-header">
+    <div><div class="brand">ember<span class="brand-dot">●</span></div><p class="eyebrow" id="version">SPORTS SIGNALS · DESKTOP</p></div>
+    <div class="header-state"><span class="pill" id="session-state">Stopped</span><span class="connection" id="connection-state">Not connected</span></div>
+  </header>
+
+  <section class="toolbar" aria-label="Session controls">
+    <div class="row"><button id="start" disabled>Start</button><button id="stop" class="secondary">Stop</button><button id="login" class="quiet">Sign in through browser</button></div>
+    <div class="risk-settings">
+      <label for="conservative-level">Strategy<select id="conservative-level"><option value="conservative">Conservative</option><option value="very_conservative" selected>Very conservative</option></select></label>
+      <label for="kelly">Sizing<select id="kelly"><option value="0.25" selected>Quarter Kelly</option><option value="0.5">Half Kelly</option></select></label>
+      <label class="cap-label" for="cap">Max bankroll risk <span class="cap-input"><input id="cap" type="number" value="5" min="0.01" max="100" step="0.01" required><span>%</span></span><small>Per bet · based on available cash balance</small></label>
+    </div>
+  </section>
+
+  <aside id="browser-alert" class="alert" role="alert" hidden>
+    <span class="alert-icon" aria-hidden="true">!</span>
+    <div><h2>DraftKings browser closed</h2><p id="alert-message">Monitoring stopped. Press Start to reopen DraftKings.</p><p id="alert-sound" class="small"></p></div>
+    <button id="dismiss-alert" class="quiet">Dismiss</button>
+  </aside>
+
+  <section class="opportunity panel" aria-labelledby="opportunity-heading">
+    <div class="panel-heading"><div><p class="eyebrow">CURRENT OPPORTUNITY</p><h1 id="opportunity-heading">Waiting for a verified match</h1></div><span id="opportunity-stage" class="pill">Standby</span></div>
+    <p id="opportunity-subtitle" class="muted">Sign in to see the match, live score, odds, and expected value being evaluated.</p>
+
+    <div id="opportunity-content" hidden>
+      <div class="scoreboard">
+        <div class="player-name" id="player-one">—</div><div class="score"><strong id="sets-one">—</strong><span>SETS</span><strong id="sets-two">—</strong></div><div class="player-name right" id="player-two">—</div>
+        <p id="point-score" class="score-detail">Current set points —</p>
+      </div>
+      <div class="opportunity-grid">
+        <div class="ev-card">
+          <p id="ev-label" class="eyebrow">CONSERVATIVE NET EV</p><div id="ev-value" class="ev-value">—</div>
+          <p id="ev-comparison" class="muted">Gate: strictly above +0%</p>
+          <svg class="ev-meter" viewBox="0 0 300 30" role="img" aria-label="Expected value relative to the entry threshold">
+            <rect class="meter-track" x="0" y="10" width="300" height="10" rx="5" />
+            <rect id="ev-meter-fill" class="meter-fill" x="0" y="10" width="0" height="10" rx="5" />
+            <line id="ev-meter-threshold" x1="135" y1="3" x2="135" y2="27" />
+          </svg>
+          <div class="meter-labels"><span>−50%</span><span>Gate</span><span>+100%</span></div>
+          <p id="ev-profit" class="small">Feed quote estimate; the actual slip is checked again before submission.</p>
+        </div>
+        <div class="decision-card">
+          <p class="eyebrow">WHAT EMBER IS LOOKING AT</p><h2 id="selection-name">Waiting for a selection</h2><p id="market-name" class="muted">—</p>
+          <div class="decision-reason"><span class="status-dot" aria-hidden="true"></span><p id="decision-reason">Waiting for strategy data.</p></div>
+          <div class="checks" aria-label="Entry conditions"><span id="check-mapping">Verified matchup</span><span id="check-history">30+ prior meetings</span><span id="check-window">Entry window</span><span id="check-ev">EV gate</span></div>
+          <p id="opportunity-age" class="small">Waiting for an update.</p>
+        </div>
+      </div>
+      <div id="candidate-cards" class="candidate-cards"></div>
+      <p class="small opportunity-note">EV is expected net profit as a percentage of stake. Conservative EV uses the displayed confidence bound. An unknown value stays blank; start-state EV is unavailable after the entry window closes.</p>
+    </div>
+    <div id="opportunity-empty" class="empty-state"><div class="empty-mark" aria-hidden="true">◎</div><h2>No verified opportunity yet</h2><p>Ember will show the match and its EV here as soon as the scanner can evaluate it.</p></div>
+  </section>
+
+  <div class="detail-grid">
+    <section class="panel compact"><p class="eyebrow">DRAFTKINGS BROWSER</p><p id="browser" class="browser-state">Press Start to sign in to DraftKings and open the TT Elite match list.</p><p class="small">Complete login, SMS, and location checks directly in the local browser.</p><button id="test-sound" class="text-button">Test browser-close sound</button></section>
+    <section class="panel compact"><p class="eyebrow">LIVE SCANNER</p><div class="scan-stats"><div><strong id="stat-live">—</strong><span>Live DK matches</span></div><div><strong id="stat-ready">—</strong><span>Monitoring candidates</span></div><div><strong id="stat-qualified">—</strong><span>Qualified signals</span></div></div><p id="scanner-summary" class="small">Sign in to receive scanner updates.</p><details><summary>Connection &amp; source timestamps</summary><pre id="scanner">Sign in to Ember to receive scanner heartbeats.</pre></details></section>
+  </div>
+
+  <section class="panel compact missed-history" aria-labelledby="missed-heading">
+    <div class="panel-heading"><div><p class="eyebrow">PERSISTENT OPPORTUNITY HISTORY</p><h2 id="missed-heading">Missed bets <span id="missed-count" class="pill">0</span></h2></div><div class="row"><select id="history-filter" aria-label="History filter"><option value="missed">Missed</option><option value="uncertain">Unconfirmed submissions</option><option value="all">All observations</option></select><button id="sync-missed" class="secondary" disabled>Sync now</button></div></div>
+    <p id="history-sync" class="small">Sign in to load this account's saved history.</p>
+    <div id="missed-list" class="missed-list"><p class="history-empty">No missed opportunities recorded yet.</p></div>
+    <div class="row history-pages"><button id="history-newer" class="quiet" disabled>Newer</button><span id="history-page" class="small"></span><button id="history-older" class="quiet" disabled>Older</button></div>
+    <p class="small">Each qualifying entry window observed by this device is recorded once. EV and odds refer to the observed offer. An unconfirmed submission is not counted as a missed bet; check My Bets before acting on it. Unsynced records are retained locally and retried after reconnecting.</p>
+  </section>
+  <details class="settings panel compact"><summary>Connection &amp; updates</summary><label for="api">Ember website</label><input id="api" type="url" value="https://getembersignals.com"><div class="row"><button id="check" class="secondary" disabled>Check for updates</button><button id="install" disabled>Install update</button></div><p id="update" class="small">Sign in to check for signature-verified updates.</p></details>
+  <details class="activity panel compact"><summary>Activity log</summary><pre id="status" aria-live="polite">Starting browser worker…</pre></details>
+</main>
+<script src="opportunity.js"></script>
+<script src="history.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
