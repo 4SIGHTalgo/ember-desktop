@@ -198,6 +198,48 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
         cls.evidence_dir = Path(tempfile.mkdtemp(prefix='ember-scheduling-'))/'output'
         cls.evidence_dir.mkdir()
 
+    def test_fresh_home_with_server_board_opens_actual_local_league_before_readiness(self):
+        import draftkings_login
+        with ExitStack() as stack:
+            directory=stack.enter_context(tempfile.TemporaryDirectory())
+            stack.enter_context(patch.dict(os.environ,{'LOCALAPPDATA':directory,'EMBER_DEVICE_TEST_ONCE':'',
+                'EMBER_DEVICE_TEST_LOGIN_ONLY':'','EMBER_DEVICE_TEST_SCAN_ONLY':'','EMBER_DEVICE_BROWSER_TICKET':''}))
+            stack.enter_context(patch.dict(sys.modules,{'keyring':Mock()}))
+            client=Client();client.lease.running=True;client.readiness_only=True
+            client.account='fixture-account';client.access_token='synthetic-fixture-token'
+            server,state=stack.enter_context(scheduling_server(fixture_signals(h2h=True)))
+            client.api=f'http://127.0.0.1:{server.server_port}'
+            client.scanner={'board':{'events':[{'event_id':'100'}]}}
+            driver=self.driver;driver._tt_plan_uncertain=driver._tt_plan_stopped=False
+            driver.get(client.api+'/')
+            from selenium.webdriver.support.ui import WebDriverWait
+            WebDriverWait(driver,5).until(lambda d:d.execute_script('return typeof window.renderRows==="function"'))
+            driver.execute_script('document.querySelectorAll("section").forEach(e=>e.remove());const empty=document.createElement("div");empty.dataset.testid="betslip-empty-state-title";document.querySelector("[data-testid=betslip-content-wrapper]").appendChild(empty)')
+            self.assertEqual(execution.read_plan_slip(driver)['status'],'empty')
+            gate=Mock();gate.poll.return_value={'ready':True,'signed_in':True,'signed_out_confirmed':False,
+                'provider_can_bet':True,'native_wagering_grant':True,'location':{'state':'unknown','blocked':False}}
+            output=io.StringIO()
+            owner=SimpleNamespace(open=lambda active:driver,detach=lambda:None,retained=False)
+            client.stop.wait=Mock(side_effect=lambda _:setattr(client.lease,'running',False))
+            for setting in (patch('ember_client.OUTPUT',output),patch('ember_provider_login.ProviderLoginGate',return_value=gate),
+                patch('draftkings_login.allow_location_permissions'),patch('draftkings_login.TT_ELITE_URL',client.api+'/leagues/tabletennis/tt-elite-series'),
+                patch('draftkings_session.SessionMaintenance'),patch.object(execution,'prepare_browser_execution'),
+                patch.object(execution,'ROOT',client.data_dir),patch.object(execution,'SLIP_CAPTURE',client.data_dir/'slip.json')):
+                stack.enter_context(setting)
+            place=stack.enter_context(patch.object(execution,'place_plan',side_effect=AssertionError('readiness cannot wager')))
+            real_get=driver.get
+            def local_get(url):
+                self.assertTrue(url.startswith(client.api+'/'),'fixture attempted nonlocal navigation')
+                return real_get(url)
+            stack.enter_context(patch.object(driver,'get',side_effect=local_get))
+            client.execute_browser(owner,lambda:client.lease.running)
+            self.assertEqual(urlsplit(driver.current_url).path,'/leagues/tabletennis/tt-elite-series')
+            self.assertGreaterEqual(gate.poll.call_count,2)
+            self.assertEqual(state.calls,[])
+            self.assertEqual(driver.execute_script('return window.actions'),[])
+            self.assertNotIn(client.access_token,output.getvalue())
+            place.assert_not_called()
+
     def run_schedule(self, mode='ready', reverse=False):
         signals = fixture_signals(h2h=True)
         first, second = (1, 0) if reverse else (0, 1)

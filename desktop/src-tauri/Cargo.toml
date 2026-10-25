@@ -1,6 +1,6 @@
 [package]
 name = "ember-desktop"
-version = "0.2.5"
+version = "0.2.6"
 description = "Ember sports signals desktop client"
 edition = "2021"
 

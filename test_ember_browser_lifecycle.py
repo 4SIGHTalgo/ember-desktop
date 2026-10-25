@@ -400,7 +400,13 @@ class ClientRecoveryTests(unittest.TestCase):
         client.receive_opportunity(original, client.history_scope())
         client.signals.put(original)
         drivers = [Mock(current_url=core.LEAGUE_URL), Mock(current_url=core.LEAGUE_URL)]
-        drivers[0].execute_script.side_effect = InvalidSessionIdException("lost during submit")
+        for driver in drivers:
+            driver.execute_script.return_value={'present':False,'status':'empty','stagingSafe':True,'legs':[]}
+        def dispatch(script,*args):
+            if script.endswith(core.CONFIRM_PLAN_SCRIPT):
+                raise InvalidSessionIdException('lost during submit')
+            return {'present':False,'status':'empty','stagingSafe':True,'legs':[]}
+        drivers[0].execute_script.side_effect = dispatch
         owner = Mock(retained=False)
         owner.open.side_effect = drivers
         owner.recovery.return_value = "driver_reconnect"

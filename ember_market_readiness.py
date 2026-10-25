@@ -67,6 +67,9 @@ class MarketReadiness:
             return {"status": "revealed", "staged": True, "attempts": 0, "wait_ms": 0}
         if plan is not None:
             snapshot = read_plan_slip(driver)
+            if snapshot.get('status') not in ('empty','present') or snapshot.get('stagingSafe') is not True:
+                return {'status':'not_ready','reason':snapshot.get('reason') or 'slip funding is not zero',
+                        'attempts':0,'wait_ms':0}
             legs = snapshot.get('legs', [])
             if isinstance(legs, list) and any(leg.get('eventId') == event['eventId'] and
                     leg.get('marketId') == market['marketId'] and leg.get('selectionId') == plan['selectionId']

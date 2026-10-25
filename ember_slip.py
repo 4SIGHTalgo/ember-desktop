@@ -56,7 +56,7 @@ const slipIdentity=remove=>{
     const identity=value=>Object.fromEntries(fields.map(k=>[k,String(value[k])]));
     let tracking;try{tracking=JSON.parse(remove.getAttribute('data-tracking'));}catch(_){return null;}
     if(!tracking||!valid(tracking.selectionId))return null;
-    const records=[];
+    const records=[],statuses=[],unfunded=[];
     if('eventId' in tracking||'marketId' in tracking){
         if(!fields.every(k=>valid(tracking[k])))return null;
         records.push(identity(tracking));
@@ -74,14 +74,20 @@ const slipIdentity=remove=>{
                 if(fiber.stateNode instanceof Element&&!card.contains(fiber.stateNode))break;
                 if(seen.has(fiber))break;seen.add(fiber);
                 const selection=fiber.memoizedProps?.selection;
-                if(!selection||typeof selection!=='object')continue;
-                if(!fields.every(k=>valid(selection[k]))||String(selection.selectionId)!==String(tracking.selectionId))return null;
-                records.push(identity(selection));
+                if(selection&&typeof selection==='object'){
+                    if(!fields.every(k=>valid(selection[k]))||String(selection.selectionId)!==String(tracking.selectionId))return null;
+                    records.push(identity(selection));statuses.push(selection.status);
+                }
+                const bet=fiber.memoizedProps?.bet;
+                if(bet&&typeof bet==='object')unfunded.push(bet.type==='Single'&&bet.numberOfBets===1&&
+                    Array.isArray(bet.selectionsMapped)&&bet.selectionsMapped.length===1&&
+                    String(bet.selectionsMapped[0])===String(tracking.selectionId)&&(bet.stake===null||bet.stake===0));
             }
         }
     }
     const unique=[...new Set(records.map(value=>JSON.stringify(value)))];
-    return unique.length===1?JSON.parse(unique[0]):null;
+    return unique.length===1?{...JSON.parse(unique[0]),nativeSuspended:statuses.includes('suspended'),
+        nativeUnfunded:unfunded.length>0&&unfunded.every(Boolean)}:null;
 };
 const writeSlipStake=(input,value)=>{
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,value);
@@ -103,14 +109,23 @@ const exactSlipSnapshot=()=>{
         return bad('funded stake control outside the slip');
     const legs=[],ids=new Set();
     for(const remove of removes){
-        const identity=slipIdentity(remove);
-        if(!identity)return bad('incomplete or conflicting leg identity');
+        const evidence=slipIdentity(remove);
+        if(!evidence)return bad('incomplete or conflicting leg identity');
+        const identity=Object.fromEntries(['selectionId','eventId','marketId'].map(k=>[k,evidence[k]]));
+        if(evidence.nativeSuspended&&!evidence.nativeUnfunded)return bad('suspended leg funding is unverified');
         if(ids.has(identity.selectionId))return bad('duplicate selection ids');
         ids.add(identity.selectionId);
         // The minimal common ancestor must isolate exactly one remove, price and stake.
         // No provider card-id guess or player-name selector is used as a fallback.
         let root=remove.parentElement;
         while(root&&root!==slip&&!(root.querySelector(stakeSelector)&&root.querySelector(priceSelector)))root=root.parentElement;
+        const card=remove.closest('[data-testid="single-card"]');
+        if(evidence.nativeSuspended&&evidence.nativeUnfunded&&card&&visibleUI(card)&&visibleUI(remove)&&
+            !card.querySelector(stakeSelector)&&!card.querySelector(priceSelector)&&/\bsuspended\b/i.test(slipText(card))){
+            legs.push({...identity,root:card,input:null,price:null,text:slipText(card),decimalOdds:null,
+                suspended:true,stakeValue:'',fingerprint:JSON.stringify([identity,slipContractText(card),''])});
+            continue;
+        }
         if(!root||root===slip||root.querySelectorAll(removeSelector).length!==1||
             root.querySelectorAll(stakeSelector).length!==1||leafSlipPrices(root).length!==1)
             return bad('unsupported leg layout');
@@ -119,7 +134,7 @@ const exactSlipSnapshot=()=>{
             input.getAttribute('data-testid')!=='betslip-wager-box-input')return bad('hidden or unsupported leg controls');
         const ancestors=[];
         for(let node=root;node&&node!==slip;node=node.parentElement)ancestors.push(node);
-        const suspended=[...ancestors,...root.querySelectorAll('[aria-disabled],[disabled]')].some(e=>
+        const suspended=evidence.nativeSuspended||[...ancestors,...root.querySelectorAll('[aria-disabled],[disabled]')].some(e=>
             e.getAttribute('aria-disabled')==='true'||e.disabled)||/\bsuspended\b|selection (?:is )?unavailable/i.test(slipText(root));
         const decimalOdds=slipDecimal(root);
         legs.push({...identity,root,input,price,text:slipText(root),decimalOdds,suspended,

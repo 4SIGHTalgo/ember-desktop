@@ -244,7 +244,7 @@ class ProtocolV2Tests(unittest.TestCase):
         client.signals.get.side_effect = deliver
         client.signals.get_nowait.side_effect = queue.Empty
         driver = Mock(current_url=core.LEAGUE_URL)
-        driver.execute_script.return_value = {'present': False}
+        driver.execute_script.return_value = {'present': False, 'status':'empty', 'stagingSafe':True, 'legs':[]}
         owner = Mock(retained=False)
         owner.open.return_value = driver
         owner.recovery.return_value = "closed"
@@ -299,7 +299,7 @@ class ProtocolV2Tests(unittest.TestCase):
         client.signals.get.side_effect = deliver
         client.signals.get_nowait.side_effect = queue.Empty
         driver = Mock(current_url=core.LEAGUE_URL)
-        driver.execute_script.return_value = {'present': False}
+        driver.execute_script.return_value = {'present': False, 'status':'empty', 'stagingSafe':True, 'legs':[]}
         owner = Mock(retained=False)
         owner.open.return_value = driver
         owner.recovery.return_value = "closed"
@@ -563,10 +563,18 @@ class ProviderStartupTests(unittest.TestCase):
                                   ("provider", False), ("provider", True), ("signal_wait", True)])
         self.assertFalse(self.client.provider_ready.is_set())
 
-    def test_live_board_holds_initial_league_navigation_but_still_rechecks_provider(self):
+    def test_live_board_is_not_evidence_of_a_prepared_browser_and_still_opens_the_league(self):
         self.client.scanner = {'board': {'events': [{'event_id': '100'}]}}
         _, events = self.run_startup([self.state(True, signed_in=True), self.state(True, signed_in=True)], readiness_only=False)
-        self.assertEqual(events, [('provider', True), ('provider', True), ('signal_wait', True)])
+        self.assertEqual(events, [('provider', True), ('table_tennis',True), ('provider', True), ('signal_wait', True)])
+
+    def test_observed_populated_slip_is_retained_without_initial_league_reload(self):
+        snapshot={'status':'present','stagingSafe':True,'legs':[{'eventId':'100','marketId':'200','selectionId':'300',
+            'text':'One Moneyline','decimalOdds':2.0,'suspended':False}]}
+        with patch('ember_client.read_plan_slip',return_value=snapshot):
+            _,events=self.run_startup([self.state(True,signed_in=True),self.state(True,signed_in=True)],readiness_only=False)
+        self.assertNotIn(('table_tennis',True),events)
+        self.assertEqual(self.client.staging.inventory,snapshot['legs'])
 
     def test_scan_only_can_prepare_a_verified_match_without_reading_or_claiming_a_wager(self):
         now = datetime.now(timezone.utc)

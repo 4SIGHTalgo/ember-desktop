@@ -138,7 +138,10 @@ class LocationRecheckBrowserTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.banner()
                 self.driver.execute_script("const box=document.querySelector('.user-status-banner__wrapper'),link=box.querySelector('a');"+change)
-                self.assertEqual(self.local.execute_script(LOCATION_RECHECK_SCRIPT)['status'],'unavailable')
+                result=self.local.execute_script(LOCATION_RECHECK_SCRIPT)
+                self.assertEqual(result['status'],'unavailable')
+                self.assertNotIn('fixture-secret',json.dumps(result))
+                self.assertNotIn('fixture-only',json.dumps(result))
                 self.assertEqual(self.driver.execute_script('return [window.rechecks,window.submits]'),[0,0])
 
 

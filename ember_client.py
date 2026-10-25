@@ -952,7 +952,13 @@ class Client:
                     continue
                 if not table_prepared:
                     self.provider_ready.clear()
-                    if self.hold_preparation():
+                    if not market_readiness.provider_ready(self.driver):
+                        browser_preparation.publish('provider_loading',market_readiness.error_reason)
+                        self.stop.wait(.5)
+                        continue
+                    snapshot = read_plan_slip(self.driver)
+                    if snapshot.get('status') == 'present' and snapshot.get('legs'):
+                        self.staging.inventory = snapshot['legs']
                         table_prepared = True
                         continue
                     try:

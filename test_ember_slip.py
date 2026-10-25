@@ -200,6 +200,41 @@ class MultiLegBrowserTests(unittest.TestCase):
         self.assertEqual(self.js('return window.actions[0][0].tracking.selectionId'), 's2')
         self.assert_unstaked()
 
+    def suspend_without_controls(self):
+        self.native_tracking()
+        self.js("""const card=document.querySelector('section'),props=card.querySelector('.line').__reactFiber$fixture.memoizedProps;
+            props.selection.status='suspended';props.bet={type:'Single',numberOfBets:1,selectionsMapped:[props.selection.selectionId],stake:null};
+            card.querySelector('input').remove();card.querySelector('[data-testid="betslip-odds-standard"]').remove();
+            card.append(document.createTextNode('SUSPENDED'));""")
+
+    def test_native_suspended_unfunded_leg_without_controls_cannot_starve_ready_b(self):
+        self.suspend_without_controls()
+        snapshot=execution.read_plan_slip(self.driver)
+        self.assertEqual(snapshot['status'],'present')
+        self.assertTrue(snapshot['stagingSafe'])
+        self.assertTrue(snapshot['legs'][0]['suspended'])
+        self.assertIsNone(snapshot['legs'][0]['decimalOdds'])
+        authorize=Mock()
+        self.assertEqual(self.run_plan(0,authorize=authorize)['submissionState'],'not-submitted')
+        authorize.assert_not_called()
+        self.assertEqual(self.run_plan(1)['status'],'placed')
+        self.assertEqual(self.js('return window.actions.length'),1)
+        self.assertEqual(self.js('return window.actions[0][0].tracking.selectionId'),'s2')
+        self.assert_unstaked()
+
+    def test_unmounted_suspended_card_requires_positive_exact_unfunded_bet_evidence(self):
+        for change in ("delete props.bet.stake", "props.bet.stake=1", "props.bet.stake=undefined",
+                       "props.bet.selectionsMapped=['other']", "props.bet.numberOfBets=2", "props.bet.type='Parlay'",
+                       "props.selection.status='unknown'"):
+            with self.subTest(change=change):
+                self.reset();self.suspend_without_controls()
+                self.js("const props=document.querySelector('section .line').__reactFiber$fixture.memoizedProps;"+change)
+                self.assertEqual(execution.read_plan_slip(self.driver)['status'],'unsupported')
+                authorize=Mock()
+                self.assertEqual(self.run_plan(1,authorize=authorize)['submissionState'],'not-submitted')
+                authorize.assert_not_called()
+                self.assertEqual(self.js('return window.actions.length'),0)
+
     def test_native_identity_never_guesses_missing_conflicting_or_external_evidence(self):
         mutations = (
             "delete card.querySelector('.line').__reactFiber$fixture",

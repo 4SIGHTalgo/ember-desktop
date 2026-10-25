@@ -631,7 +631,7 @@ if(!owned||owned.token!==cfg.stakeToken)return {cleared:true};
 let input=owned.input;
 if(!input.isConnected){
     const leg=readExactPlanLeg(cfg,true);
-    if(leg.status!=='ready')return {cleared:false};
+    if(leg.status!=='ready'||!leg.input)return {cleared:false};
     input=leg.input;
 }
 writeSlipStake(input,'');

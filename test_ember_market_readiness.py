@@ -122,6 +122,20 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.core.open_props.assert_not_called()
 
 class ProviderErrorBudgetTests(unittest.TestCase):
+    def test_unknown_or_funded_slip_does_not_trigger_navigation_or_reveal(self):
+        for snapshot in ({'status':'unsupported','reason':'identity missing'},
+                         {'status':'present','stagingSafe':False,'legs':[]}):
+            with self.subTest(snapshot=snapshot):
+                driver=Mock();driver.execute_script.return_value={'present':False}
+                core=SimpleNamespace(correct_event=Mock(),open_props=Mock(),reveal_set_winner=Mock())
+                reader=MarketReadiness(core)
+                with patch('ember_market_readiness.plan_slip_ready',return_value=False), \
+                        patch('ember_market_readiness.read_plan_slip',return_value=snapshot):
+                    self.assertEqual(reader.prepare(driver,EVENT,MARKET,lambda:True,lambda:5,plan={})['status'],'not_ready')
+                core.correct_event.assert_not_called()
+                core.open_props.assert_not_called()
+                core.reveal_set_winner.assert_not_called()
+
     def test_three_errors_cancel_the_observer_and_require_a_new_explicit_run(self):
         now=[0.0]
         driver=Mock();driver.execute_script.return_value={'present':True}
