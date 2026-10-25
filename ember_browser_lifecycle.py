@@ -134,12 +134,19 @@ class ProfileLease:
             self.file = None
 
 
+def startup_stage(error):
+    """The exact wait-stage code of a browser startup failure, else None."""
+    if isinstance(error, BrowserWaiting) and error.args and isinstance(error.args[0], str):
+        return error.args[0]
+    return None
+
+
 class LifecycleLog:
     """Small local-only diagnostic ring. Never accepts exception text or DOM."""
     def __init__(self, path):
         self.path = Path(path)
 
-    def record(self, event, *, error=None, exit_code=None, attempt=None):
+    def record(self, event, *, error=None, exit_code=None, attempt=None, stage=None):
         row = {"at": datetime.now(timezone.utc).isoformat(), "event": event[:60]}
         if error is not None:
             row["error_type"] = type(error).__name__[:80]
@@ -147,6 +154,8 @@ class LifecycleLog:
             row["exit_code"] = exit_code
         if type(attempt) is int:
             row["attempt"] = max(0, min(attempt, 1_000_000))
+        if stage is not None:
+            row["stage"] = stage[:60]
         try:
             if self.path.exists() and self.path.stat().st_size > 256_000:
                 os.replace(self.path, self.path.with_suffix(".previous.jsonl"))
@@ -535,7 +544,7 @@ class OwnedBrowser:
 
     def recovery(self, error):
         self.detach()
-        self.log.record("browser_fault", error=error)
+        self.log.record("browser_fault", error=error, stage=startup_stage(error))
         if self.closed or isinstance(error, BrowserClosed):
             state = {"state": "closed"}
         else:

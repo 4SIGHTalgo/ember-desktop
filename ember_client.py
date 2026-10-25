@@ -25,13 +25,27 @@ from ember_protocol import (RunLease, VERSION, timestamp, validate_preparation, 
                            validate_signal, PROTOCOL_V2)
 from ember_device_test import DeviceTest
 from ember_browser_session import validation_ticket
-from ember_browser_lifecycle import ActiveSessionPower, BrowserCancelled, LifecycleLog, OwnedBrowser
+from ember_browser_lifecycle import (ActiveSessionPower, BrowserCancelled, LifecycleLog, OwnedBrowser,
+                                     startup_stage)
 from ember_history import OpportunityJournal, reservations, result_reason
 from conservative_policy import (DEFAULT_LEVEL, DEFAULT_KELLY, DEFAULT_RISK_PERCENT,
                                   client_settings, validate_risk)
 
 OUTPUT = sys.stdout
 OUTPUT_LOCK = threading.Lock()
+
+# Startup wait-stage codes (ember_browser_lifecycle.BrowserWaiting) to the exact
+# user-facing failure text. Anything absent keeps the generic recovery message,
+# so a new code can never be silently mislabeled as a known stage.
+STARTUP_STAGE_MESSAGES = {
+    "chrome_not_installed": "Google Chrome was not found on this computer. Install Google Chrome, then press Start again; nothing was opened or submitted.",
+    "browser_profile_in_use": "The saved browser profile is in use by another Ember run. Stop the other run, then press Start again.",
+    "browser_ownership_unavailable": "The saved browser ownership record could not be read safely. Press Stop, then Start to relaunch a fresh owned browser.",
+    "browser_listener_unverified": "The owned Chrome debugging listener could not be verified on this machine. Retrying startup; no wager was sent.",
+    "browser_endpoint_unavailable": "Chrome opened, but its local debugging endpoint never became reachable. Check that security software is not blocking Chrome. Retrying startup; nothing was submitted.",
+    "browser_start_failed": "Chrome exited while starting. Check Chrome's health and free memory, then press Start again.",
+    "browser_owner_changed": "Another process took over the saved browser profile. Press Stop, then Start to reopen the owned browser.",
+}
 
 
 def emit(kind, **fields):
@@ -666,11 +680,14 @@ class Client:
                         break
                     attempt = 1 if time.monotonic()-started >= 60 else attempt+1
                     delay = min(2**min(attempt-1, 5), 30)
-                    owner.log.record("recovery_wait", attempt=attempt)
+                    stage = startup_stage(error)
+                    owner.log.record("recovery_wait", attempt=attempt, stage=stage)
                     if self.device_test:
                         self.device_test.update(browser_recoveries=attempt, browser_recovery_reason=reason)
-                    emit("browser_recovery", state="recovering", reason=reason,
-                        message=f"DraftKings connection interrupted. Wagering is paused; retrying the owned browser connection in {delay}s. Stop cancels recovery.")
+                    message = STARTUP_STAGE_MESSAGES.get(stage) or (
+                        "DraftKings connection interrupted. Wagering is paused; retrying the owned browser "
+                        f"connection in {delay}s. Stop cancels recovery.")
+                    emit("browser_recovery", state="recovering", reason=reason, stage=stage, message=message)
                     self.run_cancel.wait(delay)
         finally:
             close = self.run_cancel.is_set() or self.stop.is_set() or bool(self.device_test and self.device_test.state["complete"])

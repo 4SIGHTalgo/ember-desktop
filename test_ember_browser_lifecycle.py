@@ -111,6 +111,15 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertNotIn("private", content)
         self.assertEqual(json.loads(content)["error_type"], "RuntimeError")
 
+    def test_diagnostics_record_only_the_startup_stage_code(self):
+        path = self.directory/"stage-diagnostics.jsonl"
+        LifecycleLog(path).record("browser_fault",
+                                  error=BrowserWaiting("browser_endpoint_unavailable; password=private"),
+                                  stage="browser_endpoint_unavailable")
+        content = path.read_text()
+        self.assertNotIn("private", content)
+        self.assertEqual(json.loads(content)["stage"], "browser_endpoint_unavailable")
+
     def test_stale_driver_cleanup_requires_exact_process_creation_and_driver_port(self):
         process = Mock()
         process.create_time.return_value = 123
@@ -340,6 +349,47 @@ class ClientRecoveryTests(unittest.TestCase):
             self.client.execute()
         self.assertEqual(execute.call_count, 1)
         owner.release.assert_called_once_with(close=True)
+
+    def test_startup_wait_failure_reports_the_exact_stage_and_stays_fail_closed(self):
+        owner = Mock(retained=False)
+        owner.recovery.return_value = "browser_wait"
+        with patch("ember_client.OwnedBrowser", return_value=owner), patch("ember_client.ActiveSessionPower"), \
+                patch("ember_client.emit") as emit, patch.object(self.client, "execute_browser",
+                side_effect=BrowserWaiting("browser_endpoint_unavailable")), \
+                patch.object(self.client.run_cancel, "wait", side_effect=lambda *_: self.client.request_stop()):
+            self.client.execute()
+        recoveries = [call.kwargs for call in emit.call_args_list if call.args[:1] == ("browser_recovery",)]
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0]["stage"], "browser_endpoint_unavailable")
+        self.assertIn("debugging endpoint", recoveries[0]["message"])
+        self.assertIn("nothing was submitted", recoveries[0]["message"])
+        owner.log.record.assert_any_call("recovery_wait", attempt=1, stage="browser_endpoint_unavailable")
+        # Fail closed: the startup wait failure revoked permission and queued nothing.
+        self.assertFalse(self.client.lease.running)
+        self.assertFalse(self.client.provider_ready.is_set())
+        self.assertTrue(self.client.signals.empty())
+        owner.release.assert_called_once_with(close=True)
+
+    def test_unknown_or_absent_startup_stage_keeps_the_generic_recovery_message(self):
+        for error in (BrowserWaiting("brand_new_wait_stage"), WebDriverException("chrome not reachable; password=private")):
+            with self.subTest(error=type(error).__name__):
+                owner = Mock(retained=False)
+                owner.recovery.return_value = "browser_wait"
+                self.client.lease.running = True
+                self.client.run_cancel.clear()
+                self.client.stop.clear()
+                with patch("ember_client.OwnedBrowser", return_value=owner), patch("ember_client.ActiveSessionPower"), \
+                        patch("ember_client.emit") as emit, patch.object(self.client, "execute_browser",
+                        side_effect=error), \
+                        patch.object(self.client.run_cancel, "wait", side_effect=lambda *_: self.client.request_stop()):
+                    self.client.execute()
+                recoveries = [call.kwargs for call in emit.call_args_list if call.args[:1] == ("browser_recovery",)]
+                self.assertEqual(len(recoveries), 1)
+                self.assertIn("DraftKings connection interrupted", recoveries[0]["message"])
+                self.assertNotIn("password=private", json.dumps(recoveries[0]))
+                self.assertNotIn("brand_new_wait_stage", recoveries[0]["message"])
+                expected = "brand_new_wait_stage" if isinstance(error, BrowserWaiting) else None
+                self.assertEqual(recoveries[0]["stage"], expected)
 
     def test_actual_execution_recovery_never_replays_an_uncertain_contract(self):
         import tt_market_exec as core
