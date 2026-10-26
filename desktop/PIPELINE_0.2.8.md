@@ -25,3 +25,25 @@ tests pass. No live wagers are used for this verification.
 
 No wager policy, freshness limit, price floor or deduplication protection was
 relaxed. Stop before updating; review settings and press Start when ready.
+
+## Stable release verification
+
+- [Source CI](https://github.com/4SIGHTalgo/ember-desktop/actions/runs/40284974196)
+  and [tagged release](https://github.com/4SIGHTalgo/ember-desktop/actions/runs/40284994527)
+  passed Windows x64, Intel Mac and Apple Silicon Mac. The Windows native
+  WebView/worker event check and Homebrew refresh passed.
+- All 24 release assets matched their GitHub digests and checksum sidecars.
+  Version-bound updater signatures verified for all three platforms. Mac app and
+  worker architectures agree; workers report 0.2.8 and contain no private strategy
+  modules. The packaged native slip reader matches the verified source.
+- Stable updater paths from supported prior releases return the exact 0.2.8
+  artifacts; current-version checks return no update. The production download
+  guide points to 0.2.8.
+- Windows native update from 0.2.7 to 0.2.8 completed. Native file version is
+  0.2.8.0 and worker version is 0.2.8. The exact installed worker also passed the
+  connected fixture pipeline for all four approved families, with four claims and
+  four synthetic acceptances. Execution records, profiles, shortcut and settings
+  survived the update. The regular app was signed in with a current feed and left
+  stopped; its updater reports no pending update.
+
+Live-provider wagering was not used to verify this release.
