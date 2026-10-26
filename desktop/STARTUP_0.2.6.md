@@ -23,3 +23,25 @@ driver-loss fixture that raised on every script, including the newly added
 startup reads. That fixture now supplies observed empty/zero slip evidence and
 loses the reply only at its intended final-submit boundary; the no-replay test
 and full rerun passed without relaxing the production guards.
+
+## Published/installed acceptance
+
+- Public source CI `40245761022` passed all three native platforms. Release run
+  `40245764210` passed after a single unchanged Windows retry of an OS UI probe
+  timeout; its failed first attempt remains visible. All 24 artifact/sidecar
+  digests, updater signatures, Mac architectures and private-module exclusion
+  verified. Production updater and live site/Homebrew now serve 0.2.6.
+- An existing Windows installation upgraded through the native updater. Actual
+  executable, frozen worker and exact packaged reader code verified as 0.2.6.
+- A fresh installed zero-opportunity login-only run automatically reached the
+  TT Elite league and reported `table_tennis_prepared: true`; no manual league
+  navigation was needed in that run. It finished with zero opportunities and no
+  submission. Provider native permission was observed, but independent location remained
+  unknown; no unobserved verification is asserted.
+- The user added a blank-stake native selection. The live reader accepted its
+  exact event/market/selection identity and observed 2.66 odds, zero funding and
+  no suspension. No provider error notice, submission flow or wager request was
+  recorded in that read-only inspection. Submission itself was not live-tested.
+- Official location-recheck and expiry/recovery behavior is verified with local
+  browser fixtures. No live location failure was forced during acceptance.
+  Updater signatures do not imply OS publisher signing or Apple notarization.
