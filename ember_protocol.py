@@ -7,11 +7,12 @@ import time
 
 from ember_opportunity import validate_opportunity
 from ember_board import validate_board
+from ember_identity import provider_id
 from conservative_policy import contract_id
 from execution_policy import allows_bet, allows_payload, ALLOWED_FAMILIES, DISTRIBUTION_FAMILIES, DISTRIBUTION_MARKETS
-from tt_market_semantics import entry_window, name_key, score_state
+from tt_market_semantics import entry_window, name_key, score_state, next_set_number
 
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 PROTOCOL = 1
 PROTOCOL_V2 = 2
 
@@ -31,9 +32,9 @@ def validate_stage(value):
         return None
     if not isinstance(value, dict) or set(value) not in (STAGE_FIELDS, STAGE_FIELDS | {"event"}) or value["protocol"] != PROTOCOL:
         raise ValueError("Invalid pre-open hint")
-    for field in ("event_id", "market_id", "selection_id"):
+    for field, kind in (("event_id", "event"), ("market_id", "market"), ("selection_id", "selection")):
         item = value[field]
-        if not isinstance(item, str) or not item.isascii() or not 0 < len(item) <= 64:
+        if not provider_id(item, kind):
             raise ValueError("Invalid pre-open identity")
     if value["bet_type"] not in STAGE_BET_TYPES or value["bet_type"] not in ALLOWED_FAMILIES:
         raise ValueError("Invalid pre-open family")
@@ -67,7 +68,7 @@ def validate_preparation(value):
     if not isinstance(value, dict) or set(value) != {"protocol", "event", "market_hint", "expires_at"} or value["protocol"] != PROTOCOL:
         raise ValueError("Invalid browser preparation data")
     event, hint = value["event"], value["market_hint"]
-    if not isinstance(event.get("eventId"), str) or not event["eventId"].isascii() or not event["eventId"].isdigit():
+    if not provider_id(event.get("eventId"), "event"):
         raise ValueError("Invalid preparation event")
     if set(hint) != {"betType"} or hint["betType"] not in {"split", "closeout"}:
         raise ValueError("Preparation cannot contain a wager or executable command")
@@ -147,7 +148,7 @@ def validate_plan(plan):
         raise ValueError("Disabled market family")
     if not isinstance(plan["selection"], str) or not 0 < len(plan["selection"]) <= 200:
         raise ValueError("Invalid plan selection")
-    if not isinstance(plan["selectionId"], str) or not re.fullmatch(r"[A-Za-z0-9_#:.+\-]{1,200}", plan["selectionId"]):
+    if not provider_id(plan["selectionId"], "selection"):
         raise ValueError("Invalid selection identifier")
     target = plan["nextSet"]
     if type(target) is not int or target not in ((1, 2, 3, 4, 5) if plan["betType"] in DISTRIBUTION_FAMILIES else (2, 3, 4, 5)):
@@ -198,8 +199,9 @@ def validate_signal(signal):
         if timestamp(plan["deadline"]) > timestamp(signal["expires_at"]):
             raise ValueError("Plan deadline outlives the signal")
         event, market = payload["event"], payload["market"]
-        for value in (event.get("eventId"), market.get("eventId"), market.get("marketId")):
-            if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        for value, kind in ((event.get("eventId"), "event"), (market.get("eventId"), "event"),
+                            (market.get("marketId"), "market")):
+            if not provider_id(value, kind):
                 raise ValueError("Invalid provider identifier")
         if (event["eventId"] != market["eventId"]
                 or market.get("name") not in {"Game 2", "Game 3", "Game 4", "Game 5", "Moneyline"} | set(DISTRIBUTION_MARKETS)):
@@ -213,6 +215,12 @@ def validate_signal(signal):
         if (not allows_bet(plan, market, matches[0]) or signal["contract"] != contract_id(event, plan)
                 or plan["scoreState"] != score_state(event) or not entry_window(event)):
             raise ValueError("Signal does not match its contract or entry window")
+        spec=plan['specification']
+        if (plan['nextSet'] != next_set_number(event)
+                or name_key(event['player1' if spec['player']==0 else 'player2']) != name_key(matches[0]['label'])
+                or plan['betType'] not in DISTRIBUTION_FAMILIES and spec.get('target') != plan['nextSet']
+                or plan['betType']=='closeout' and plan['scoreState'][spec['player']] != 2):
+            raise ValueError('Plan target or participant disagrees with the observed contract')
         return signal
     # Protocol 1 strategy payloads are private-engine data; this client executes
     # server plans only, so they fail closed at the schema edge.

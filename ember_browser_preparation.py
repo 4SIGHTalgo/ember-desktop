@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 from ember_protocol import timestamp
 from tt_market_semantics import entry_window
+from driver_lifecycle import connection_lost
 
 
 class BrowserPreparation:
@@ -84,7 +85,9 @@ class BrowserPreparation:
                 reading = self.market_readiness.warm(driver, event, market)
             except self.core.FATAL_BROWSER_ERRORS:
                 raise
-            except (RuntimeError, self.core.WebDriverException):
+            except (RuntimeError, self.core.WebDriverException) as error:
+                if connection_lost(error):
+                    raise
                 reading = {"status": "waiting", "reason": "market surface not ready"}
             if reading.get("status") != "ready":
                 self.publish("preparing_market", f"Match open; preparing the exact market section ({reading.get('reason') or 'loading'}).", event["eventId"])
@@ -165,7 +168,9 @@ class BrowserPreparation:
             opened = self.core.open_props(driver, event, {"betType": family}, timeout=2.5)
         except self.core.FATAL_BROWSER_ERRORS:
             raise
-        except (RuntimeError, self.core.WebDriverException):
+        except (RuntimeError, self.core.WebDriverException) as error:
+            if connection_lost(error):
+                raise
             opened = False
         if opened:
             self.key, self.failures = key, 0

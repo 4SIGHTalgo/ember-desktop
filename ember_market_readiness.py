@@ -2,6 +2,7 @@
 import time
 
 from tt_market_exec import LOAD_RECOVERY_SCRIPT, plan_slip_ready, read_plan_slip
+from driver_lifecycle import connection_lost
 
 
 PROVIDER_HOST = "sportsbook.draftkings.com"
@@ -46,16 +47,18 @@ class MarketReadiness:
         self.error_reason = 'provider load error; preparation paused'
 
     def provider_ready(self, driver):
-        if self.load_errors >= 3 or self.clock() < self.retry_at:
+        if self.clock() < self.retry_at:
             return False
         state = driver.execute_script(LOAD_RECOVERY_SCRIPT, {})
         if not isinstance(state, dict) or state.get('present') is not False:
             self.retry_at = self.clock()+5
             self.load_errors += 1
-            if self.load_errors >= 3:
-                self.error_reason = 'repeated provider load errors; press Stop then Start after the provider recovers'
+            if self.load_errors == 3:
+                self.error_reason = 'provider load error; awaiting a positively verified recovery'
                 driver.execute_script(self.core.REVEAL_SCRIPT, None)
             return False
+        self.load_errors = 0
+        self.error_reason = 'provider load error; preparation paused'
         return True
 
     def prepare(self, driver, event, market, valid, remaining, plan=None, max_wait=.3, staging=False):
@@ -76,6 +79,8 @@ class MarketReadiness:
                     and leg.get('suspended') is True for leg in legs):
                 return {'status': 'not_ready', 'reason': 'target leg suspended', 'attempts': 0, 'wait_ms': 0}
         if not hasattr(self.core, 'correct_event') or not self.core.correct_event(driver, event):
+            if staging:
+                return {'status': 'not_ready', 'reason': 'event identity not ready', 'attempts': 0, 'wait_ms': 0}
             # A signal turn may still have to cross matches; give that one
             # navigation a real budget instead of a yield-sized slice.
             nav_wait = min(2.0, max(.3, max(0, remaining()-.6))) if plan is not None else max(0, deadline-self.clock())
@@ -168,7 +173,9 @@ class MarketReadiness:
                 last = reading if isinstance(reading, dict) else {"status": "waiting", "reason": "market surface not ready"}
             except self.core.FATAL_BROWSER_ERRORS:
                 raise
-            except self.core.WebDriverException:
+            except self.core.WebDriverException as error:
+                if connection_lost(error):
+                    raise
                 last = {"status": "waiting", "reason": "market surface not ready"}
             if last.get("status") == "revealed" and valid():
                 return {**last, "attempts": attempts, "wait_ms": round(1000*(self.clock()-started), 1)}

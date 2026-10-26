@@ -11,6 +11,7 @@ from selenium.webdriver.chrome.options import Options
 
 from driver_lifecycle import create_owned_chrome
 from ember_market_readiness import MarketReadiness
+from ember_browser_preparation import BrowserPreparation
 from ember_staging import Staging
 import test_ember_scheduling as fixtures
 import tt_market_exec as execution
@@ -168,9 +169,11 @@ class StagingBrowserTests(unittest.TestCase):
         driver.execute_script('document.querySelectorAll("section").forEach(e=>e.remove());window.renderRows(0)')
         hints = fixtures.fixture_stages(self.signals)
         stager, readiness = Staging(), MarketReadiness(execution)
+        preparation=BrowserPreparation(execution,lambda:None,lambda _:None,lambda **_:None,market_readiness=readiness)
         with patch.object(execution, 'correct_event', side_effect=fixtures.local_identity):
             for _ in range(12):
-                stager.step(driver, execution, readiness, hints, lambda: True, time.time())
+                preparation.step(driver,None,True,time.time(),stages=hints,legs=stager.inventory,hold=True)
+                stager.step(driver, execution, readiness, hints, lambda: True, time.time(),focus=preparation.focus_event_id())
                 if len(execution.read_plan_slip(driver)['legs']) == 4:
                     break
             snapshot = execution.read_plan_slip(driver)

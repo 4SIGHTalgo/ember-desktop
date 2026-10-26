@@ -4,7 +4,7 @@ import time
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException, WebDriverException
 
 from draftkings_login import LOGIN_URL, SPORTSBOOK_URL
-from driver_lifecycle import DriverConnectionLost
+from driver_lifecycle import DriverConnectionLost, connection_lost as browser_connection_lost
 
 
 PROVIDER_STATE_SCRIPT = r"""
@@ -49,11 +49,16 @@ def provider_state(driver):
     if isinstance(handles, (list, tuple)) and not handles:
         raise NoSuchWindowException("No provider browser windows remain")
     handles = handles if isinstance(handles, (list, tuple)) and handles else [None]
+    try:
+        current = driver.current_window_handle
+    except NoSuchWindowException:
+        current = None
     fallback = authenticated = pending = None
     for handle in handles:
         try:
-            if handle is not None:
+            if handle is not None and handle != current:
                 driver.switch_to.window(handle)
+                current = handle
             state = driver.execute_script(PROVIDER_STATE_SCRIPT, {"origin": SPORTSBOOK_URL.rstrip("/")}) or {}
             if not isinstance(state, dict):
                 continue
@@ -63,6 +68,9 @@ def provider_state(driver):
                 authenticated = (handle, state)
             if fallback is None or state.get("on_sportsbook"):
                 fallback = (handle, state)
+        except NoSuchWindowException:
+            current = None
+            continue
         except (InvalidSessionIdException, DriverConnectionLost):
             raise
         except WebDriverException as error:
@@ -72,21 +80,13 @@ def provider_state(driver):
     fallback = pending or authenticated or fallback
     if fallback is not None:
         handle, state = fallback
-        if handle is not None:
+        if handle is not None and handle != current:
             try:
                 driver.switch_to.window(handle)
             except NoSuchWindowException:
                 return {}
         return state
     return {}
-
-
-def browser_connection_lost(error):
-    if isinstance(error, (InvalidSessionIdException, NoSuchWindowException, DriverConnectionLost)):
-        return True
-    return isinstance(error, WebDriverException) and any(text in str(error).lower() for text in (
-        "chrome not reachable", "not connected to devtools", "disconnected from chrome",
-        "target window already closed", "web view not found", "tab crashed"))
 
 
 class ProviderLoginGate:

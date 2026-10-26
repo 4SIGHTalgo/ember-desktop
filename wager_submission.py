@@ -34,10 +34,22 @@ const watchSubmissionNetwork=()=>{
     return state;
 };
 const loadNotice=()=>{
-    const matches=[...document.querySelectorAll('[role="alert"],[data-testid*="toast"],div,p,span')]
-        .filter(visibleUI).filter(e=>{const t=submissionText(e);return t.length<350&&
-            /(?:oops[\s-]*)?something\s+didn.t\s+load\s+right/i.test(t);});
-    return matches.find(e=>!matches.some(other=>other!==e&&e.contains(other)))||null;
+    const pattern=/(?:oops[\s-]*)?something\s+didn.t\s+load\s+right/i;
+    const matches=e=>{const t=(e.textContent||'').replace(/\s+/g,' ').trim();
+        return t.length<350&&pattern.test(t)&&visibleUI(e)&&pattern.test(submissionText(e));};
+    for(const e of document.querySelectorAll('[role="alert"],[data-testid*="toast"]'))if(matches(e))return e;
+    if(!document.body)return null;
+    const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
+    for(let text=walker.nextNode();text;text=walker.nextNode()){
+        if(!/oops|something|load\s+right/i.test(text.nodeValue||''))continue;
+        if(text.parentElement?.closest('script,style,noscript,template'))continue;
+        if(!visibleUI(text.parentElement))continue;
+        for(let e=text.parentElement;e;e=e.parentElement){
+            if((e.textContent||'').length>700)break;
+            if(matches(e))return e;
+        }
+    }
+    return null;
 };
 const stakeLimitPrompt=()=>{
     const roots=new Set();

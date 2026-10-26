@@ -10,15 +10,9 @@ Layer: protocol semantics (stdlib plus draftkings_live only).
 from functools import lru_cache
 import math
 import re
-import unicodedata
 
 import draftkings_live as dk
-
-
-def name_key(name):
-    name = unicodedata.normalize("NFKD", name.casefold().translate(str.maketrans("łøđ", "lod")))
-    return " ".join("".join(c if c.isalnum() else " " for c in name
-                            if not unicodedata.combining(c)).split())
+from ember_identity import name_key
 
 
 def pair_key(match):

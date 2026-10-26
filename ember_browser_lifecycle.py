@@ -150,6 +150,12 @@ class LifecycleLog:
         row = {"at": datetime.now(timezone.utc).isoformat(), "event": event[:60]}
         if error is not None:
             row["error_type"] = type(error).__name__[:80]
+            for key in ('command', 'transport_error', 'elapsed_ms', 'driver_alive'):
+                value = getattr(error, key, None)
+                if isinstance(value, str):
+                    row[key] = value[:80]
+                elif type(value) in (int, float, bool):
+                    row[key] = value
         if type(exit_code) is int:
             row["exit_code"] = exit_code
         if type(attempt) is int:
@@ -528,8 +534,12 @@ class OwnedBrowser:
         # of retaining an already-destroyed default target from attachment.
         self.driver.switch_to.window(handles[0])
         if self.reload_page:
-            from draftkings_login import LOGIN_URL
-            self.driver.get(LOGIN_URL)  # Safe GET after renderer crash; never replay a script/click.
+            from draftkings_login import TT_ELITE_URL
+            route = urlsplit(self.driver.current_url)
+            league = urlsplit(TT_ELITE_URL)
+            safe = route.scheme == league.scheme and route.netloc == league.netloc and (
+                route.path.startswith('/event/') or route.path.rstrip('/') == league.path.rstrip('/'))
+            self.driver.get(self.driver.current_url if safe else TT_ELITE_URL)
             self.reload_page = False
         self.log.record("driver_attached")
         return self.driver

@@ -56,6 +56,9 @@ jobs:
           workspaces: desktop/src-tauri
           cache-on-failure: true
       - run: python -m pip install -r desktop/requirements-worker.txt
+      - run: python -m unittest test_ember_identity test_draftkings_session -v
+      - run: python -m unittest test_driver_lifecycle -v
+        if: runner.os == 'Windows'
       - name: Client test battery
         run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_client', 'test_ember_history', 'test_ember_opportunity', 'test_ember_device_test', 'test_ember_stream', 'test_ember_browser_preparation', 'test_ember_market_readiness.ReadinessBudgetTests', 'test_ember_market_readiness.ProviderErrorBudgetTests', 'test_tt_market_semantics', 'test_tt_market_exec', 'test_execution_policy', 'test_draftkings_login', 'test_draftkings_live'])"
       - run: python -m unittest test_ember_board -v

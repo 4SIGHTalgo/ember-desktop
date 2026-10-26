@@ -3,13 +3,14 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import math
+from ember_identity import provider_id
 
 
 MARKETS = {"Moneyline", "Game 2", "Game 3", "Game 4", "Game 5", "Games Spread", "Points Spread"}
 
 
-def identifier(value):
-    return isinstance(value, str) and value.isascii() and 0 < len(value) <= 64
+def identifier(value, kind="market"):
+    return provider_id(value, kind)
 
 
 def stamp(value):
@@ -36,7 +37,7 @@ def validate_board(value):
         raise ValueError("Invalid board events")
     seen = set()
     for event in events:
-        if not isinstance(event, dict) or not identifier(event.get("event_id")) or event["event_id"] in seen:
+        if not isinstance(event, dict) or not identifier(event.get("event_id"), "event") or event["event_id"] in seen:
             raise ValueError("Invalid board event identity")
         seen.add(event["event_id"])
         players = event.get("players")
@@ -73,7 +74,7 @@ def validate_board(value):
                 raise ValueError("Invalid board outcomes")
             selections = set()
             for outcome in outcomes:
-                if (not isinstance(outcome, dict) or not identifier(outcome.get("selection_id"))
+                if (not isinstance(outcome, dict) or not identifier(outcome.get("selection_id"), "selection")
                         or outcome["selection_id"] in selections or outcome.get("label") not in players
                         or type(outcome.get("entry_open")) is not bool):
                     raise ValueError("Invalid board selection")

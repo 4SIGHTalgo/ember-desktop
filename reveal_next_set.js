@@ -1,9 +1,10 @@
 // Reveal one exact market; selection buttons are never clicked.
 const config = arguments[0];
-const watcherVersion = 6;
+const watcherVersion = 7;
 let state = window.__ttNextSetWatch;
 if (state && (!config || state.key !== config.key || state.version !== watcherVersion)) {
     state.observer.disconnect();
+    clearTimeout(state.expiryTimer);
     window.__ttNextSetWatch = state = null;
 }
 if (!config) return null;
@@ -26,8 +27,10 @@ if (!state) {
         state.status = 'waiting';
         state.reason = null;
         state.missingRow = false;
+        if (location.href.split('?')[0] !== state.config.pageUrl || Date.now() >= state.config.validUntil) {
+            state.reason = 'page changed or data expired';state.observer.disconnect();return;
+        }
         if (loadNotice()) { state.reason = 'provider load error; preparation paused'; return; }
-        if (location.href.split('?')[0] !== state.config.pageUrl || Date.now() > state.config.validUntil) { state.reason = 'page changed or data expired'; return; }
         const scoreboards = [...document.querySelectorAll('.cms-event-scoreboard-container')];
         if (!scoreboards.some(scoreboard => scoreboard.getClientRects().length && state.config.players.every(p =>
             ` ${normalize(scoreboard.innerText)} `.includes(` ${normalize(p)} `)))) { state.reason = 'scoreboard identity'; return; }
@@ -63,8 +66,12 @@ if (!state) {
             state.reason = 'expanding ' + kind + ' section'; return;
         }
         state.expanding = false;
-        const buttons = state.config.testIds.map(id => [...document.querySelectorAll('button[data-testid]')]
-            .filter(b => b.getAttribute('data-testid') === id && visible(b)));
+        const indexed = new Map();
+        for(const b of document.querySelectorAll('button[data-testid]')){
+            const id=b.getAttribute('data-testid');
+            if(state.config.testIds.includes(id)&&visible(b))indexed.set(id,[...(indexed.get(id)||[]),b]);
+        }
+        const buttons = state.config.testIds.map(id => indexed.get(id)||[]);
         if (buttons.some(matches => matches.length !== 1)) { state.missingRow = true; state.reason = 'selection IDs missing or ambiguous'; return; }
         const choices = buttons.map(matches => matches[0]);
         const matchMarket = moneyline || state.config.distribution;
@@ -86,10 +93,18 @@ if (!state) {
         row.scrollIntoView({block: 'center', behavior: 'instant'});
         row.style.outline = '3px solid #53d337';
     };
-    state.observer = new MutationObserver(check);
-    state.observer.observe(document.body, {subtree: true, childList: true, attributes: true, characterData: true});
+    state.observer = new MutationObserver(()=>{
+        if(state.scheduled)return;
+        state.scheduled=true;
+        setTimeout(()=>{state.scheduled=false;if(window.__ttNextSetWatch===state)check();},50);
+    });
+    state.observer.observe(document.body, {subtree: true, childList: true, attributes: true, characterData: true,
+        attributeFilter:['aria-expanded','aria-selected','aria-disabled','aria-pressed','disabled','hidden','class','style']});
     state.check = check;
 }
 state.config = config;
+clearTimeout(state.expiryTimer);
+state.expiryTimer=setTimeout(()=>{state.observer.disconnect();state.status='waiting';state.reason='page changed or data expired';},
+    Math.min(2147483647,Math.max(0,config.validUntil-Date.now())));
 state.check();
 return {status: state.status, reason: state.reason || null, missingRow: !!state.missingRow, revealedAt: state.revealedAt || null};

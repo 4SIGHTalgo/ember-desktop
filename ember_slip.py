@@ -5,9 +5,10 @@ unsupported: labels alone never establish a contract's identity.
 """
 from datetime import datetime
 import math
+from ember_identity import provider_id
 
 
-def plan_slip_config(event, market, plan, outcome=None):
+def plan_slip_config(event, market, plan, outcome=None, *, server_offset=0):
     """Build the identity/deadline supplied to every protocol-2 DOM operation."""
     if any(not isinstance(value, dict) for value in (event, market, plan)):
         raise ValueError("plan slip contract must be an object")
@@ -16,7 +17,7 @@ def plan_slip_config(event, market, plan, outcome=None):
     if not isinstance(outcome, dict) or not isinstance(plan.get("specification"), dict):
         raise ValueError("plan slip selection and specification must be objects")
     identifiers = (event.get("eventId"), market.get("marketId"), outcome.get("selectionId"))
-    if any(not isinstance(value, str) or not value.strip() for value in identifiers):
+    if any(not provider_id(value, kind) for value, kind in zip(identifiers, ("event", "market", "selection"))):
         raise ValueError("plan slip identity is incomplete")
     if (market.get("eventId") != event["eventId"] or plan.get("selectionId") != outcome["selectionId"]
             or plan.get("selection") != outcome.get("label")
@@ -25,13 +26,15 @@ def plan_slip_config(event, market, plan, outcome=None):
     deadline = datetime.fromisoformat(plan["deadline"])
     if deadline.tzinfo is None:
         raise ValueError("plan deadline must be timezone-aware")
+    if type(server_offset) not in (int, float) or not math.isfinite(server_offset):
+        raise ValueError("server clock offset must be finite")
     line = (plan.get("specification") or {}).get("line")
     if line is not None and (type(line) not in (int, float) or not math.isfinite(line)):
         raise ValueError("plan line is invalid")
     return {"eventId": event["eventId"], "marketId": market["marketId"],
             "selectionId": outcome["selectionId"], "selectionLabel": outcome["label"],
             "marketName": market["name"], "selectionLine": line,
-            "validUntil": deadline.timestamp() * 1000}
+            "validUntil": (deadline.timestamp()-server_offset) * 1000}
 
 
 EXACT_SLIP_READER_JS = r"""
@@ -51,14 +54,15 @@ const slipContractText=root=>{
 const zeroStake=input=>!input.value.trim()||/^\d+(?:\.\d+)?$/.test(input.value.trim())&&Number(input.value)===0;
 const slipIdentity=remove=>{
     const fields=['selectionId','eventId','marketId'];
-    const valid=value=>['string','number'].includes(typeof value)&&String(value).trim()&&
-        (typeof value!=='number'||Number.isSafeInteger(value));
+    const valid=(value,key)=>['string','number'].includes(typeof value)&&
+        (typeof value!=='number'||Number.isSafeInteger(value)&&value>=0)&&
+        (key==='eventId'?/^[0-9]{1,32}$/:key==='marketId'?/^[A-Za-z0-9_#:.+\-]{1,64}$/:/^[A-Za-z0-9_#:.+\-]{1,200}$/).test(String(value));
     const identity=value=>Object.fromEntries(fields.map(k=>[k,String(value[k])]));
     let tracking;try{tracking=JSON.parse(remove.getAttribute('data-tracking'));}catch(_){return null;}
-    if(!tracking||!valid(tracking.selectionId))return null;
+    if(!tracking||!valid(tracking.selectionId,'selectionId'))return null;
     const records=[],statuses=[],unfunded=[];
     if('eventId' in tracking||'marketId' in tracking){
-        if(!fields.every(k=>valid(tracking[k])))return null;
+        if(!fields.every(k=>valid(tracking[k],k)))return null;
         records.push(identity(tracking));
     }
     // Native remove tracking omits event/market; the scoped rendered selection supplies them.
@@ -75,7 +79,7 @@ const slipIdentity=remove=>{
                 if(seen.has(fiber))break;seen.add(fiber);
                 const selection=fiber.memoizedProps?.selection;
                 if(selection&&typeof selection==='object'){
-                    if(!fields.every(k=>valid(selection[k]))||String(selection.selectionId)!==String(tracking.selectionId))return null;
+                    if(!fields.every(k=>valid(selection[k],k))||String(selection.selectionId)!==String(tracking.selectionId))return null;
                     records.push(identity(selection));statuses.push(selection.status);
                 }
                 const bet=fiber.memoizedProps?.bet;
@@ -100,8 +104,9 @@ const exactSlipSnapshot=()=>{
     if(panels.length!==1||!visibleUI(panels[0]))return bad('bet slip is hidden or ambiguous');
     const slip=panels[0],removes=[...slip.querySelectorAll(removeSelector)];
     const domIds=[slip,...slip.querySelectorAll('[id]')].map(e=>e.id).filter(Boolean);
-    const allIds=[...document.querySelectorAll('[id]')].map(e=>e.id);
-    if(domIds.some(id=>allIds.filter(other=>other===id).length!==1))return bad('duplicate DOM ids');
+    const idCounts=new Map();
+    for(const e of document.querySelectorAll('[id]'))idCounts.set(e.id,(idCounts.get(e.id)||0)+1);
+    if(domIds.some(id=>idCounts.get(id)!==1))return bad('duplicate DOM ids');
     const inputs=[...slip.querySelectorAll(stakeSelector)];
     if([...slip.querySelectorAll('input')].some(input=>!input.matches(stakeSelector)&&!zeroStake(input)))
         return bad('unrecognized funded slip input');

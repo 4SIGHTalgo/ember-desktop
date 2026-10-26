@@ -185,7 +185,8 @@ class OpportunityJournal:
                 report = json.loads(row["report"])
                 if row["outcome"] in {"placed", "uncertain", "handled", "observed_only", "processing", "submitting"} or (reserved and row["outcome"] == "missed"):
                     return report["id"]
-                if signal["id"] <= report["signal_id"]:
+                if signal["id"] < report["signal_id"] or (signal["id"] == report["signal_id"]
+                        and signal["expires_at"] <= report["expires_at"]):
                     return report["id"]
                 now = not_before(now, report["last_observed_at"])
                 report.update(signal_id=signal["id"], snapshot=snapshot, last_observed_at=now,
@@ -248,7 +249,7 @@ class OpportunityJournal:
                 if expired_only and datetime.fromisoformat(report["expires_at"].replace("Z", "+00:00")) > datetime.fromisoformat(now):
                     continue
                 status = attempts.get(row["contract"])
-                state = "handled" if status == "placed" else "uncertain" if status in {"reserved_or_unconfirmed", "unconfirmed", "stopped"} else "missed"
+                state = "handled" if status == "placed" else "uncertain" if status in {"reserved_or_unconfirmed", "unconfirmed", "stopped", "submitting", "submission_uncertain"} else "missed"
                 disposition = "already_attempted" if state == "handled" else "submission_uncertain" if state == "uncertain" else reason or (report["reason"] if report["reason"] != "waiting" else "signal_expired")
                 report.update(outcome=state, reason=disposition, resolved_at=not_before(now, report["last_observed_at"]))
                 self._save(connection, row, report)
@@ -264,7 +265,7 @@ class OpportunityJournal:
                 status = attempts.get(row["contract"])
                 if status == "placed":
                     state, reason = "handled", "already_attempted"
-                elif row["outcome"] in {"processing", "submitting"} or status in {"reserved_or_unconfirmed", "unconfirmed", "stopped"}:
+                elif row["outcome"] in {"processing", "submitting"} or status in {"reserved_or_unconfirmed", "unconfirmed", "stopped", "submitting", "submission_uncertain"}:
                     state, reason = "uncertain", "app_restarted_in_flight"
                 else:
                     state, reason = "missed", "app_restarted"

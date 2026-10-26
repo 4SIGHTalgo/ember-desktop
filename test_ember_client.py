@@ -222,6 +222,21 @@ class ProtocolV2Tests(unittest.TestCase):
             self.assertTrue(ledger.reserve_signal("two", signal))
             ledger.connection.close()
 
+    def test_dispatched_uncertainty_fence_is_durable_and_account_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'execution.sqlite3'
+            ledger=Ledger(path)
+            self.assertTrue(ledger.reserve('one','100:split'))
+            self.assertFalse(ledger.unresolved_submission('one'))
+            ledger.finish('one','100:split','submitting');ledger.connection.close()
+            reopened=Ledger(path)
+            self.assertTrue(reopened.unresolved_submission('one'))
+            self.assertFalse(reopened.unresolved_submission('two'))
+            self.assertFalse(reopened.reserve('one','100:split'))
+            reopened.finish('one','100:split','placed')
+            self.assertFalse(reopened.unresolved_submission('one'))
+            reopened.connection.close()
+
     def test_plan_signal_executes_by_comparison_and_journals_the_outcome(self):
         import tt_market_exec as core
         client = self.client
@@ -701,6 +716,25 @@ class SlipStagingTests(unittest.TestCase):
 class PlanRenewalTests(unittest.TestCase):
     setUp = ProtocolV2Tests.setUp
     plan_signal = staticmethod(plan_signal)
+
+    def test_observation_only_renewal_and_outcome_reordering_preserve_the_authorized_contract(self):
+        from copy import deepcopy
+        signal=self.plan_signal()
+        signal['payload']['event']['publishedAt']='2026-10-25T00:00:00+00:00'
+        renewed=deepcopy(signal)
+        renewed['payload']['event']['publishedAt']='2026-10-25T00:00:00.100000+00:00'
+        renewed['payload']['market']['outcomes'].reverse()
+        plan=signal['payload']['plan']
+        self.client.renew_signal(signal,{'signal':renewed})
+        self.assertIs(signal['payload']['plan'],plan)
+        self.assertEqual(signal['payload']['event']['publishedAt'],renewed['payload']['event']['publishedAt'])
+
+    def test_known_unsubmitted_readiness_can_continue_the_same_reserved_attempt(self):
+        signal=self.plan_signal();signal['_reserved']=True
+        self.client.provider_ready.set()
+        self.assertFalse(self.client.defer_readiness(signal,{'retryable':True,'submissionState':'uncertain'}))
+        self.assertTrue(self.client.defer_readiness(signal,{'retryable':True,'submissionState':'not-submitted'}))
+        self.assertIs(self.client.signals.get_nowait(),signal)
 
     def status(self, signal=None):
         now = datetime.now(timezone.utc)

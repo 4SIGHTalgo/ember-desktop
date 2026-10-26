@@ -120,6 +120,25 @@ class StreamRecoveryTests(unittest.TestCase):
         self.assertEqual([signal['id'] for signal in observed], [2])
         self.assertEqual(observed[0]['payload']['plan']['min_decimal'], 3)
 
+    def test_malformed_opportunity_cannot_disconnect_or_hide_the_following_valid_signal(self):
+        from copy import deepcopy
+        from test_ember_client import plan_signal
+        self.client.account='1';self.client.lease.running=True
+        good=plan_signal();bad=deepcopy(good)
+        bad['payload']['plan']['selectionId']=None
+        connection=self.socket([self.lease,{'type':'signal','signal':bad},{'type':'signal','signal':good}])
+        observed=[]
+        disconnect=self.client.feed_disconnected
+        def capture(*args):
+            observed.extend(list(self.client.signals.queue));disconnect(*args)
+        with patch('ember_client.websocket.create_connection',return_value=connection) as connect, \
+                patch.object(self.client,'feed_disconnected',side_effect=capture),patch('ember_client.emit') as emit:
+            self.client.stream()
+        self.assertEqual(connect.call_count,1)
+        self.assertEqual([signal['id'] for signal in observed],[good['id']])
+        self.assertTrue(any(call.args==('signal_rejected',) for call in emit.call_args_list))
+        self.assertNotIn('fixture-access',str(emit.call_args_list))
+
     def test_sync_failure_retains_local_outbox_and_retry_is_acknowledged(self):
         from test_ember_history import history_signal
         self.client.account = "1"

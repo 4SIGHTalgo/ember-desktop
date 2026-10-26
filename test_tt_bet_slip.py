@@ -78,6 +78,7 @@ PLAN_SETUP = SETUP.replace(
           '</section><button data-testid="betslip-place-bet-button" disabled>').replace(
               "const submit = slip.querySelector('button');",
               "const submit = slip.querySelector('[data-testid=betslip-place-bet-button]');")
+PLAN_SETUP += "window.__isLoggedIn=window.__canBet=true;window.__playSpan={playSpan:{clientKey:'fixture-grant',grantType:'PlaySportsbook'}};"
 
 
 class PlanExecutionBrowserTests(unittest.TestCase):

@@ -47,13 +47,15 @@ def multi_leg_html(contracts=None):
         cards.append(f'''<section><div><button data-testid="betslip-selection-card-ex-button"
             data-tracking='{tracking}'>Remove</button></div><div>{outcome['label']}</div>
             <div>{market['name']}</div><span class="line">{line}</span>
-            <span data-testid="betslip-odds-standard">{('+110', '+150', '+180')[index]}</span>
+             <span data-testid="betslip-odds-standard">{('+110', '+150', '+180')[index % 3]}</span>
             <input data-testid="betslip-wager-box-input" name="stake" inputmode="decimal" value=""></section>''')
     return ('''<!doctype html><meta charset="utf-8"><button id="standardized-header-account-menu">Account</button>
         <span id="standardized-header-balance">$100.00</span><div data-testid="betslip-content-wrapper">'''
         + ''.join(cards) + '''<div>Parlay <input data-testid="betslip-wager-box-input" inputmode="decimal" value=""></div>
         <button data-testid="betslip-place-bet-button">Place Bet</button></div><script>
         window.actions=[];window.mode='receipt';window.phase=0;window.inputEvents=0;
+        window.__isLoggedIn=true;window.__canBet=true;
+        window.__playSpan={playSpan:{clientKey:'fixture-native-grant',grantType:'PlaySportsbook'}};
         const slip=document.querySelector('[data-testid=betslip-content-wrapper]');
         const button=slip.querySelector('[data-testid=betslip-place-bet-button]');
         slip.addEventListener('input',()=>window.inputEvents++);
@@ -102,6 +104,13 @@ def slip_fixture_server():
 
 
 class SlipConfigTests(unittest.TestCase):
+    def test_server_deadline_is_translated_to_the_browser_clock_without_extending_it(self):
+        event, market, plan, outcome=contract()
+        plain=plan_slip_config(event,market,plan,outcome)
+        ahead=plan_slip_config(event,market,plan,outcome,server_offset=10)
+        behind=plan_slip_config(event,market,plan,outcome,server_offset=-10)
+        self.assertEqual(ahead['validUntil'],plain['validUntil']-10000)
+        self.assertEqual(behind['validUntil'],plain['validUntil']+10000)
     def test_config_carries_full_identity_line_and_timezone_deadline(self):
         config = plan_slip_config(*contract()[:3], contract()[3])
         self.assertEqual({k: config[k] for k in ('eventId', 'marketId', 'selectionId', 'selectionLine')},
@@ -136,6 +145,27 @@ class SlipConfigTests(unittest.TestCase):
 
 
 class MultiLegBrowserTests(unittest.TestCase):
+    def test_expiry_during_final_validation_never_clicks_submit(self):
+        event,market,plan,outcome=contract()
+        config=plan_slip_config(event,market,plan,outcome)
+        config.update(stake=2.61,minDecimal=1.85)
+        self.js('document.querySelector("section input").value="2.61"')
+        script=execution.CONFIRM_PLAN_SCRIPT.replace('const submittedAt =',
+            'const until=performance.now()+700;while(performance.now()<until){};const submittedAt =')
+        result=self.driver.execute_script('arguments[0].validUntil=Date.now()+500;\n'+script,config)
+        self.assertEqual(result['status'],'aborted')
+        self.assertIn('deadline',result['reason'])
+        self.assertEqual(self.js('return window.actions'),[])
+
+    def test_permission_lost_after_validation_never_clicks_submit(self):
+        event,market,plan,outcome=contract()
+        config=plan_slip_config(event,market,plan,outcome)
+        config.update(stake=2.61,minDecimal=1.85)
+        self.js('document.querySelector("section input").value="2.61"')
+        script=execution.CONFIRM_PLAN_SCRIPT.replace('const submittedAt =','window.__canBet=false;const submittedAt =')
+        result=self.driver.execute_script(script,config)
+        self.assertEqual(result['status'],'aborted')
+        self.assertEqual(self.js('return window.actions'),[])
     @classmethod
     def setUpClass(cls):
         resources = ExitStack()
@@ -591,7 +621,7 @@ class MultiLegBrowserTests(unittest.TestCase):
                 self.assertEqual(self.js("return document.querySelector('input').value"), '2.61')
 
     def test_missing_positive_authentication_evidence_never_writes_or_submits(self):
-        self.js("document.getElementById('standardized-header-account-menu').remove()")
+        self.js("document.getElementById('standardized-header-account-menu').remove();delete window.__isLoggedIn;delete window.__canBet;delete window.__playSpan")
         self.assertFalse(execution.plan_slip_ready(self.driver, *contract()[:3]))
         claim = Mock()
         result = self.run_plan(authorize=claim)

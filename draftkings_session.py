@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import re
 
 from selenium.common.exceptions import WebDriverException
+from driver_lifecycle import connection_lost
 from draftkings_live import retry_after_seconds
 
 
@@ -61,7 +62,9 @@ class SessionMaintenance:
         self.network_due=now+15
         try:
             entries=driver.get_log('performance')
-        except WebDriverException:
+        except WebDriverException as error:
+            if connection_lost(error):
+                raise
             self.report['networkObservation']='unavailable'
             return
         if not isinstance(entries,list): return
@@ -113,7 +116,9 @@ class SessionMaintenance:
                                 self.report['sessionRestricted']=True
                             else:
                                 self.report['renewalEvidence']='response did not confirm a sportsbook grant'
-                        except (WebDriverException,ValueError,KeyError,TypeError):
+                        except (WebDriverException,ValueError,KeyError,TypeError) as error:
+                            if connection_lost(error):
+                                raise
                             self.report['renewalEvidence']='response body unavailable; renewal unverified'
                 elif message['method']=='Network.loadingFailed' and identifier in self.requests:
                     self.requests.pop(identifier)

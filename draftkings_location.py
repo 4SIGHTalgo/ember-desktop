@@ -16,7 +16,10 @@ const readDkLocation = () => {
         for (const frame of documents[index].querySelectorAll('iframe')) {
             try {
                 if (frame.getClientRects().length && frame.contentDocument
-                    && !documents.includes(frame.contentDocument)) documents.push(frame.contentDocument);
+                    && !documents.includes(frame.contentDocument)) {
+                    if(documents.length>=20)return {...metadata,state:'unknown',blocked:true,message:'location document limit exceeded'};
+                    documents.push(frame.contentDocument);
+                }
             } catch (_) { /* Cross-origin frames cannot be read from the parent. */ }
         }
     }

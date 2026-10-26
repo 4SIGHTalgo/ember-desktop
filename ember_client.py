@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import secrets
 import sqlite3
 import sys
@@ -31,7 +32,8 @@ from ember_browser_lifecycle import (ActiveSessionPower, BrowserCancelled, Lifec
 from ember_history import OpportunityJournal, reservations, result_reason
 from ember_staging import Staging
 from ember_board import display_board
-from tt_market_exec import read_plan_slip
+from ember_identity import signal_identity
+from tt_market_exec import read_plan_slip, PLAN_CLEAR_STAKE_SCRIPT
 from draftkings_location import LocationRecheck
 from conservative_policy import (DEFAULT_LEVEL, DEFAULT_KELLY, DEFAULT_RISK_PERCENT,
                                   client_settings, validate_risk)
@@ -87,6 +89,10 @@ class Ledger:
     def finish(self, account, contract, status):
         self.connection.execute("UPDATE attempts SET status=? WHERE account=? AND contract=?", (status, account, contract))
         self.connection.commit()
+
+    def unresolved_submission(self, account):
+        return self.connection.execute("SELECT 1 FROM attempts WHERE account=? AND status IN ('submitting','submission_uncertain') LIMIT 1",
+                                       (account,)).fetchone() is not None
 
     def reserve_signal(self, account, signal):
         from tt_market_semantics import completed_scores, payoff_key
@@ -164,6 +170,7 @@ class Client:
         self.browser_alerted = False
         self.browser_recovering = False
         self.browser_activity = None
+        self.pre_submit_recovery = None
         self.resume_run = False
         self.browser_owner = None
         self.preserve_browser_on_exit = False
@@ -231,7 +238,7 @@ class Client:
             self.history_outcome(signal, "observed_only", "read_only")
         elif signal["contract"] in attempted:
             signal["_history_handled"] = True
-            state = ("uncertain" if attempted[signal["contract"]] in {"reserved_or_unconfirmed", "unconfirmed", "stopped"}
+            state = ("uncertain" if attempted[signal["contract"]] in {"reserved_or_unconfirmed", "unconfirmed", "stopped", "submitting", "submission_uncertain"}
                      else "handled" if attempted[signal["contract"]] == "placed" else "missed")
             self.history_outcome(signal, state, "submission_uncertain" if state == "uncertain" else "already_attempted")
         elif not self.lease.running:
@@ -558,7 +565,11 @@ class Client:
                             emit("status", message="Signal access paused; rechecking Ember sign-in and subscription.")
                         break
                     elif message.get("type") == "signal":
-                        signal = validate_signal(message["signal"])
+                        try:
+                            signal = validate_signal(message["signal"])
+                        except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+                            emit("signal_rejected", code="invalid_signal")
+                            continue
                         self.receive_opportunity(signal, stream_scope)
                         if self.scan_only and signal["id"] not in self.observed_signals:
                             self.observed_signals.add(signal["id"])
@@ -566,7 +577,8 @@ class Client:
                                 self.device_test.update(observed_signals=len(self.observed_signals), signal_id=signal["id"],
                                                         event_id=signal["payload"]["event"]["eventId"])
                             emit("status", message=f"Observed model signal {signal['id']} in scan-only mode; no wager will be submitted.")
-                        elif self.run_permitted() and not signal.get("_history_handled"):
+                        elif (self.lease.running and not self.run_cancel.is_set() and not self.stop.is_set()
+                              and not signal.get("_history_handled")):
                             try:
                                 self.signals.put_latest(signal)
                             except queue.Full:
@@ -594,20 +606,14 @@ class Client:
         if 'signal' not in status:
             return
         renewed = validate_signal(status['signal'])
-        def identity(value):
-            value = deepcopy({key: value[key] for key in ('protocol', 'id', 'contract', 'payload')})
-            payload = value['payload']
-            if 'plan' in payload:
-                payload['plan'].pop('deadline')
-            for key in ('event', 'market'):
-                payload[key].pop('receivedAt', None)
-            return value
-        if (identity(renewed) != identity(signal)
+        if (signal_identity(renewed) != signal_identity(signal)
                 or timestamp(renewed['expires_at']) < timestamp(signal['expires_at'])
                 or ('plan' in signal['payload'] and timestamp(renewed['payload']['plan']['deadline']) <
                     timestamp(signal['payload']['plan']['deadline']))):
             raise ValueError('authorization_contract_changed')
         signal['expires_at'] = renewed['expires_at']
+        for key in ('event', 'market'):
+            signal['payload'][key] = deepcopy(renewed['payload'][key])
         if 'plan' in signal['payload']:
             signal['payload']['plan']['deadline'] = renewed['payload']['plan']['deadline']
 
@@ -675,7 +681,9 @@ class Client:
                                                   "conservative_level": self.conservative_level}},
                                       authenticated=True, timeout=self.authorization_timeout(signal))
             except Exception as error:
-                if str(error) == "contract_claimed_by_another_client":
+                if isinstance(error, (requests.Timeout, requests.ConnectionError)) or str(error) == 'request_timeout':
+                    self.last_authorize_reason = 'authorization_unavailable'
+                elif str(error) == "contract_claimed_by_another_client":
                     self.last_authorize_reason = "claimed_elsewhere"
                 elif str(error) == "signal_expired":
                     self.last_authorize_reason = "signal_expired"
@@ -712,7 +720,8 @@ class Client:
 
     def defer_readiness(self, signal, readiness):
         """Yield only before claim/reservation/submission, within the original expiry."""
-        if signal.get('_reserved') or not self.permits(signal) or min(self.lease.until-self.lease.clock(),
+        known_unsubmitted = (readiness.get('retryable') is True and readiness.get('submissionState') == 'not-submitted')
+        if (signal.get('_reserved') and not known_unsubmitted) or not self.permits(signal) or min(self.lease.until-self.lease.clock(),
                 timestamp(signal['expires_at'])-time.time()-self.lease.server_offset) <= .6:
             return False
         try:
@@ -797,6 +806,8 @@ class Client:
             focused = browser_preparation.focus_event_id()
             if isinstance(focused, str):
                 focus = focused
+        if focus is None:
+            return None
         result = self.staging.step(driver, core, market_readiness, stages,
             valid=lambda: self.run_permitted() and self.last_feed is True,
             server_now=time.time()+self.lease.server_offset, focus=focus)
@@ -837,6 +848,11 @@ class Client:
         tt_market_exec.ROOT = self.data_dir
         tt_market_exec.SLIP_CAPTURE = self.data_dir / "last-slip.json"
         ledger = Ledger(self.data_dir / "execution.sqlite3")
+        if ledger.unresolved_submission(self.account) is True:
+            self.lease.running = False
+            emit('execution',status='unconfirmed',message='A previous submission is unresolved. Reconcile DraftKings history before resuming; no wager was replayed.')
+            ledger.connection.close()
+            return
         maintenance = SessionMaintenance(core.DEFAULT_KEEP_ALIVE)
         login_gate = ProviderLoginGate(recheck=self.location_recheck, active=active)
         self.provider_ready.clear()
@@ -906,11 +922,13 @@ class Client:
                     previous_submission = submission_may_have_run
                     submission_may_have_run = True
                     self.history_outcome(current, "submitting", "waiting")
+                    ledger.finish(self.account,current['contract'],'submitting')
                     current.setdefault('_timing', {})['submitted'] = time.monotonic()
                     response = original_execute(script, *args)
                     if (not previous_submission and isinstance(response, dict)
                             and response.get("status") in {"aborted", "resize", "skipped", "waiting"}):
                         submission_may_have_run = False
+                        ledger.finish(self.account,current['contract'],'reserved_or_unconfirmed')
                         self.history_outcome(current, "processing", "waiting")
                     if self.device_test:
                         self.device_test.update(submitted=bool(response and response.get("status") == "submitted"))
@@ -920,6 +938,7 @@ class Client:
 
             self.driver.execute_script = guarded
             while active():
+                self.driver._ember_server_offset = self.lease.server_offset
                 current = None
                 submission_may_have_run = False
                 if any(getattr(self.driver, flag, False) is True for flag in ('_tt_plan_uncertain', '_tt_plan_stopped')):
@@ -973,6 +992,14 @@ class Client:
                         self.staging.inventory = snapshot['legs']
                         table_prepared = True
                         continue
+                    route = urlsplit(self.driver.current_url)
+                    league = urlsplit(core.LEAGUE_URL)
+                    reusable = (route.scheme == league.scheme and route.netloc == league.netloc and
+                        (route.path.rstrip('/') == league.path.rstrip('/') or
+                         re.fullmatch(r'/event/[^/]+/[0-9]{1,32}/?', route.path)))
+                    if (snapshot.get('status') == 'empty' and provider.get('document_ready') is True and reusable):
+                        table_prepared = True
+                        continue
                     try:
                         self.browser_activity = "league_navigation"
                         with redirect_stdout(QuietOutput()):
@@ -999,6 +1026,20 @@ class Client:
                     emit("status", message="Table Tennis is signed in and ready. Waiting for fresh, qualifying model signals.")
                 if not self.scan_only:
                     self.provider_ready.set()
+                if self.pre_submit_recovery is not None:
+                    recovery = self.pre_submit_recovery
+                    if not self.run_permitted():
+                        self.stop.wait(.1)
+                        continue
+                    cleared = self.driver.execute_script(PLAN_CLEAR_STAKE_SCRIPT,recovery['target']) or {}
+                    snapshot = read_plan_slip(self.driver)
+                    if cleared.get('cleared') is not True or snapshot.get('stagingSafe') is not True:
+                        self.lease.running = False
+                        break
+                    self.pre_submit_recovery = None
+                    if self.authorize(recovery['signal']):
+                        recovery['signal']['_preflight_authorized'] = True
+                        self.signals.put_latest(recovery['signal'])
                 with redirect_stdout(QuietOutput()):
                     maintenance.observe_network(self.driver, time.monotonic())
                     maintenance.activity(self.driver, time.monotonic(), "signed-in", busy=not self.signals.empty(),
@@ -1092,7 +1133,7 @@ class Client:
                     if ((result or {}).get('retryable') is True and (result or {}).get('submissionState') == 'not-submitted'
                             and not submission_may_have_run and self.defer_readiness(signal, result)):
                         continue
-                    ledger.finish(self.account, signal["contract"], state)
+                    ledger.finish(self.account, signal["contract"], 'submission_uncertain' if state=='unconfirmed' else state)
                     signal.setdefault('_timing', {})['finished'] = time.monotonic()
                     if (result or {}).get("denied"):
                         # The denial reason is authoritative; the result payload
@@ -1115,6 +1156,12 @@ class Client:
                         self.lease.revoke()
                     emit("execution", status=state, message=f"Signal {signal['id']}: {state}")
                 except Exception as error:
+                    transaction = getattr(self.driver,'_tt_plan_transaction',None)
+                    if (browser_connection_lost(error) and not submission_may_have_run and signal.get('_reserved')
+                            and isinstance(transaction,dict) and transaction.get('uncertain') is False
+                            and transaction.get('target') and transaction.get('authorized')):
+                        self.pre_submit_recovery = {'signal':signal,'target':{
+                            **transaction['target'],'recoveryStake':transaction['authorized']['stake']}}
                     if submission_may_have_run or getattr(self.driver, '_tt_plan_uncertain', False) is True:
                         self.lease.running = False
                         self.lease.revoke()
@@ -1168,6 +1215,7 @@ class Client:
                 self.resume_run = resume
                 if not resume:
                     self.location_recheck = LocationRecheck()
+                    self.pre_submit_recovery = None
                 self.preserve_browser_on_exit = False
                 self.run_cancel.clear()
                 if self.device_test:

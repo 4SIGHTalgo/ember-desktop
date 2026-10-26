@@ -151,7 +151,7 @@ class ProviderErrorBudgetTests(unittest.TestCase):
                 core.open_props.assert_not_called()
                 core.reveal_set_winner.assert_not_called()
 
-    def test_three_errors_cancel_the_observer_and_require_a_new_explicit_run(self):
+    def test_three_errors_cancel_the_observer_but_a_verified_recovery_resumes_the_run(self):
         now=[0.0]
         driver=Mock();driver.execute_script.return_value={'present':True}
         core=SimpleNamespace(REVEAL_SCRIPT='cancel',open_props=Mock(),reveal_set_winner=Mock())
@@ -163,12 +163,32 @@ class ProviderErrorBudgetTests(unittest.TestCase):
         calls=driver.execute_script.call_count
         driver.execute_script.return_value={'present':False}
         now[0]=100
-        self.assertFalse(reader.provider_ready(driver))
-        self.assertIn('Stop then Start',reader.error_reason)
-        self.assertEqual(driver.execute_script.call_count,calls)
+        self.assertTrue(reader.provider_ready(driver))
+        self.assertEqual(reader.load_errors,0)
+        self.assertEqual(driver.execute_script.call_count,calls+1)
         core.open_props.assert_not_called()
         core.reveal_set_winner.assert_not_called()
         self.assertTrue(MarketReadiness(core,clock=lambda:now[0]).provider_ready(driver))
+
+    def test_separate_recovered_notice_episodes_do_not_accumulate_a_permanent_stop(self):
+        now=[0.0]
+        driver=Mock()
+        reader=MarketReadiness(SimpleNamespace(REVEAL_SCRIPT='cancel'),clock=lambda:now[0])
+        for episode in range(5):
+            now[0]=episode*10
+            driver.execute_script.return_value={'present':True}
+            self.assertFalse(reader.provider_ready(driver))
+            now[0]+=5
+            driver.execute_script.return_value={'present':False}
+            self.assertTrue(reader.provider_ready(driver))
+            self.assertEqual(reader.load_errors,0)
+
+    def test_staging_cannot_navigate_even_without_a_confirmed_focus(self):
+        driver=Mock();driver.execute_script.return_value={'present':False}
+        core=SimpleNamespace(correct_event=Mock(return_value=False),open_props=Mock())
+        result=MarketReadiness(core).prepare(driver,EVENT,MARKET,lambda:True,lambda:5,staging=True)
+        self.assertEqual(result['status'],'not_ready')
+        core.open_props.assert_not_called()
 
     def test_load_notice_pauses_navigation_across_turns_and_resumes_only_after_positive_recheck(self):
         now = [0.0]
@@ -276,6 +296,20 @@ class MarketReadinessBrowserTests(unittest.TestCase):
         while time.monotonic()<deadline and not self.driver.execute_script("return window.__ttNextSetWatch.status==='revealed'"):
             time.sleep(.05)
         self.assertEqual(self.driver.execute_script('return window.expansions'),1)
+        self.assert_no_wager_actions()
+
+    def test_deep_split_text_load_notice_is_not_missed_by_the_linear_reader(self):
+        self.driver.execute_script("""
+            const notice=document.createElement('div');
+            for(const text of ['Oops-something ',"didn't load right."]){
+                let parent=notice;for(let i=0;i<8;i++){const child=document.createElement('div');parent.append(child);parent=child;}
+                parent.textContent=text;
+            }
+            document.body.append(notice);
+        """)
+        self.assertTrue(self.driver.execute_script(execution.LOAD_RECOVERY_SCRIPT,{})['present'])
+        self.assertEqual(self.reader.warm(self.driver,self.event,{'betType':'split'})['status'],'waiting')
+        self.assertEqual(self.driver.execute_script('return window.expansions'),0)
         self.assert_no_wager_actions()
 
     def test_reported_oliver_market_first_waits_then_recovers_when_async_expansion_finishes(self):

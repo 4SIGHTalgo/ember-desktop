@@ -204,13 +204,18 @@ def prepare_browser_execution(driver):
 
 
 def open_props(driver, event, market=None, timeout=15):
+    deadline = time.monotonic() + max(0, timeout)
     slug = "-vs-".join(name_key(event[player]).replace(" ", "-") for player in ("player1", "player2"))
     navigation = "already open"
     if not correct_event(driver, event) and not event_route_open(driver, event):
+        pending = getattr(driver, '_tt_navigation_intent', None)
+        if isinstance(pending, dict) and time.monotonic() < pending['until']:
+            return False
         # Prefer the site's native routing so an event change need not tear down
         # the running GeoComply client. Reuse the current page when already there.
         identifier = event["eventId"]
-        links = driver.find_elements(By.CSS_SELECTOR,
+        expired_intent = isinstance(pending, dict) and pending['event'] == event['eventId']
+        links = [] if expired_intent else driver.find_elements(By.CSS_SELECTOR,
                                      f'a[href*="/event/"][href$="/{identifier}"], a[href*="/event/"][href$="/{identifier}/"]')
         # Player-name anchors can have their own click handlers. The actual
         # event's More Bets action is the reliable router entry point.
@@ -223,16 +228,22 @@ def open_props(driver, event, market=None, timeout=15):
                     and target.path.rstrip("/").split("/")[-1] == event["eventId"]
                     and link.get_attribute("target") in (None, "", "_self")):
                 try:
+                    driver._tt_navigation_intent = {'event': identifier, 'until': time.monotonic()+5}
                     if not native_navigation_click(driver, link):
+                        driver._tt_navigation_intent = None
                         continue
-                    WebDriverWait(driver, min(2, timeout), poll_frequency=.05).until(
+                    WebDriverWait(driver, max(.001, deadline-time.monotonic()), poll_frequency=.05).until(
                         lambda d: urlparse(d.current_url).path.rstrip("/").split("/")[-1] == event["eventId"])
-                except (ElementClickInterceptedException, StaleElementReferenceException, TimeoutException):
+                except (ElementClickInterceptedException, StaleElementReferenceException):
+                    driver._tt_navigation_intent = None
                     continue
+                except TimeoutException:
+                    return False
                 navigation = "in-page event link"
                 break
         else:
             try:
+                driver._tt_navigation_intent = {'event': event['eventId'], 'until': time.monotonic()+5}
                 driver.get(f"https://sportsbook.draftkings.com/event/{slug}/{event['eventId']}")
             except TimeoutException:
                 # Analytics/stream requests can keep the load open after the
@@ -242,10 +253,10 @@ def open_props(driver, event, market=None, timeout=15):
             navigation = "direct load"
 
     try:
-        deadline = time.monotonic() + timeout
         def wait(predicate):
-            return WebDriverWait(driver, max(.05, deadline - time.monotonic()), poll_frequency=.05).until(predicate)
+            return WebDriverWait(driver, max(.001, deadline - time.monotonic()), poll_frequency=.05).until(predicate)
         wait(lambda d: correct_event(d, event))
+        driver._tt_navigation_intent = None
         tab = wait(lambda d: market_tab(d, market))
         label = tab.text.strip()
         if tab.get_attribute('aria-selected') != 'true' and not ensure_market_tab(
@@ -634,6 +645,11 @@ if(!input.isConnected){
     if(leg.status!=='ready'||!leg.input)return {cleared:false};
     input=leg.input;
 }
+if(Number.isFinite(cfg.recoveryStake)){
+    const leg=readExactPlanLeg(cfg,true);
+    if(leg.status!=='ready'||leg.input!==input||!zeroStake(input)&&Number(input.value)!==cfg.recoveryStake)
+        return {cleared:false};
+}
 writeSlipStake(input,'');
 const cleared=input.value===''&&exactSlipSnapshot().stagingSafe===true&&
     [...document.querySelectorAll(stakeSelector)].every(zeroStake);
@@ -828,6 +844,11 @@ recordSubmissionClick(cfg,slip,surface,button,submitKind,limit?.maximum);
 window.__ttSubmitFlow.planIdentity={eventId:cfg.eventId,marketId:cfg.marketId,selectionId:cfg.selectionId,
     selectionLabel:cfg.selectionLabel,marketName:cfg.marketName,selectionLine:cfg.selectionLine};
 const submittedAt = new Date().toISOString();
+if(!Number.isFinite(cfg.validUntil)||Date.now()>=cfg.validUntil)
+    return {status:'aborted',uiRejected:true,reason:'plan deadline expired before submit'};
+const finalNative=window.__playSpan?.playSpan;
+if(window.__isLoggedIn!==true||window.__canBet!==true||!finalNative?.clientKey||finalNative.grantType!=='PlaySportsbook')
+    return {status:'aborted',signIn:true,reason:'native wagering permission expired before submit'};
 button.click();
 return {status: 'submitted', placeText: label, odds, decimalOdds,
         minDecimal: cfg.minDecimal, stake: cfg.stake, echo: cfg.echo,
@@ -1036,7 +1057,8 @@ def plan_slip_ready(driver, event, market, plan):
     if getattr(driver, "_tt_plan_uncertain", False) is True or getattr(driver, "_tt_plan_stopped", False) is True:
         return False
     try:
-        config = plan_slip_config(event, market, plan)
+        offset = getattr(driver, '_ember_server_offset', 0)
+        config = plan_slip_config(event, market, plan, server_offset=offset if type(offset) in (int, float) else 0)
     except (KeyError, TypeError, ValueError):
         return False
     result = driver.execute_script(PLAN_SLIP_READY_SCRIPT, config)
@@ -1073,9 +1095,12 @@ def place_plan(driver, event, market, plan, outcome, authorize_values, validate=
                 "submitted": False, "submissionState": "uncertain" if getattr(driver, "_tt_plan_uncertain", False) is True
                 else "not-submitted", "retryable": False, "notReady": False}
     transaction = {"uncertain": False, "touched": False, "lost": False}
+    driver._tt_plan_transaction = transaction
     result = None
     try:
-        transaction["target"] = plan_slip_config(event, market, plan, outcome)
+        offset = getattr(driver, '_ember_server_offset', 0)
+        transaction["target"] = plan_slip_config(event, market, plan, outcome,
+            server_offset=offset if type(offset) in (int, float) else 0)
         transaction["target"]["stakeToken"] = str(time.time_ns())
         if deadline_budget is not None:
             if type(deadline_budget) not in (int, float) or not math.isfinite(deadline_budget) or deadline_budget < 0:
@@ -1196,7 +1221,9 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
             values = _authorize_values(authorize_values, quote)
             if "denied" in values:
                 return {"status": "skipped", "reason": f"the server withheld the wager ({values['denied']})",
-                        "submitted": False, "denied": values["denied"]}
+                        "submitted": False, "denied": values["denied"],
+                        "notReady": values["denied"] == "authorization_unavailable"}
+            transaction['authorized'] = values
             target.update(expectedFingerprint=quote.get("targetFingerprint"), expectedDecimal=quote.get("decimalOdds"))
             transaction["touched"] = True
             armed = trace.call("planSlipArming", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,

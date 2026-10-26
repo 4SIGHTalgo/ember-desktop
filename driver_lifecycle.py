@@ -5,9 +5,10 @@ from ctypes import wintypes
 import os
 import subprocess
 import sys
+import time
 
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException, WebDriverException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
 from urllib3.exceptions import HTTPError
@@ -18,6 +19,14 @@ BOT_TERMINAL_TITLE = "SPORTSBOOK BOT - KEEP THIS TERMINAL OPEN"
 
 class DriverConnectionLost(WebDriverException):
     """The local driver connection is gone; no wager command may be replayed."""
+
+
+def connection_lost(error):
+    if isinstance(error, (DriverConnectionLost, InvalidSessionIdException, NoSuchWindowException)):
+        return True
+    return isinstance(error, WebDriverException) and any(text in str(error).lower() for text in (
+        "chrome not reachable", "not connected to devtools", "disconnected from chrome",
+        "target window already closed", "web view not found", "tab crashed"))
 
 
 class _WindowsDriverJob:
@@ -128,6 +137,7 @@ class _GuardedExecutor:
         self.delegate, self.service = delegate, service
         self._execute = delegate.execute
         self.disconnected = False
+        self.failure = None
 
     def __getattr__(self, name):
         return getattr(self.delegate, name)
@@ -137,12 +147,21 @@ class _GuardedExecutor:
                    "no wager command was retried. Inspect any in-flight wager before restarting "
                    "from the bot's owning terminal.")
         if self.disconnected:
-            raise DriverConnectionLost(message)
+            raise self.failure
+        started = time.monotonic()
         try:
             return self._execute(command, params)
-        except (HTTPError, OSError):
+        except (HTTPError, OSError) as error:
             self.disconnected = True
-            raise DriverConnectionLost(message) from None
+            self.failure = DriverConnectionLost(message)
+            self.failure.command = command
+            self.failure.transport_error = type(error).__name__
+            self.failure.elapsed_ms = round(1000*(time.monotonic()-started), 1)
+            try:
+                self.failure.driver_alive = self.service.process.poll() is None
+            except (AttributeError, OSError):
+                self.failure.driver_alive = None
+            raise self.failure from None
 
 
 def create_owned_chrome(options, executable_path=None, preserve_external_browser=False):
@@ -160,6 +179,10 @@ def create_owned_chrome(options, executable_path=None, preserve_external_browser
         raise
     # Keep Selenium's RemoteConnection instance: BiDi/private-context support
     # checks its concrete type. Guard its dispatch method without replacing it.
+    pool = getattr(driver.command_executor, '_conn', None)
+    if pool is not None and isinstance(pool.connection_pool_kw, dict):
+        pool.connection_pool_kw['retries'] = False
+        pool.clear()
     guard = _GuardedExecutor(driver.command_executor, service)
     driver.command_executor.execute = guard.execute
     return driver
