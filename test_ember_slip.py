@@ -237,6 +237,117 @@ class MultiLegBrowserTests(unittest.TestCase):
             card.querySelector('input').remove();card.querySelector('[data-testid="betslip-odds-standard"]').remove();
             card.append(document.createTextNode('SUSPENDED'));""")
 
+    def close_without_controls(self, indexes=(0,)):
+        self.native_tracking()
+        self.js("""window.removedPicks=[];window.bulkRemovalClicks=0;window.keepClosed=false;
+            const submit=document.querySelector('[data-testid="betslip-place-bet-button"]'),place=submit.onclick;
+            const refresh=()=>submit.textContent=document.querySelector('[data-testid="betslip-icon-closed"]')?
+                'Remove Unavailable Picks\\nOne or more of your picks are no longer available':'Place Bet';
+            submit.onclick=()=>{if(document.querySelector('[data-testid="betslip-icon-closed"]')){
+                window.bulkRemovalClicks++;return;}place();};
+            for(const index of arguments[0]){
+                const card=document.querySelectorAll('section')[index],props=card.querySelector('.line').__reactFiber$fixture.memoizedProps;
+                props.selection.status='closed';props.bet={type:'Single',numberOfBets:1,
+                    selectionsMapped:[props.selection.selectionId],stake:null};
+                card.querySelector('input').remove();card.querySelector('[data-testid="betslip-odds-standard"]').remove();
+                const icon=document.createElement('span');icon.dataset.testid='betslip-icon-closed';icon.textContent='CLOSED';card.append(icon);
+                card.querySelector('[data-tracking]').onclick=()=>{if(window.keepClosed)return;
+                    window.removedPicks.push(props.selection.selectionId);card.remove();refresh();};
+            }
+            refresh();""", list(indexes))
+
+    def test_closed_native_pick_is_removed_before_another_exact_leg_is_claimed(self):
+        self.close_without_controls()
+        snapshot=execution.read_plan_slip(self.driver)
+        self.assertEqual(snapshot['status'],'present')
+        self.assertTrue(snapshot['legs'][0]['closed'])
+        self.assertFalse(execution.plan_slip_ready(self.driver,*contract(2)[:3]))
+        def authorize(quote):
+            self.assertEqual(self.js('return window.removedPicks'),['s1'])
+            self.assert_unstaked()
+            return {'stake':2.61,'min_decimal':2.0}
+        result=self.run_plan(2,authorize=authorize)
+        self.assertEqual(result['status'],'placed',result)
+        self.assertEqual([row[0]['tracking']['selectionId'] for row in self.js('return window.actions')],['s3'])
+        self.assertEqual(self.js('return window.bulkRemovalClicks'),0)
+        self.assertEqual([leg['selectionId'] for leg in execution.read_plan_slip(self.driver)['legs']],['s2'])
+        self.assert_unstaked()
+
+    def test_multiple_closed_picks_can_recover_readiness_without_board_or_wager_actions(self):
+        from ember_market_readiness import MarketReadiness
+        self.close_without_controls((0,1))
+        event,market,plan,_=contract(2)
+        with patch.object(execution,'open_props',side_effect=AssertionError('unexpected navigation')):
+            result=MarketReadiness(execution).prepare(self.driver,event,market,lambda:True,lambda:5,plan=plan)
+        self.assertEqual(result['status'],'revealed',result)
+        self.assertTrue(result['staged'])
+        self.assertEqual(self.js('return window.removedPicks'),['s1','s2'])
+        self.assertEqual(self.js('return window.actions'),[])
+        self.assert_unstaked()
+
+    def test_closed_cleanup_refuses_funding_unknown_identity_or_unverified_status(self):
+        for mutation in ('delete props.bet.stake','props.bet.stake=1','props.bet.type="Parlay"',
+                         'props.bet.selectionsMapped=["other"]','props.selection.status="open"',
+                         'card.querySelector("[data-testid=betslip-icon-closed]").remove()',
+                         'document.querySelectorAll("input")[0].value="1"'):
+            with self.subTest(mutation=mutation):
+                self.reset();self.close_without_controls()
+                self.js('const card=document.querySelector("section"),props=card.querySelector(".line").__reactFiber$fixture.memoizedProps;'+mutation)
+                self.assertEqual(execution.remove_closed_picks(self.driver)['status'],'blocked')
+                authorize=Mock()
+                self.assertEqual(self.run_plan(2,authorize=authorize)['submissionState'],'not-submitted')
+                authorize.assert_not_called()
+                self.assertEqual(self.js('return window.removedPicks'),[])
+                self.assertEqual(self.js('return window.actions'),[])
+
+    def test_stalled_closed_removal_yields_without_a_claim_stake_or_bulk_click(self):
+        self.close_without_controls()
+        self.js('window.keepClosed=true')
+        authorize=Mock()
+        result=self.run_plan(2,authorize=authorize)
+        self.assertTrue(result['retryable'],result)
+        self.assertEqual(result['submissionState'],'not-submitted')
+        authorize.assert_not_called()
+        self.assertEqual(self.js('return window.bulkRemovalClicks'),0)
+        self.assertEqual(self.js('return window.actions'),[])
+        self.assert_unstaked()
+
+    def test_pick_closing_after_claim_or_arming_aborts_then_can_retry_unsubmitted_work(self):
+        for phase in ('claim','armed'):
+            with self.subTest(phase=phase):
+                self.reset()
+                validations=[0]
+                def authorize(quote):
+                    if phase=='claim':self.close_without_controls()
+                    return {'stake':2.61,'min_decimal':2.0}
+                def valid():
+                    validations[0]+=1
+                    if phase=='armed' and validations[0]==2:self.close_without_controls()
+                    return True
+                result=self.run_plan(2,authorize=authorize,validate=valid)
+                self.assertEqual(result['submissionState'],'not-submitted',result)
+                self.assertTrue(result['retryable'],result)
+                self.assertEqual(self.js('return window.actions'),[])
+                self.assert_unstaked()
+                self.assertEqual(self.run_plan(2)['status'],'placed')
+                self.assertEqual(self.js('return window.removedPicks'),['s1'])
+                self.assertEqual(len(self.js('return window.actions')),1)
+
+    def test_closed_cleanup_preserves_a_pick_that_becomes_suspended_between_removals(self):
+        self.close_without_controls((0,1))
+        self.js('''const first=document.querySelector('section [data-tracking]'),original=first.onclick;
+            const second=document.querySelectorAll('section')[1];
+            first.onclick=()=>{original();
+                second.querySelector('.line').__reactFiber$fixture.memoizedProps.selection.status='suspended';
+                const icon=second.querySelector('[data-testid="betslip-icon-closed"]');
+                icon.dataset.testid='betslip-icon-suspended';icon.textContent='SUSPENDED';
+                document.querySelector('[data-testid="betslip-place-bet-button"]').textContent='Place Bet';};''')
+        result=execution.remove_closed_picks(self.driver)
+        self.assertEqual(result['status'],'cleared')
+        self.assertEqual(self.js('return window.removedPicks'),['s1'])
+        self.assertEqual([leg['selectionId'] for leg in execution.read_plan_slip(self.driver)['legs']],['s2','s3'])
+        self.assertEqual(self.run_plan(2)['status'],'placed')
+
     def test_native_suspended_unfunded_leg_without_controls_cannot_starve_ready_b(self):
         self.suspend_without_controls()
         snapshot=execution.read_plan_slip(self.driver)

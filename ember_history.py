@@ -39,12 +39,14 @@ REASONS = {
 }
 WIRE_FIELDS = ("id", "revision", "signal_id", "observed_at", "last_observed_at", "expires_at",
                "resolved_at", "outcome", "reason", "final_decimal_odds", "final_point_ev", "readiness")
+SLIP_READINESS_REASONS = {'unsupported leg layout', 'closed leg funding is unverified',
+    'closed leg status is unverified', 'closed picks block submission', 'closed picks could not be removed'}
 READINESS_REASONS = {"ready", "event route not ready", "event identity not ready", "scoreboard identity",
     "market tab not selected", "winner section missing", "winner section ambiguous", "expanding winner section",
     "market section missing", "market section ambiguous", "expanding market section",
     "selection IDs missing or ambiguous", "selections are not in one market row", "game number mismatch",
     "selections disabled, hidden, already selected, or names/prices invalid", "page changed or data expired",
-    "waiting for the exact market tab", "market surface not ready"}
+    "waiting for the exact market tab", "market surface not ready"} | SLIP_READINESS_REASONS
 
 
 def readiness_details(value):
@@ -282,7 +284,7 @@ class OpportunityJournal:
         # local diagnostics without requiring a server cutover for this client.
         for report in batch:
             readiness = report['readiness']
-            if readiness.get('reason') in {'market section missing', 'market section ambiguous', 'expanding market section'}:
+            if readiness.get('reason') in {'market section missing', 'market section ambiguous', 'expanding market section'} | SLIP_READINESS_REASONS:
                 readiness['reason'] = 'market surface not ready'
         return batch
 

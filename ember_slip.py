@@ -91,6 +91,7 @@ const slipIdentity=remove=>{
     }
     const unique=[...new Set(records.map(value=>JSON.stringify(value)))];
     return unique.length===1?{...JSON.parse(unique[0]),nativeSuspended:statuses.includes('suspended'),
+        nativeClosed:statuses.includes('closed'),closedVerified:statuses.length>0&&statuses.every(s=>s==='closed'),
         nativeUnfunded:unfunded.length>0&&unfunded.every(Boolean)}:null;
 };
 const writeSlipStake=(input,value)=>{
@@ -118,6 +119,7 @@ const exactSlipSnapshot=()=>{
         if(!evidence)return bad('incomplete or conflicting leg identity');
         const identity=Object.fromEntries(['selectionId','eventId','marketId'].map(k=>[k,evidence[k]]));
         if(evidence.nativeSuspended&&!evidence.nativeUnfunded)return bad('suspended leg funding is unverified');
+        if(evidence.nativeClosed&&!evidence.nativeUnfunded)return bad('closed leg funding is unverified');
         if(ids.has(identity.selectionId))return bad('duplicate selection ids');
         ids.add(identity.selectionId);
         // The minimal common ancestor must isolate exactly one remove, price and stake.
@@ -125,10 +127,13 @@ const exactSlipSnapshot=()=>{
         let root=remove.parentElement;
         while(root&&root!==slip&&!(root.querySelector(stakeSelector)&&root.querySelector(priceSelector)))root=root.parentElement;
         const card=remove.closest('[data-testid="single-card"]');
-        if(evidence.nativeSuspended&&evidence.nativeUnfunded&&card&&visibleUI(card)&&visibleUI(remove)&&
-            !card.querySelector(stakeSelector)&&!card.querySelector(priceSelector)&&/\bsuspended\b/i.test(slipText(card))){
+        const closed=!!(evidence.nativeClosed&&evidence.closedVerified&&card&&
+            visibleUI(card.querySelector('[data-testid="betslip-icon-closed"]'))&&/\bclosed\b/i.test(slipText(card)));
+        if(evidence.nativeClosed&&!closed)return bad('closed leg status is unverified');
+        if((evidence.nativeSuspended||closed)&&evidence.nativeUnfunded&&card&&visibleUI(card)&&visibleUI(remove)&&
+            !card.querySelector(stakeSelector)&&!card.querySelector(priceSelector)&&/\b(?:suspended|closed)\b/i.test(slipText(card))){
             legs.push({...identity,root:card,input:null,price:null,text:slipText(card),decimalOdds:null,
-                suspended:true,stakeValue:'',fingerprint:JSON.stringify([identity,slipContractText(card),''])});
+                suspended:true,closed,stakeValue:'',fingerprint:JSON.stringify([identity,slipContractText(card),''])});
             continue;
         }
         if(!root||root===slip||root.querySelectorAll(removeSelector).length!==1||
@@ -139,10 +144,10 @@ const exactSlipSnapshot=()=>{
             input.getAttribute('data-testid')!=='betslip-wager-box-input')return bad('hidden or unsupported leg controls');
         const ancestors=[];
         for(let node=root;node&&node!==slip;node=node.parentElement)ancestors.push(node);
-        const suspended=evidence.nativeSuspended||[...ancestors,...root.querySelectorAll('[aria-disabled],[disabled]')].some(e=>
+        const suspended=evidence.nativeSuspended||closed||[...ancestors,...root.querySelectorAll('[aria-disabled],[disabled]')].some(e=>
             e.getAttribute('aria-disabled')==='true'||e.disabled)||/\bsuspended\b|selection (?:is )?unavailable/i.test(slipText(root));
         const decimalOdds=slipDecimal(root);
-        legs.push({...identity,root,input,price,text:slipText(root),decimalOdds,suspended,
+        legs.push({...identity,root,input,price,text:slipText(root),decimalOdds,suspended,closed,
             stakeValue:input.value,fingerprint:JSON.stringify([identity,slipContractText(root),price.textContent.trim()])});
     }
     if(leafSlipPrices(slip).some(price=>!legs.some(leg=>leg.price===price)))
@@ -164,6 +169,7 @@ const readExactPlanLeg=(cfg,cleanup=false)=>{
     const leg=matches[0],{slip}=snapshot;
     if(cleanup)return {...leg,slip,status:'ready'};
     if(snapshot.inputs.some(input=>input!==leg.input&&!zeroStake(input)))return bad('non-target or parlay stake is not zero');
+    if(snapshot.legs.some(item=>item.closed))return {...bad('closed picks block submission'),notReady:true};
     if(leg.suspended||leg.input.readOnly)return {...bad('target leg is suspended or disabled'),notReady:true};
     const contains=value=>(' '+slipKey(leg.text)+' ').includes(' '+slipKey(value)+' ');
     const markets=cfg.marketName==='Moneyline'?['Moneyline','Match Winner']:[cfg.marketName];
@@ -178,6 +184,7 @@ const readExactPlanLeg=(cfg,cleanup=false)=>{
     const buttons=[...slip.querySelectorAll('button[data-testid="betslip-place-bet-button"]')].filter(visibleUI);
     if(buttons.length!==1)return bad('place-bet button is hidden or ambiguous');
     const button=buttons[0],label=slipText(button);
+    if(/^remove\s+(?:unavailable|closed)\s+picks\b/i.test(label))return {...bad('closed picks block submission'),notReady:true};
     const login=[...document.querySelectorAll('button,a,[role="button"]')].filter(visibleUI)
         .some(e=>/^(?:sign\s*up\s*(?:or|\/)\s*)?(?:log\s*in|sign\s*in)$/i.test(slipText(e)));
     if(login||window.__isLoggedIn===false||/log\s*in|sign\s*in/i.test(label))
@@ -191,7 +198,7 @@ const readExactPlanLeg=(cfg,cleanup=false)=>{
 const publicSlipSnapshot=()=>{
     const snapshot=exactSlipSnapshot();
     return {status:snapshot.status,reason:snapshot.reason,stagingSafe:snapshot.stagingSafe===true,
-        legs:snapshot.legs.map(({selectionId,eventId,marketId,text,decimalOdds,stakeValue,suspended})=>
-            ({selectionId,eventId,marketId,text,decimalOdds,stakeValue,suspended}))};
+        legs:snapshot.legs.map(({selectionId,eventId,marketId,text,decimalOdds,stakeValue,suspended,closed})=>
+            ({selectionId,eventId,marketId,text,decimalOdds,stakeValue,suspended,closed}))};
 };
 """

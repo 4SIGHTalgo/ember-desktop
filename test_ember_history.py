@@ -76,6 +76,18 @@ class OpportunityJournalTests(unittest.TestCase):
         self.assertEqual(self.snapshot()["counts"], {"uncertain": 1})
         self.assertEqual(self.snapshot()["records"][0]["reason"], "submission_uncertain")
 
+    def test_closed_pick_diagnostics_survive_locally_without_breaking_server_sync(self):
+        for number,reason in enumerate(('unsupported leg layout','closed picks could not be removed',
+                                       'closed leg funding is unverified'),10):
+            with self.subTest(reason=reason):
+                signal=history_signal(number,contract=f'{number}:split')
+                self.journal.observe(self.scope,signal)
+                self.journal.transition(self.scope,signal,'missed','signal_expired',result={
+                    'readiness':{'status':'not_ready','reason':reason,'attempts':0,'wait_ms':0}})
+                self.assertEqual(self.snapshot()['records'][0]['readiness']['reason'],reason)
+                self.assertTrue(all(row['readiness']['reason']=='market surface not ready'
+                                    for row in self.journal.pending_batch(self.scope)))
+
     def test_explicit_non_submission_can_be_logged_as_missed_after_final_validation(self):
         signal = history_signal()
         self.journal.observe(self.scope, signal)

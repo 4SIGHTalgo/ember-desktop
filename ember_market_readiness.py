@@ -1,7 +1,7 @@
 """Non-wager market warmup and deadline-bounded recovery of transient UI states."""
 import time
 
-from tt_market_exec import LOAD_RECOVERY_SCRIPT, plan_slip_ready, read_plan_slip
+from tt_market_exec import LOAD_RECOVERY_SCRIPT, plan_slip_ready, read_plan_slip, remove_closed_picks
 from driver_lifecycle import connection_lost
 
 
@@ -70,6 +70,14 @@ class MarketReadiness:
             return {"status": "revealed", "staged": True, "attempts": 0, "wait_ms": 0}
         if plan is not None:
             snapshot = read_plan_slip(driver)
+            if (snapshot.get('stagingSafe') is True and valid() and remaining() > .6
+                    and any(leg.get('closed') is True for leg in snapshot.get('legs', []))):
+                removed = remove_closed_picks(driver)
+                if removed.get('status') != 'cleared':
+                    return {'status':'not_ready','reason':'closed picks could not be removed','attempts':0,'wait_ms':0}
+                if valid() and plan_slip_ready(driver, event, market, plan):
+                    return {'status':'revealed','staged':True,'attempts':0,'wait_ms':0}
+                snapshot = read_plan_slip(driver)
             if snapshot.get('status') not in ('empty','present') or snapshot.get('stagingSafe') is not True:
                 return {'status':'not_ready','reason':snapshot.get('reason') or 'slip funding is not zero',
                         'attempts':0,'wait_ms':0}

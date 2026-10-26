@@ -212,12 +212,14 @@ class SlipFirstOrderTests(unittest.TestCase):
     setUp = PlanExecutionTests.setUp
 
     def hot(self, denial=False, failure=None, fatal_at=None, continuation=False,
-            quote_failure=None, snapshot=None, cleanup=True, deadline_budget=None, receipt_error=None):
+             quote_failure=None, snapshot=None, cleanup=True, deadline_budget=None, receipt_error=None,
+             closed=False, removal_status='cleared'):
         from contextlib import ExitStack
         from unittest.mock import patch
         self.order, self.configs = [], []
         driver = self.driver = Mock()
         identity = {"eventId": "100", "marketId": "200", "selectionId": "300"}
+        closed_removed = False
 
         def record(name, value):
             def call(*args, **kwargs):
@@ -228,9 +230,13 @@ class SlipFirstOrderTests(unittest.TestCase):
             return call
 
         def dispatch(script, *args):
+            nonlocal closed_removed
             if script is execution.PLAN_SLIP_SNAPSHOT_SCRIPT:
                 return record("snapshot", {"status": "present", "stagingSafe": True,
-                                           "legs": [identity, {**identity, "selectionId": "other"}]} if snapshot is None else snapshot)()
+                                           "legs": [identity, {**identity, "selectionId": "other",'closed':closed and not closed_removed}]} if snapshot is None else snapshot)()
+            if script is execution.PLAN_REMOVE_CLOSED_SCRIPT:
+                closed_removed = removal_status == 'cleared'
+                return record('closed_remove',{'status':removal_status})()
             if script is execution.WAIT_FOR_PLAN_ARM_SCRIPT:
                 self.configs.append(args[0])
                 return record("quote" if args[0].get("readOnly") else "arm",
@@ -284,6 +290,30 @@ class SlipFirstOrderTests(unittest.TestCase):
         self.assertEqual(self.order[-2:], ["quote", "claim"])
         self.assertNotIn("arm", self.order)
         self.assertNotIn("cleanup", self.order)
+
+    def test_closed_removal_is_verified_before_quote_claim_and_stake(self):
+        self.assertEqual(self.hot(closed=True)['status'],'placed')
+        self.assertEqual(self.order,['validate','signed_in_state','location_status','recover_load_notice',
+            'ensure_slip_open','snapshot','closed_remove','snapshot','quote','claim','arm','validate','confirm','receipt'])
+
+    def test_unverified_or_lost_closed_removal_never_claims_or_submits(self):
+        for status in ('waiting','blocked',None):
+            with self.subTest(status=status):
+                result=self.hot(closed=True,removal_status=status)
+                self.assertTrue(result['retryable'])
+                self.assertEqual(result['submissionState'],'not-submitted')
+                self.assertEqual(self.order[-1],'closed_remove')
+        with self.assertRaises(execution.DriverConnectionLost):
+            self.hot(closed=True,fatal_at='closed_remove')
+        self.assertEqual(self.order[-1],'closed_remove')
+        calls=len(self.driver.mock_calls)
+        self.assertEqual(execution.remove_closed_picks(self.driver)['status'],'blocked')
+        self.assertEqual(len(self.driver.mock_calls),calls)
+
+    def test_uncertain_submission_never_dispatches_closed_pick_removal(self):
+        driver=Mock();driver._tt_plan_uncertain=True
+        self.assertEqual(execution.remove_closed_picks(driver)['status'],'blocked')
+        driver.execute_script.assert_not_called()
 
     def test_definite_abort_clears_only_owned_target_after_confirm(self):
         result = self.hot(failure={"status": "aborted", "uiRejected": True, "reason": "changed line"})

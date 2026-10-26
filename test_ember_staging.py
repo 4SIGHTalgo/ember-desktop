@@ -65,6 +65,27 @@ class StagingTests(unittest.TestCase):
         self.step()
         self.core.click_selection.assert_not_called()
 
+    def test_idle_staging_removes_verified_closed_picks_even_without_fresh_hints(self):
+        closed={'status':'present','stagingSafe':True,'legs':[{'eventId':'100','marketId':'200',
+            'selectionId':'100a','closed':True}]}
+        self.reader.side_effect=[closed,self.snapshot]
+        with patch('ember_staging.remove_closed_picks',return_value={'status':'cleared'}) as remove:
+            self.assertIsNone(self.step(hints=[]))
+            remove.assert_called_once_with(self.driver)
+        self.assertEqual(self.stager.inventory,[])
+        self.core.click_selection.assert_not_called()
+        self.readiness.prepare.assert_not_called()
+
+    def test_stop_funding_or_uncertainty_blocks_idle_closed_pick_removal(self):
+        self.snapshot.update(status='present',legs=[{'closed':True}])
+        for blocked in ('stop','funded','uncertain'):
+            with self.subTest(blocked=blocked),patch('ember_staging.remove_closed_picks') as remove:
+                self.snapshot['stagingSafe']=blocked!='funded'
+                self.driver._tt_plan_uncertain=blocked=='uncertain'
+                self.step(hints=[],valid=blocked!='stop')
+                remove.assert_not_called()
+        self.core.click_selection.assert_not_called()
+
     def test_navigation_spending_a_whole_turn_can_finish_on_its_next_tick(self):
         now = [0.0]
         def slow_navigation(*args, **kwargs):

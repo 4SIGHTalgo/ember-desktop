@@ -632,6 +632,30 @@ return window.__dkKeepAlive || null;
 # arithmetic ever runs here — the server computed the floor and the stake.
 PLAN_SLIP_READER_JS = VISIBLE_UI_JS + BALANCE_READER_JS + EXACT_SLIP_READER_JS
 PLAN_SLIP_SNAPSHOT_SCRIPT = SLIP_LEGS_SCRIPT
+PLAN_REMOVE_CLOSED_SCRIPT = PLAN_SLIP_READER_JS + """
+let snapshot=exactSlipSnapshot();
+const safe=()=>['present','empty'].includes(snapshot.status)&&snapshot.stagingSafe===true;
+const blocked=()=>({status:'blocked',reason:snapshot.reason||'slip funding is not zero'});
+if(!safe())return blocked();
+const closed=snapshot.legs.filter(leg=>leg.closed),removed=[];
+if(closed.length>128)return {status:'blocked',reason:'too many closed picks'};
+for(const identity of closed){
+    snapshot=exactSlipSnapshot();
+    if(!safe())return blocked();
+    const matches=snapshot.legs.filter(leg=>['eventId','marketId','selectionId'].every(k=>leg[k]===identity[k]));
+    if(!matches.length)continue;
+    if(matches.length!==1)return {status:'blocked',reason:'closed pick identity is ambiguous'};
+    const leg=matches[0];
+    if(!leg.closed)continue;
+    const controls=[...leg.root.querySelectorAll(removeSelector)].filter(visibleUI);
+    if(controls.length!==1||controls[0].tagName!=='BUTTON'||controls[0].disabled||controls[0].getAttribute('aria-disabled')==='true')
+        return {status:'blocked',reason:'closed pick removal is unavailable'};
+    controls[0].click();removed.push(leg.selectionId);
+}
+snapshot=exactSlipSnapshot();
+if(!safe())return blocked();
+return {status:snapshot.legs.some(leg=>leg.closed)?'waiting':'cleared',removed};
+"""
 PLAN_SLIP_READY_SCRIPT = LOCATION_READER_JS + PLAN_SLIP_READER_JS + """
 const leg=readExactPlanLeg(arguments[0]);
 return {ready:!readDkLocation().blocked&&leg.status==='ready'&&exactSlipSnapshot().stagingSafe===true};
@@ -1052,6 +1076,14 @@ def read_plan_slip(driver):
     return result if isinstance(result, dict) else {"status": "unsupported", "stagingSafe": False, "legs": []}
 
 
+def remove_closed_picks(driver):
+    """Remove only exact native closed singles while the entire slip is unfunded."""
+    if any(getattr(driver, flag, False) is True for flag in ('_tt_plan_uncertain', '_tt_plan_stopped')):
+        return {'status': 'blocked', 'reason': 'a previous submission is unresolved'}
+    result = driver.execute_script(PLAN_REMOVE_CLOSED_SCRIPT)
+    return result if isinstance(result, dict) else {'status': 'blocked', 'reason': 'closed pick removal is unverified'}
+
+
 def plan_slip_ready(driver, event, market, plan):
     """Whether the exact unstaked leg can execute without any board navigation."""
     if getattr(driver, "_tt_plan_uncertain", False) is True or getattr(driver, "_tt_plan_stopped", False) is True:
@@ -1181,6 +1213,11 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     if not trace.call("planSlipOpen", ensure_slip_open, driver, timeout=_plan_wait_ms(transaction) / 1000):
         raise BetNotSubmitted("the bet-slip accordion did not open", not_ready=True)
     snapshot = trace.call("planSlipLegs", read_plan_slip, driver)
+    if snapshot.get('stagingSafe') is True and any(leg.get('closed') is True for leg in snapshot.get('legs', [])):
+        removed = trace.call('planClosedPicks', remove_closed_picks, driver)
+        if removed.get('status') != 'cleared':
+            raise BetNotSubmitted('closed picks could not be removed', not_ready=True)
+        snapshot = trace.call('planSlipLegs', read_plan_slip, driver)
     if snapshot.get("status") not in ("empty", "present") or not snapshot.get("stagingSafe"):
         raise BetNotSubmitted(snapshot.get("reason") or "the staged slip is unsupported or has stakes")
     staged = any(all(leg.get(key) == target[key] for key in ("eventId", "marketId", "selectionId"))

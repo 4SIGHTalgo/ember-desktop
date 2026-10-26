@@ -2,7 +2,7 @@
 import time
 
 from ember_protocol import timestamp
-from tt_market_exec import read_plan_slip
+from tt_market_exec import read_plan_slip, remove_closed_picks
 
 
 def stage_key(stage):
@@ -41,6 +41,10 @@ class Staging:
         snapshot = read_plan_slip(driver)
         if snapshot.get('reason') == 'bet slip is hidden or ambiguous':
             core.ensure_slip_open(driver, timeout=min(.05, max_wait))
+            snapshot = read_plan_slip(driver)
+        if snapshot.get('stagingSafe') is True and any(leg.get('closed') is True for leg in snapshot.get('legs', [])):
+            if not valid() or remove_closed_picks(driver).get('status') != 'cleared':
+                return None
             snapshot = read_plan_slip(driver)
         self.inventory = snapshot.get("legs", [])
         if snapshot.get("status") not in ("empty", "present") or snapshot.get("stagingSafe") is not True:
