@@ -120,6 +120,25 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertNotIn("private", content)
         self.assertEqual(json.loads(content)["stage"], "browser_endpoint_unavailable")
 
+    def test_fault_records_only_a_short_ascii_activity_label(self):
+        path = self.directory/"diagnostics.jsonl"
+        LifecycleLog(path).record("browser_fault", error=RuntimeError("boom"), activity="script:REVEAL_SCRIPT")
+        self.assertEqual(json.loads(path.read_text())["activity"], "script:REVEAL_SCRIPT")
+        LifecycleLog(path).record("browser_fault", activity="  ")
+        LifecycleLog(path).record("browser_fault", activity="préparer:100")
+        rows = [json.loads(line) for line in path.read_text().splitlines()][1:]
+        self.assertNotIn("activity", rows[0])
+        self.assertEqual(rows[1]["activity"], "prparer:100")
+
+    def test_recovery_journals_the_last_activity_with_the_fault(self):
+        self.browser.process = Mock()
+        with patch.object(self.browser, "inspect", return_value={"state": "waiting"}):
+            self.assertEqual(self.browser.recovery(WebDriverException("unreachable"), activity="prepare:100"),
+                             "browser_wait")
+        row = json.loads((self.directory/"browser-lifecycle.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(row["event"], "browser_fault")
+        self.assertEqual(row["activity"], "prepare:100")
+
     def test_stale_driver_cleanup_requires_exact_process_creation_and_driver_port(self):
         process = Mock()
         process.create_time.return_value = 123
@@ -303,7 +322,7 @@ class ClientRecoveryTests(unittest.TestCase):
         self.assertFalse(client.lease.running)
         self.assertTrue(client.run_cancel.is_set())
 
-    def test_recovery_revokes_permission_discards_old_queue_and_leaves_submitted_contract_uncertain(self):
+    def test_recovery_keeps_pending_quotes_fail_closed_and_never_downgrades_a_submitted_contract(self):
         from test_ember_history import history_signal
         signal = history_signal()
         self.client.provider_ready.set()
@@ -315,8 +334,16 @@ class ClientRecoveryTests(unittest.TestCase):
         self.client.pause_browser()
         self.assertFalse(self.client.provider_ready.is_set())
         self.assertEqual(self.client.lease.until, 0)
-        self.assertTrue(self.client.signals.empty())
+        # A transient pause keeps the pending quote for a fast reconnect; the
+        # revoked lease and cleared provider permission keep it fail-closed.
+        self.assertEqual(self.client.signals.get_nowait(), signal)
+        self.assertFalse(self.client.permits(signal))
         self.assertFalse(ledger.reserve(self.client.account, signal["contract"]))
+        # The pause itself never resolves a possibly-submitted contract; only
+        # post-recovery processing (or login reconciliation) may, as uncertain.
+        row = self.client.history.snapshot(self.client.history_scope())["records"][0]
+        self.assertEqual(row["outcome"], "submitting")
+        self.client.history_outcome(signal, "missed", "browser_not_ready")
         row = self.client.history.snapshot(self.client.history_scope())["records"][0]
         self.assertEqual(row["outcome"], "uncertain")
         ledger.connection.close()

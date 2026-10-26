@@ -76,7 +76,10 @@ class MarketReadiness:
                     and leg.get('suspended') is True for leg in legs):
                 return {'status': 'not_ready', 'reason': 'target leg suspended', 'attempts': 0, 'wait_ms': 0}
         if not hasattr(self.core, 'correct_event') or not self.core.correct_event(driver, event):
-            opening = self.open(driver, event, market, valid, remaining, max_wait=max(0, deadline-self.clock()))
+            # A signal turn may still have to cross matches; give that one
+            # navigation a real budget instead of a yield-sized slice.
+            nav_wait = min(2.0, max(.3, max(0, remaining()-.6))) if plan is not None else max(0, deadline-self.clock())
+            opening = self.open(driver, event, market, valid, remaining, max_wait=nav_wait)
             if opening.get("status") != "opened":
                 return opening
         if plan is not None:

@@ -14,6 +14,14 @@ class Staging:
         self.cursor = 0
         self.pending = None
         self.inventory = []
+        self.read_snapshot = None
+        self.read_at = float("-inf")
+
+    def recent_snapshot(self, max_age=1.0, clock=time.monotonic):
+        """The slip read from this tick; a publisher never needs a second one."""
+        if self.read_snapshot is not None and clock()-self.read_at <= max_age:
+            return self.read_snapshot
+        return None
 
     def add(self, driver, core, event, market, outcome, valid, timeout):
         snapshot = read_plan_slip(driver)
@@ -24,7 +32,7 @@ class Staging:
             return {'status': 'selected'}
         return core.click_selection(driver, event, outcome, market, validate=valid, timeout=timeout)
 
-    def step(self, driver, core, readiness, stages, valid, server_now, max_wait=.3):
+    def step(self, driver, core, readiness, stages, valid, server_now, max_wait=.3, focus=None):
         """At most one absent leg per tick; expiry never removes a physical leg."""
         if not valid() or any(getattr(driver, flag, False) is True for flag in
                               ("_tt_plan_uncertain", "_tt_plan_stopped")):
@@ -37,7 +45,14 @@ class Staging:
         self.inventory = snapshot.get("legs", [])
         if snapshot.get("status") not in ("empty", "present") or snapshot.get("stagingSafe") is not True:
             return None
+        self.read_snapshot, self.read_at = snapshot, started
         fresh = [s for s in stages[:128] if s.get("event") and timestamp(s["expires_at"]) > server_now]
+        if focus is not None:
+            # The navigation arbiter owns every page change; staging only
+            # clicks on the page the arbiter already put the browser on.
+            fresh = [s for s in fresh if str(s["event_id"]) == focus]
+            if fresh and (not hasattr(core, "correct_event") or not core.correct_event(driver, fresh[0]["event"])):
+                return None
         present = {(leg["eventId"], leg["marketId"], leg["selectionId"]) for leg in self.inventory}
         absent = [s for s in fresh if stage_key(s) not in present]
         if not absent:
@@ -46,7 +61,7 @@ class Staging:
         if stage is None:
             stage = absent[self.cursor % len(absent)]
             self.cursor += 1
-            # Navigation may spend a turn; give its page one follow-up before rotating.
+            # A slow reveal may spend a turn; give its page one follow-up before rotating.
             self.pending = stage_key(stage)
         else:
             self.pending = None

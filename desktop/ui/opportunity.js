@@ -61,7 +61,9 @@ window.EmberOpportunity = (() => {
     text('sets-one', view.set_tally?.[0] ?? '—'); text('sets-two', view.set_tally?.[1] ?? '—');
     text('point-score', `${view.period ? `${view.period} set · ` : ''}Current points ${view.points ? view.points.join(' – ') : 'unavailable'}`);
     const mode = view.ev_mode === 'point' ? 'POINT-ESTIMATE NET EV' : view.confidence === 95 ? 'VERY CONSERVATIVE NET EV' : 'CONSERVATIVE NET EV';
-    const shownEV = active && view.entry_open ? best?.gate_ev : null;
+    // The estimate is shown whenever the data is current; the Entry closed
+    // stage and the window check keep it visibly non-executable.
+    const shownEV = active ? best?.gate_ev : null;
     text('ev-label', mode); text('ev-value', percent(shownEV, view.minimum_ev));
     const tone = known(shownEV) ? shownEV > 0 ? 'positive' : 'negative' : '';
     $('ev-value').dataset.tone = tone;
@@ -90,7 +92,7 @@ window.EmberOpportunity = (() => {
     text('check-history', `${view.history_count ?? 'Unknown'} prior meetings · min 30`);
     text('check-ev', `${view.ev_mode === 'point' ? 'Point' : 'Conservative'} EV > ${view.minimum_ev}%`);
     text('opportunity-age', `Quote: ${quoteAge === null ? 'not received' : `${quoteAge}s ago`} · Score: ${scoreAge === null ? 'not received' : `${scoreAge}s ago`} · Snapshot: ${age(view.updated_at, now) ?? '—'}s ago`);
-    const shownCandidates = active && view.entry_open ? candidates : candidates.map(row => ({...row, estimated_ev: null, conservative_ev: null}));
+    const shownCandidates = active ? candidates : candidates.map(row => ({...row, estimated_ev: null, conservative_ev: null}));
     const signature = JSON.stringify([shownCandidates, view.confidence]);
     if ($('candidate-cards').dataset.signature !== signature) {
       $('candidate-cards').replaceChildren(...shownCandidates.map(candidate => candidateCard(candidate, view.confidence)));

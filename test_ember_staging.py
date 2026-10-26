@@ -38,9 +38,10 @@ class StagingTests(unittest.TestCase):
         self.reader = reader.start()
         self.addCleanup(reader.stop)
 
-    def step(self, hints=None, valid=True):
-        return self.stager.step(self.driver, self.core, self.readiness, self.hints if hints is None else hints,
-                                lambda: valid, time.time())
+    def step(self, hints=None, valid=True, focus=None, core=None):
+        return self.stager.step(self.driver, core or self.core, self.readiness,
+                                self.hints if hints is None else hints,
+                                lambda: valid, time.time(), focus=focus)
 
     def test_one_native_selection_per_tick_and_round_robin_across_failed_events(self):
         self.readiness.prepare.return_value = {'status': 'not_ready'}
@@ -87,6 +88,27 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(self.step(), self.hints[0])
         self.core.click_selection.assert_called_once()
         self.assertLessEqual(self.core.click_selection.call_args.kwargs['timeout'], .001)
+
+    def test_focus_limits_staging_to_the_arbiters_page_and_never_navigates(self):
+        core = SimpleNamespace(click_selection=Mock(return_value={'status': 'clicked'}),
+                               correct_event=Mock(return_value=True))
+        self.assertEqual(self.step(core=core, focus="100"), self.hints[0])
+        self.assertEqual([call.args[1] for call in self.readiness.prepare.call_args_list],
+                         [self.hints[0]['event']])
+        core.click_selection.assert_called_once()
+        self.assertEqual(self.step(core=core, focus="101"), self.hints[1])
+        self.assertEqual(core.click_selection.call_count, 2)
+        core.correct_event.return_value = False
+        self.readiness.prepare.reset_mock()
+        core.click_selection.reset_mock()
+        self.assertIsNone(self.step(core=core, focus="101"))
+        self.readiness.prepare.assert_not_called()
+        core.click_selection.assert_not_called()
+
+    def test_recent_slip_read_is_reusable_only_within_the_same_tick(self):
+        self.step()
+        self.assertIsNotNone(self.stager.recent_snapshot())
+        self.assertIsNone(self.stager.recent_snapshot(max_age=-1))
 
     def test_expiry_disconnect_funded_slip_and_uncertainty_never_click(self):
         expired = {**self.hints[0], 'expires_at': (datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()}

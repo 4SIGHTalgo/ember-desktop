@@ -146,7 +146,7 @@ class LifecycleLog:
     def __init__(self, path):
         self.path = Path(path)
 
-    def record(self, event, *, error=None, exit_code=None, attempt=None, stage=None):
+    def record(self, event, *, error=None, exit_code=None, attempt=None, stage=None, activity=None):
         row = {"at": datetime.now(timezone.utc).isoformat(), "event": event[:60]}
         if error is not None:
             row["error_type"] = type(error).__name__[:80]
@@ -156,6 +156,11 @@ class LifecycleLog:
             row["attempt"] = max(0, min(attempt, 1_000_000))
         if stage is not None:
             row["stage"] = stage[:60]
+        if activity is not None:
+            # Only the caller's own short operation label; never DOM or error text.
+            label = str(activity).encode("ascii", "ignore").decode("ascii")[:80].strip()
+            if label:
+                row["activity"] = label
         try:
             if self.path.exists() and self.path.stat().st_size > 256_000:
                 os.replace(self.path, self.path.with_suffix(".previous.jsonl"))
@@ -542,9 +547,9 @@ class OwnedBrowser:
             except OSError:
                 pass
 
-    def recovery(self, error):
+    def recovery(self, error, activity=None):
         self.detach()
-        self.log.record("browser_fault", error=error, stage=startup_stage(error))
+        self.log.record("browser_fault", error=error, stage=startup_stage(error), activity=activity)
         if self.closed or isinstance(error, BrowserClosed):
             state = {"state": "closed"}
         else:

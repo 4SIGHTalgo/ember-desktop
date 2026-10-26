@@ -108,6 +108,21 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.assertEqual(result['status'], 'not_ready')
         self.assertAlmostEqual(self.now, .3)
 
+    def test_a_signal_turn_crosses_matches_on_a_real_budget_but_reveal_stays_short(self):
+        self.core.correct_event = Mock(return_value=False)
+        self.core.open_props.side_effect = self.core.BrowserNavigationPending("rendering")
+        slip = {'status': 'empty', 'stagingSafe': True, 'legs': []}
+        with patch('ember_market_readiness.plan_slip_ready', return_value=False), \
+                patch('ember_market_readiness.read_plan_slip', return_value=slip):
+            for plan, budget in (({'selectionId': SELECTIONS[0]}, 2.0), (None, .3)):
+                with self.subTest(plan='signal' if plan else 'idle'):
+                    self.now = 0
+                    result = self.reader.prepare(self.driver, EVENT, MARKET, lambda: True,
+                                                lambda: 4.3-self.now, plan=plan)
+                    self.assertEqual(result['status'], 'not_ready')
+                    self.assertAlmostEqual(self.now, budget, delta=.05)
+        self.core.reveal_set_winner.assert_not_called()
+
     def test_exact_ready_staged_leg_bypasses_open_and_reveal_entirely(self):
         with patch('ember_market_readiness.plan_slip_ready', return_value=True):
             result = self.reader.prepare(self.driver, EVENT, MARKET, lambda: True, lambda: 5, plan={})

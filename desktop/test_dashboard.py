@@ -172,6 +172,32 @@ class DashboardBrowserTests(unittest.TestCase):
         self.assertEqual(self.value("opportunity-stage"), "Entry closed")
         self.assertIn("1 – 0", self.value("point-score"))
 
+    def test_client_decorated_closed_window_shows_its_estimate_with_an_entry_closed_stage(self):
+        view = self.show(closed=True, qualified=False)
+        # When a later server ships computable estimates for closed windows, the
+        # panel shows them while the entry window stays visibly non-executable.
+        for row in view["candidates"]:
+            row.update(conservative_ev=12.5, gate_ev=15.0)
+        now = datetime.now(timezone.utc)
+        self.emit(kind="scanner", connected=True, healthy=True, server_offset=0, received_at=now.isoformat(),
+                  snapshot={"opportunity": view, "counts": {"events": 3, "dk_live": 1, "mapped": 1, "qualified": 0}})
+        self.assertEqual(self.value("ev-value"), "+15.00%")
+        self.assertEqual(self.value("opportunity-stage"), "Entry closed")
+        self.assertEqual(self.driver.find_element("id", "check-window").get_attribute("data-passed"), "false")
+        self.assertEqual(self.driver.find_element("id", "check-ev").get_attribute("data-passed"), "false")
+
+    def test_board_status_names_live_matches_that_lack_verified_history(self):
+        event = board_event()
+        now = datetime.now(timezone.utc)
+        view = {"protocol": 1, "updated_at": now.isoformat(), "expires_at": (now+timedelta(seconds=10)).isoformat(),
+                "events": [event]}
+        self.emit(kind="scanner", connected=True, healthy=True, server_offset=0, received_at=now.isoformat(),
+                  snapshot={"board": view, "counts": {"dk_live": 2, "mapped": 1}})
+        self.assertIn("DraftKings live 2 · 1 mapped", self.value("board-status"))
+        self.emit(kind="scanner", connected=True, healthy=True, server_offset=0, received_at=now.isoformat(),
+                  snapshot={"board": view, "counts": {"dk_live": 2, "mapped": 2}})
+        self.assertNotIn("mapped", self.value("board-status"))
+
     def test_disconnect_marks_previous_values_as_stale(self):
         view = self.show()
         self.emit(kind="scanner", connected=False, healthy=False, received_at=datetime.now(timezone.utc).isoformat(),

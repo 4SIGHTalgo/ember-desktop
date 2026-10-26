@@ -163,6 +163,7 @@ class Client:
         self.max_bankroll_risk_percent = DEFAULT_RISK_PERCENT
         self.browser_alerted = False
         self.browser_recovering = False
+        self.browser_activity = None
         self.resume_run = False
         self.browser_owner = None
         self.preserve_browser_on_exit = False
@@ -353,6 +354,8 @@ class Client:
             self.stopped()
 
     def pause_browser(self):
+        # Queued signals stay: their own expiry is the fail-closed authority,
+        # and a fast driver re-attach may still execute them in time.
         self.provider_ready.clear()
         self.lease.revoke()
         self.provider_phase = "recovering"
@@ -360,13 +363,6 @@ class Client:
         if self.device_test:
             self.device_test.update(phase="recovering_browser", browser_state="recovering",
                 draftkings_signed_in=False, provider_can_bet=False, native_wagering_grant=False)
-        while True:
-            try:
-                signal = self.signals.get_nowait()
-                self.pending_contracts.discard(signal["contract"])
-                self.history_outcome(signal, "missed", "browser_not_ready")
-            except queue.Empty:
-                break
         scope = self.history_scope()
         if scope:
             self.history_call(self.history.close_pending, scope, "browser_not_ready", now=self.history_time(),
@@ -752,7 +748,7 @@ class Client:
                     if not active():
                         break
                     self.pause_browser()
-                    reason = owner.recovery(error)
+                    reason = owner.recovery(error, activity=self.browser_activity)
                     if reason == "closed":
                         self.browser_closed()
                         break
@@ -796,14 +792,20 @@ class Client:
 
     def maintain_staging(self, driver, core, browser_preparation, market_readiness, mono):
         stages = (self.scanner or {}).get('stages', [])
+        focus = None
+        if browser_preparation is not None:
+            focused = browser_preparation.focus_event_id()
+            if isinstance(focused, str):
+                focus = focused
         result = self.staging.step(driver, core, market_readiness, stages,
             valid=lambda: self.run_permitted() and self.last_feed is True,
-            server_now=time.time()+self.lease.server_offset)
-        self.publish_slip(driver)
+            server_now=time.time()+self.lease.server_offset, focus=focus)
+        self.publish_slip(driver, self.staging.recent_snapshot())
         return result
 
-    def publish_slip(self, driver):
-        snapshot = read_plan_slip(driver)
+    def publish_slip(self, driver, snapshot=None):
+        if snapshot is None:
+            snapshot = read_plan_slip(driver)
         if snapshot.get("status") not in ("empty", "present"):
             return
         stages = (self.scanner or {}).get("stages", [])
@@ -844,6 +846,10 @@ class Client:
             emit("browser", **fields)
             if fields["state"] != "provider_wait" and fields.get("changed", True):
                 emit("status", message=fields["text"])
+            if fields.get("event_id"):
+                self.browser_activity = "prepare:" + str(fields["event_id"])
+            elif fields["state"] in ("league_loading", "event_retry"):
+                self.browser_activity = "league_navigation"
             if self.device_test:
                 self.device_test.update(browser_state=fields["state"])
                 if fields["state"] == "watching_event":
@@ -874,10 +880,15 @@ class Client:
             if self.device_test:
                 self.device_test.update(browser_started=True, retained_browser=owner.retained, phase="awaiting_provider_signin")
             original_execute = self.driver.execute_script
+            # Attribute each driver fault to the operation that preceded it.
+            script_names = {id(getattr(module, name)): name
+                            for module in (core, tt_market_exec) for name in dir(module)
+                            if name.endswith("_SCRIPT")}
 
             def guarded(script, *args):
                 nonlocal submission_may_have_run
                 if script == core.CONFIRM_PLAN_SCRIPT:
+                    self.browser_activity = "confirm_wager_script"
                     if current is None or not self.permits(current):
                         return {"status": "aborted", "reason": "Ember authorization expired"}
                     # A browser-side deadline also covers a delayed CDP command.
@@ -904,6 +915,7 @@ class Client:
                     if self.device_test:
                         self.device_test.update(submitted=bool(response and response.get("status") == "submitted"))
                     return response
+                self.browser_activity = script_names.get(id(script), "inline_script")
                 return original_execute(script, *args)
 
             self.driver.execute_script = guarded
@@ -962,6 +974,7 @@ class Client:
                         table_prepared = True
                         continue
                     try:
+                        self.browser_activity = "league_navigation"
                         with redirect_stdout(QuietOutput()):
                             login_gate.navigation_started()
                             goto_tt_elite(self.driver)
@@ -997,19 +1010,23 @@ class Client:
                 if self.scan_only:
                     browser_preparation.step(self.driver, self.preparation,
                         self.lease.clock() < self.lease.until and self.last_feed is True,
-                        time.time()+self.lease.server_offset)
+                        time.time()+self.lease.server_offset,
+                        stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
                     if self.device_test:
                         self.device_test.update(phase="watching_verified_event_no_wagers" if browser_preparation.key else "league_standby_no_wagers")
                     self.stop.wait(.5)
                     continue
                 try:
-                    signal = self.signals.get(timeout=.05)
+                    # A queued signal wakes this immediately; the timeout only
+                    # paces the idle loop's browser reads.
+                    signal = self.signals.get(timeout=.3)
                 except queue.Empty:
                     with redirect_stdout(QuietOutput()):
-                        self.maintain_staging(self.driver, core, browser_preparation, market_readiness, time.monotonic())
                         browser_preparation.step(self.driver, self.preparation,
                             self.lease.clock() < self.lease.until and self.last_feed is True,
-                            time.time()+self.lease.server_offset, hold=self.hold_preparation())
+                            time.time()+self.lease.server_offset, hold=self.hold_preparation(),
+                            stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
+                        self.maintain_staging(self.driver, core, browser_preparation, market_readiness, time.monotonic())
                     continue
                 current = signal
                 signal.setdefault('_timing', {}).setdefault('dequeued', time.monotonic())

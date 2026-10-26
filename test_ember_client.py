@@ -431,6 +431,16 @@ class ProviderStartupTests(unittest.TestCase):
         self.assertFalse(self.client.defer_readiness(signal, {'status': 'not_ready'}))
         self.assertTrue(self.client.signals.empty())
 
+    def test_pause_browser_keeps_queued_signals_for_a_fast_reconnect(self):
+        self.client.provider_ready.set()
+        signal = plan_signal()
+        self.client.signals.put_latest(signal)
+        self.client.pause_browser()
+        self.assertFalse(self.client.provider_ready.is_set())
+        self.assertEqual(self.client.signals.get_nowait(), signal)
+        # The revoked lease still fails closed; only a fresh authorization may execute.
+        self.assertFalse(self.client.permits(signal))
+
     def test_unexpected_browser_close_alerts_once_and_revokes_execution(self):
         self.client.provider_ready.set()
         with patch("ember_client.emit") as emit:
@@ -618,10 +628,11 @@ class SlipStagingTests(unittest.TestCase):
         for name, value in (("clear_slip", Mock(return_value=True)),
                             ("click_selection", Mock(return_value={"status": "clicked"})),
                             ("ensure_slip_open", Mock(return_value=True)),
-                            ("score_state", Mock(return_value=[1, 0]))):
+                            ("score_state", Mock(return_value=[1, 0])),
+                            ("correct_event", Mock(return_value=True))):
             self.stack.enter_context(patch.object(core, name, value))
         self.driver = Mock()
-        self.browser_preparation = Mock(key=("100", "split"))
+        self.browser_preparation = Mock(key=("100", "split"), focus_event_id=Mock(return_value="100"))
         self.market_readiness = Mock()
         self.market_readiness.open.return_value = {"status": "opened"}
         self.market_readiness.wait.return_value = {"status": "revealed"}
@@ -656,25 +667,29 @@ class SlipStagingTests(unittest.TestCase):
         self.assertIsNone(self.maintain())
         self.core.click_selection.assert_not_called()
         self.core.clear_slip.assert_not_called()
-        self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2'}]
+        self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2', 'text': 'Tomasz Lojtek'}]
         self.assertIsNone(self.maintain())
         self.core.clear_slip.assert_not_called()
         self.assertTrue(self.client.hold_preparation())
 
     def test_a_moved_hint_adds_a_leg_without_clearing_others(self):
         self.client.stage_due = 0.0
-        self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2'}]
+        self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2', 'text': 'Tomasz Lojtek'}]
         self.client.scanner['stages'] = [ClientProtocolTests.stage(event_id='100', selection_id='s1', event=self.event)]
         moved = self.maintain()
         self.assertEqual(moved["selection_id"], "s1")
         self.assertEqual(self.core.click_selection.call_args.args[2]["selectionId"], "s1")
         self.core.clear_slip.assert_not_called()
 
-    def test_full_hint_can_stage_another_event_without_preparation_authority(self):
+    def test_staging_follows_the_navigation_focus_and_never_navigates_itself(self):
         self.client.stage_due = 0.0
         self.browser_preparation.key = ("999", "closeout")
+        self.browser_preparation.focus_event_id = Mock(return_value="999")
+        self.assertIsNone(self.maintain())
+        self.core.click_selection.assert_not_called()
+        self.browser_preparation.focus_event_id = Mock(return_value="100")
         self.assertEqual(self.maintain(), self.hint)
-        self.assertEqual(self.market_readiness.prepare.call_args.args[1], self.event)
+        self.core.click_selection.assert_called_once()
 
     def test_unhealthy_feed_never_stages(self):
         self.client.stage_due = 0.0

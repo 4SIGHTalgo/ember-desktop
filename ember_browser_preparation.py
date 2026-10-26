@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from ember_protocol import timestamp
+from tt_market_semantics import entry_window
 
 
 class BrowserPreparation:
@@ -17,6 +18,65 @@ class BrowserPreparation:
         self.last_status = None
         self.last_publish = float("-inf")
         self.market_readiness = market_readiness
+
+    def focus_event_id(self):
+        """The event whose page the browser is being kept on, if any."""
+        return self.key[0] if self.key else None
+
+    def focus_target(self, hint, stages, legs, server_now):
+        """One monitoring focus from the stage catalog, not just the server hint.
+
+        An open entry window with an unstaged leg outranks everything; after
+        that, matches still missing slip legs are pre-staged nearest-break
+        first, and fully staged matches only need warming.
+        """
+        candidates = {}
+        for stage in stages:
+            event = stage.get("event") if isinstance(stage, dict) else None
+            if not isinstance(event, dict) or timestamp(stage["expires_at"]) <= server_now:
+                continue
+            identifier = str(event.get("eventId"))
+            if identifier and identifier not in candidates:
+                candidates[identifier] = (event, stage.get("bet_type"))
+        if not candidates:
+            if hint and server_now < timestamp(hint["expires_at"]):
+                return hint["event"], hint["market_hint"]["betType"]
+            return None, None
+        present = {(leg.get("eventId"), leg.get("marketId"), leg.get("selectionId"))
+                   for leg in legs or [] if isinstance(leg, dict)}
+        stages = stages if isinstance(stages, list) else []
+
+        def entry_open(event):
+            try:
+                return bool(entry_window(event))
+            except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+                return False
+
+        def missing(identifier):
+            return any(str(stage.get("event_id")) == identifier and
+                       (stage.get("event_id"), stage.get("market_id"), stage.get("selection_id")) not in present
+                       for stage in stages)
+
+        def points(event):
+            current = event.get("currentSet") or {}
+            return max((value for value in (current.get("home"), current.get("away"))
+                        if type(value) is int), default=0)
+
+        hint_id = str((hint or {}).get("event", {}).get("eventId") or "")
+        def rank(identifier):
+            event, _ = candidates[identifier]
+            urgency = 0 if entry_open(event) and missing(identifier) else 1 if missing(identifier) else 2
+            return (urgency, -points(event), identifier != hint_id, identifier)
+        best = min(candidates, key=rank)
+        current = self.key[0] if self.key else None
+        if current in candidates and rank(current)[0] == rank(best)[0]:
+            # Sticky focus; only a clearly closer unstaged match takes over.
+            if not (rank(best)[0] == 1 and rank(best)[1] < rank(current)[1]-1):
+                best = current
+        family = candidates[best][1]
+        if hint and str(hint["event"].get("eventId")) == best:
+            family = hint["market_hint"]["betType"]
+        return candidates[best][0], family
 
     def monitor(self, driver, event, market):
         if self.market_readiness is not None:
@@ -51,7 +111,7 @@ class BrowserPreparation:
         self.open_league(driver)
         self.key = None
 
-    def step(self, driver, hint, feed_ready, server_now, hold=False):
+    def step(self, driver, hint, feed_ready, server_now, hold=False, stages=None, legs=None):
         now = self.clock()
         if not feed_ready:
             self.publish("waiting_feed", "Live source connection is paused; browser preparation is waiting for fresh data.", self.key[0] if self.key else None)
@@ -59,7 +119,12 @@ class BrowserPreparation:
         if self.market_readiness is not None and not self.market_readiness.provider_ready(driver):
             self.publish('provider_loading', self.market_readiness.error_reason)
             return
-        if not hint or server_now >= timestamp(hint["expires_at"]):
+        event = family = None
+        if stages:
+            event, family = self.focus_target(hint, stages, legs, server_now)
+        elif hint and server_now < timestamp(hint["expires_at"]):
+            event, family = hint["event"], hint["market_hint"]["betType"]
+        if event is None:
             if hold:
                 self.no_hint_since = None
                 self.publish("waiting_candidate", "Retaining staged live matches while waiting for fresh signals.", self.key[0] if self.key else None)
@@ -82,29 +147,29 @@ class BrowserPreparation:
                 self.publish("league_loading", "Waiting for the TT Elite league match list to load.")
             return
         self.no_hint_since = None
-        event, market = hint["event"], hint["market_hint"]
-        key = (event["eventId"], market["betType"])
+        key = (str(event["eventId"]), family)
         if key != self.pending_key:
             self.pending_key, self.next_attempt, self.failures = key, 0, 0
         if now < self.next_attempt:
             return
         self.next_attempt = now+2
         try:
-            if self.key == key and self.core.correct_event(driver, event):
-                self.monitor(driver, event, market)
+            if self.key and self.key[0] == key[0] and self.core.correct_event(driver, event):
+                self.key = key
+                self.monitor(driver, event, {"betType": family})
                 return
-            self.publish("preparing_event", f"Preparing {event['player1']} vs {event['player2']} ({market['betType']}).", event["eventId"])
+            self.publish("preparing_event", f"Preparing {event['player1']} vs {event['player2']} ({family}).", event["eventId"])
             # Every event navigation needs the same auth-hydration grace as the
             # initial league navigation, including retries on a loading page.
             self.navigation_started()
-            opened = self.core.open_props(driver, event, market, timeout=.5)
+            opened = self.core.open_props(driver, event, {"betType": family}, timeout=2.5)
         except self.core.FATAL_BROWSER_ERRORS:
             raise
         except (RuntimeError, self.core.WebDriverException):
             opened = False
         if opened:
             self.key, self.failures = key, 0
-            self.monitor(driver, event, market)
+            self.monitor(driver, event, {"betType": family})
             return
         self.failures += 1
         if self.failures >= 5 and not hold:

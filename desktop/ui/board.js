@@ -210,7 +210,13 @@ window.EmberBoard = (() => {
     const signature = JSON.stringify([cards.map(card => card.outerHTML), filter]);
     if (signature !== lastSignature) { $('board-events').replaceChildren(...cards); lastSignature = signature; }
     $('board-count').textContent = groups.size;
-    $('board-status').textContent = `${live} live · ${currentLegs} staged legs · ${legs.size} retained slip observations · ${records.size} tracked positions · ${confidence}% confidence · ${!board ? 'Board unavailable / legacy snapshot' : boardFresh ? 'Source current' : 'Source stale / paused'}`;
+    const mapped = Number.isInteger(context.counts?.mapped) ? context.counts.mapped : null;
+    const providerLive = Number.isInteger(context.counts?.dk_live) ? context.counts.dk_live : null;
+    // Surface the mapping gap: live DraftKings matches without verified
+    // history can never qualify, and the board alone hides that reason.
+    const mappingGap = mapped !== null && providerLive !== null && mapped < providerLive
+      ? ` · DraftKings live ${providerLive} · ${mapped} mapped` : '';
+    $('board-status').textContent = `${live} live · ${currentLegs} staged legs · ${legs.size} retained slip observations · ${records.size} tracked positions · ${confidence}% confidence${mappingGap} · ${!board ? 'Board unavailable / legacy snapshot' : boardFresh ? 'Source current' : 'Source stale / paused'}`;
     $('board-empty').hidden = cards.length > 0;
     $('board-empty').textContent = groups.size ? 'No matches in this filter.' : 'No matches received yet. Legacy scanner details appear below.';
   }

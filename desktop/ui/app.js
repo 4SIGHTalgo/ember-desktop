@@ -31,7 +31,7 @@ function render() {
       `Last history update: ${snapshot.last_history_at || 'not received yet'}`, snapshot.detail || 'Waiting for scanner telemetry.'].join('\n');
   }
   const offset = scannerState?.server_offset || 0;
-  window.EmberBoard.render({connected, healthy, serverOffset: offset, confidence: $('conservative-level').value === 'very_conservative' ? 95 : 90});
+  window.EmberBoard.render({connected, healthy, serverOffset: offset, counts, confidence: $('conservative-level').value === 'very_conservative' ? 95 : 90});
   if (signalView && Date.parse(signalView.expires_at) <= Date.now() + offset * 1000) signalView = null;
   window.EmberOpportunity.render(signalView || snapshot.opportunity, {connected, healthy, heartbeatAge: seconds,
     serverOffset: offset, running, providerReady, browserClosed, browserEvent});
