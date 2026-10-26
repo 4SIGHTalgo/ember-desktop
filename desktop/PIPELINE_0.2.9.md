@@ -26,3 +26,25 @@ No live wagers were used for verification.
 
 Stop monitoring before updating. Review saved settings after restart; press Start
 only when you want to enable monitoring and execution.
+
+## Stable release acceptance
+
+- [Release CI](https://github.com/4SIGHTalgo/ember-desktop/actions/runs/40340886594)
+  and [source CI](https://github.com/4SIGHTalgo/ember-desktop/actions/runs/40340880986)
+  passed Windows x64 and both Mac architectures. One Windows local-fixture
+  navigation failure and one Intel Mac busy-DMG failure passed on a single
+  failed-job rerun with unchanged source and checks; initial failures remain
+  visible in Actions history.
+- All 24 assets match their GitHub digests and checksum sidecars. Updater
+  signatures verify for all platforms. Packaged versions/architectures agree,
+  private strategy modules are absent, and the native slip reader and closed-pick
+  cleanup fragment match the verified source.
+- All three stable updater targets are at 100% rollout. Upgrade checks through
+  0.2.8 return exact signed 0.2.9 artifacts; current 0.2.9 checks return no update.
+  The production installation guide shows 0.2.9.
+- The verified installer upgraded Windows to native version 0.2.9.0 and worker
+  0.2.9. The exact installed worker passed the connected closed-pick fixture:
+  two closed picks removed, four server-sized claims and four synthetic provider
+  acceptances. Existing execution history, profiles, shortcut and settings survived.
+  The regular app was signed in with a current feed and left stopped, with no
+  pending update. No live wager was used for release verification.
