@@ -27,7 +27,7 @@ REASONS = {
     "event_unavailable": "The matching event page did not become ready",
     "market_unavailable": "The matching market did not become ready",
     "entry_closed": "The start-state entry window closed",
-    "odds_below_ev": "The final price no longer met the point-EV gate",
+    "odds_below_ev": "The observed price no longer met the conservative-EV window",
     "balance_unavailable": "Available cash was missing or insufficient",
     "sizing_failed": "The stake could not be sized or armed",
     "selection_failed": "The selection did not reach a ready bet slip",
@@ -83,6 +83,8 @@ def offer(signal):
         matches = [outcome for outcome in (market.get("outcomes") or [])
                    if outcome.get("selectionId") == plan["selectionId"]]
         return key, {"event_id": event["eventId"], "players": [event["player1"], event["player2"]],
+            **({'conservative_ev':finite(plan.get('display',{}).get('conservative_ev')),
+                'conservative_confidence':plan.get('display',{}).get('confidence')} if signal.get('protocol')==3 else {}),
             "market": market.get("name"), "selection": plan["selection"],
             "decimal_odds": finite(matches[0].get("decimal")) if len(matches) == 1 else None,
             "point_ev": None, "minimum_ev": None, "ev_mode": None,
@@ -231,6 +233,7 @@ class OpportunityJournal:
                     report["readiness"] = readiness_details(result["readiness"])
                 comparison = result.get("comparison") or result
                 report["final_point_ev"] = finite(comparison.get("estimatedNetEVPercent"))
+                if signal.get('protocol')==3:report['final_conservative_ev']=finite(result.get('conservativeEV'))
                 report["final_decimal_odds"] = finite(comparison.get("slipDecimal", result.get("acceptedDecimal")))
                 # An explicit non-submission result is stronger evidence than the
                 # conservative pre-dispatch marker used for crash recovery.

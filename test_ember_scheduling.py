@@ -288,7 +288,7 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
                 driver.execute_script("window.mode='silent'")
             elif mode == 'stale':
                 signals[0]['expires_at'] = signals[0]['payload']['plan']['deadline'] = (now-timedelta(seconds=1)).isoformat()
-            elif mode == 'staging':
+            elif mode == 'idle':
                 driver.execute_script('document.querySelectorAll("section").forEach(e=>e.remove());window.renderRows(0)')
                 client.scanner = {'stages': fixture_stages(signals)}
                 for stage in client.scanner['stages']:
@@ -306,7 +306,7 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
                             s['expires_at'] = s['payload']['plan']['deadline'] = deadline
                 client.receive_opportunity(signals[index], client.history_scope())
                 client.signals.put_latest(signals[index])
-            if mode != 'staging':
+            if mode != 'idle':
                 enqueue(first)
             if mode == 'simultaneous':
                 enqueue(second)
@@ -321,13 +321,6 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
                 now = datetime.now(timezone.utc)
                 client.lease.update({'enabled': True, 'client_supported': True, 'server_time': now.isoformat(),
                     'access_until': (now+timedelta(hours=1)).isoformat(), 'lease_seconds': 5})
-                if mode == 'staging':
-                    snapshot = execution.read_plan_slip(driver)
-                    if len(snapshot['legs']) == 4 and not signals[first].get('_timing'):
-                        self.assertTrue(snapshot['stagingSafe'])
-                        self.assertEqual(driver.execute_script('return window.inputEvents'), 0)
-                        self.assertEqual(driver.execute_script('return window.actions'), [])
-                        enqueue(first)
                 return gate.poll.return_value
             gate.poll.side_effect = ready_provider
             output = io.StringIO()
@@ -423,14 +416,17 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
         self.assertEqual([call['id'] for call in calls], [1, 1])
         self.assertEqual(history['counts'].get('uncertain'), 1)
 
-    def test_client_idle_scheduler_stages_pre_window_h2h_legs_before_two_live_signals(self):
-        _, actions, history, _, _ = self.run_schedule('staging')
-        self.assertEqual(len(actions), 2)
-        self.assertEqual(history['counts'], {'placed': 2})
+    def test_idle_h2h_hints_keep_the_slip_empty_without_selection_claim_or_stake(self):
+        _, actions, history, reserved, calls = self.run_schedule('idle')
+        self.assertEqual(actions, [])
+        self.assertEqual(history['counts'], {})
+        self.assertEqual(reserved, [])
+        self.assertEqual(calls, [])
         snapshot = execution.read_plan_slip(self.driver)
-        self.assertEqual({leg['selectionId'] for leg in snapshot['legs']}, {'0ML100b', '0ML101b'})
+        self.assertEqual(snapshot['legs'], [])
         self.assertTrue(snapshot['stagingSafe'])
-        self.assertTrue(all(click['trusted'] for click in self.driver.execute_script('return window.selectionClicks')))
+        self.assertEqual(self.driver.execute_script('return window.selectionClicks'), [])
+        self.assertEqual(self.driver.execute_script('return window.inputEvents'), 0)
 
 
 if __name__ == '__main__':

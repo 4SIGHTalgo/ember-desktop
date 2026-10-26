@@ -62,8 +62,16 @@ checksum files: `wget` the matching sidecar and verify with
 While monitoring, Ember receives execution plans over an authenticated,
 continuously re-verified connection and only ever submits a wager when the
 exact authorized selection, price floor, stake, and deadline all still match.
-Anything ambiguous — a moved price, an expired authorization, an unclear
+Anything ambiguous — an expired authorization, an unclear
 balance — aborts the bet instead of guessing.
+
+In 0.3.0, the slip stays empty until a positive conservative-EV signal qualifies.
+Ember funds one exact single at a time while continuing to scan multiple matches.
+Its probabilities remain the frozen pre-set reference at your selected 90% or
+95% confidence level. Equal or improving EV remains eligible after the set starts;
+any observed decrease permanently expires that window, even if EV stays positive
+or later rebounds. Improved prices require a newly authorized stake. This is
+pre-set-reference conservative EV, not a score-conditioned in-play probability.
 
 ## Updating
 

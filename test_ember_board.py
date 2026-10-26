@@ -19,6 +19,22 @@ def board():
 
 
 class BoardValidationTests(unittest.TestCase):
+    def test_confidence_windows_are_independent_and_stale_evidence_stays_closed(self):
+        original={'board':board()}
+        outcome=original['board']['events'][0]['markets'][0]['outcomes'][0]
+        outcome.update(entry_open=False,reference_windows={
+            '90':{'kind':'pregame_non_decreasing','key':'a'*64,'status':'cancelled'},
+            '95':{'kind':'pregame_non_decreasing','key':'b'*64,'status':'open'}})
+        validate_board(original['board'])
+        for level,opened,key in (('conservative',False,'a'),('very_conservative',True,'b')):
+            selected=display_board(original,level)['board']['events'][0]['markets'][0]['outcomes'][0]
+            self.assertEqual(selected['entry_open'],opened)
+            self.assertEqual(selected['reference_window']['key'],key*64)
+        outcome['lower_probabilities']['95']=None
+        self.assertFalse(display_board(original,'very_conservative')['board']['events'][0]['markets'][0]['outcomes'][0]['entry_open'])
+        outcome['reference_windows']['95']['status']='guessed'
+        with self.assertRaises(ValueError):validate_board(original['board'])
+
     def test_display_uses_the_selected_server_confidence_without_deriving_probability(self):
         original = {"board": board()}
         for level, expected in (("conservative", 30), ("very_conservative", 20)):

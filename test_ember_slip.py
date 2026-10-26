@@ -194,7 +194,7 @@ class MultiLegBrowserTests(unittest.TestCase):
     def js(self, script, *args):
         return self.driver.execute_script(script, *args)
 
-    def run_plan(self, index=0, authorize=None, validate=None, plan_override=None, *, h2h=False, deadline_budget=None):
+    def run_plan(self, index=0, authorize=None, validate=None, plan_override=None, *, h2h=False, deadline_budget=None,observe_price=None):
         event, market, plan, outcome = (h2h_contract if h2h else contract)(index)
         plan.update(plan_override or {})
         with ExitStack() as stack:
@@ -202,7 +202,38 @@ class MultiLegBrowserTests(unittest.TestCase):
                 stack.enter_context(patch.object(execution, name, side_effect=AssertionError('board dependency')))
             return execution.place_plan(self.driver, event, market, plan, outcome,
                 authorize or (lambda quote: {'stake': 2.61, 'min_decimal': 2.0, 'echo': 'fixture'}), validate,
-                deadline_budget=deadline_budget)
+                deadline_budget=deadline_budget,observe_price=observe_price)
+
+    def test_reference_plan_removes_other_unfunded_picks_and_submits_one_exact_single(self):
+        self.js("""window.removedPicks=[];for(const button of document.querySelectorAll('section [data-tracking]')){
+            button.onclick=()=>{window.removedPicks.push(JSON.parse(button.dataset.tracking).selectionId);button.closest('section').remove();};} """)
+        def authorize(quote):
+            self.assertEqual(self.js('return document.querySelectorAll("section").length'),1)
+            self.assertEqual(self.js('return window.removedPicks'),['s2','s3'])
+            self.assert_unstaked()
+            return {'stake':2.61,'min_decimal':2.1}
+        result=self.run_plan(authorize=authorize,plan_override={'window':{},'min_decimal':2.1})
+        self.assertEqual(result['status'],'placed',result)
+        self.assertEqual(self.js('return window.actions[0].map(row=>row.tracking.selectionId)'),['s1'])
+        self.assert_unstaked()
+
+    def test_native_improvement_during_arming_is_observed_before_retry_and_later_decline_stops(self):
+        self.js("""for(const button of document.querySelectorAll('section [data-tracking]'))button.onclick=()=>button.closest('section').remove();
+            const card=document.querySelector('section');card.querySelector('input').addEventListener('input',()=>{
+                if(!window.improved){window.improved=true;card.querySelector('[data-testid=betslip-odds-standard]').textContent='+175';}});""")
+        prices=[]
+        result=self.run_plan(plan_override={'window':{},'min_decimal':2.1},observe_price=lambda price:prices.append(price) or True)
+        self.assertEqual(result['submissionState'],'not-submitted',result)
+        self.assertTrue(result['retryable'],result)
+        self.assertEqual(prices,[2.1,2.75])
+        self.assert_unstaked()
+        self.js("document.querySelector('[data-testid=betslip-odds-standard]').textContent='+160'")
+        authorize=Mock()
+        result=self.run_plan(authorize=authorize,plan_override={'window':{},'min_decimal':2.75})
+        self.assertTrue(result['windowExpired'],result)
+        authorize.assert_not_called()
+        self.assertEqual(self.js('return window.actions'),[])
+        self.assert_unstaked()
 
     def assert_unstaked(self):
         self.assertTrue(self.js("return [...document.querySelectorAll('input')].every(e=>Number(e.value)===0)"))

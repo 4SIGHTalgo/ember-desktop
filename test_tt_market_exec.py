@@ -213,13 +213,13 @@ class SlipFirstOrderTests(unittest.TestCase):
 
     def hot(self, denial=False, failure=None, fatal_at=None, continuation=False,
              quote_failure=None, snapshot=None, cleanup=True, deadline_budget=None, receipt_error=None,
-             closed=False, removal_status='cleared'):
+              closed=False, removal_status='cleared',observe_price=None):
         from contextlib import ExitStack
         from unittest.mock import patch
         self.order, self.configs = [], []
         driver = self.driver = Mock()
         identity = {"eventId": "100", "marketId": "200", "selectionId": "300"}
-        closed_removed = False
+        closed_removed = single_removed = False
 
         def record(name, value):
             def call(*args, **kwargs):
@@ -230,10 +230,13 @@ class SlipFirstOrderTests(unittest.TestCase):
             return call
 
         def dispatch(script, *args):
-            nonlocal closed_removed
+            nonlocal closed_removed,single_removed
             if script is execution.PLAN_SLIP_SNAPSHOT_SCRIPT:
                 return record("snapshot", {"status": "present", "stagingSafe": True,
-                                           "legs": [identity, {**identity, "selectionId": "other",'closed':closed and not closed_removed}]} if snapshot is None else snapshot)()
+                                           "legs": [identity] if single_removed else [identity, {**identity, "selectionId": "other",'closed':closed and not closed_removed}]} if snapshot is None else snapshot)()
+            if script is execution.PLAN_SINGLE_SLIP_SCRIPT:
+                single_removed=removal_status=='cleared'
+                return record('single_remove',{'status':removal_status})()
             if script is execution.PLAN_REMOVE_CLOSED_SCRIPT:
                 closed_removed = removal_status == 'cleared'
                 return record('closed_remove',{'status':removal_status})()
@@ -271,7 +274,30 @@ class SlipFirstOrderTests(unittest.TestCase):
             return execution.place_plan(driver, self.event, self.market, self.plan, self.outcome,
                 authorize_values=record("claim", {"denied": "signal_expired"} if denial else
                                         {"stake": 2.61, "min_decimal": 1.85}),
-                validate=record("validate", True), deadline_budget=deadline_budget)
+                validate=record("validate", True), deadline_budget=deadline_budget,observe_price=observe_price)
+
+    def test_reference_plan_cleans_other_unfunded_picks_before_read_claim_arm_submit(self):
+        self.plan['window']={};self.plan['min_decimal']=2.5
+        self.assertEqual(self.hot()['status'],'placed')
+        self.assertEqual(self.order,['validate','signed_in_state','location_status','recover_load_notice',
+            'ensure_slip_open','snapshot','single_remove','snapshot','quote','claim','arm','validate','confirm','receipt'])
+        for status in ('waiting','blocked',None):
+            with self.subTest(status=status):
+                result=self.hot(removal_status=status)
+                self.assertEqual(result['submissionState'],'not-submitted')
+                self.assertNotIn('claim',self.order)
+                self.assertNotIn('arm',self.order)
+                self.assertNotIn('confirm',self.order)
+
+    def test_observed_decline_stops_before_claim_or_stake(self):
+        self.plan['window']={};self.plan['min_decimal']=2.5
+        observer=Mock(return_value=False)
+        result=self.hot(observe_price=observer)
+        observer.assert_called_once_with(2.5)
+        self.assertTrue(result['windowExpired'])
+        self.assertEqual(result['submissionState'],'not-submitted')
+        self.assertEqual(self.order[-1],'quote')
+        self.assertNotIn('claim',self.order)
 
     def test_exact_staged_leg_has_no_board_dependency_and_one_submit(self):
         self.assertEqual(self.hot()["status"], "placed")

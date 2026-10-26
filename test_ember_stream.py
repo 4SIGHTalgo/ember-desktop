@@ -21,6 +21,7 @@ class StreamRecoveryTests(unittest.TestCase):
             "EMBER_DEVICE_TEST_LOGIN_ONLY": "", "EMBER_DEVICE_TEST_SCAN_ONLY": ""}), patch.dict(sys.modules, {"keyring": Mock()}):
             self.client = Client()
         self.client.api = "https://example.com"
+        self.client.conservative_level='conservative'
         self.client.access_token = "fixture-access"
         self.client.token_until = time.monotonic()+1000
         self.client.ensure_access = Mock()
@@ -29,7 +30,7 @@ class StreamRecoveryTests(unittest.TestCase):
         self.client.stop.wait = Mock(side_effect=lambda _: self.client.stop.is_set())
         now = datetime.now(timezone.utc)
         self.lease = {"type": "lease", "enabled": True, "client_supported": True, "feed_healthy": True,
-            "server_time": now.isoformat(), "access_until": (now+timedelta(hours=1)).isoformat(), "lease_seconds": 5}
+            "server_time": now.isoformat(), "access_until": (now+timedelta(hours=1)).isoformat(), "lease_seconds": 5,'window_ids':[1,2]}
 
     def socket(self, frames, fail_close=False, before_receive=None):
         incoming = iter(frames)
@@ -99,14 +100,15 @@ class StreamRecoveryTests(unittest.TestCase):
 
     def test_stream_keeps_the_latest_quote_for_a_waiting_contract(self):
         from copy import deepcopy
-        from test_ember_client import plan_signal
+        from test_ember_client import window_signal
         self.client.account = '1'
         self.client.lease.running = True
         self.client.provider_ready.set()
-        first = plan_signal()
+        first = window_signal()
         latest = deepcopy(first)
         latest['id'] = 2
         latest['payload']['plan']['min_decimal'] = 3
+        latest['payload']['market']['outcomes'][0]['decimal']=3
         connection = self.socket([self.lease, {'type': 'signal', 'signal': first},
                                   {'type': 'signal', 'signal': latest}])
         observed = []
@@ -122,9 +124,9 @@ class StreamRecoveryTests(unittest.TestCase):
 
     def test_malformed_opportunity_cannot_disconnect_or_hide_the_following_valid_signal(self):
         from copy import deepcopy
-        from test_ember_client import plan_signal
+        from test_ember_client import window_signal
         self.client.account='1';self.client.lease.running=True
-        good=plan_signal();bad=deepcopy(good)
+        good=window_signal();bad=deepcopy(good)
         bad['payload']['plan']['selectionId']=None
         connection=self.socket([self.lease,{'type':'signal','signal':bad},{'type':'signal','signal':good}])
         observed=[]
@@ -138,6 +140,24 @@ class StreamRecoveryTests(unittest.TestCase):
         self.assertEqual([signal['id'] for signal in observed],[good['id']])
         self.assertTrue(any(call.args==('signal_rejected',) for call in emit.call_args_list))
         self.assertNotIn('fixture-access',str(emit.call_args_list))
+
+    def test_stream_cannot_replace_the_selected_confidence_with_the_other_window(self):
+        from test_ember_client import window_signal
+        self.client.account='1';self.client.lease.running=True;self.client.provider_ready.set()
+        for level,confidence in (('conservative',90),('very_conservative',95)):
+            with self.subTest(level=level):
+                self.client.stop.clear();self.client.conservative_level=level
+                signals=[window_signal(confidence=n) for n in (90,95)]
+                signals[1]['id']=2
+                connection=self.socket([self.lease,*[{'type':'signal','signal':signal} for signal in signals]])
+                observed=[];disconnect=self.client.feed_disconnected
+                def capture(*args):
+                    observed.extend(list(self.client.signals.queue));disconnect(*args)
+                with patch('ember_client.websocket.create_connection',return_value=connection), \
+                        patch.object(self.client,'feed_disconnected',side_effect=capture),patch('ember_client.emit'):
+                    self.client.stream()
+                self.assertEqual(len(observed),1)
+                self.assertEqual(observed[0]['payload']['plan']['window']['confidence'],confidence)
 
     def test_sync_failure_retains_local_outbox_and_retry_is_acknowledged(self):
         from test_ember_history import history_signal

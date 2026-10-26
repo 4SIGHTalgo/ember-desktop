@@ -29,7 +29,7 @@ from draftkings_location import (LOCATION_READER_JS, LocationRecheck, location_c
 from wager_sizing import BALANCE_READER_JS
 from wager_submission import SUBMISSION_UI_JS, LOAD_RECOVERY_JS, recover_load_notice, settle_submission
 from execution_timing import ExecutionTiming
-from tt_market_semantics import closeout_state, name_key, score_state
+from tt_market_semantics import closeout_state, name_key, score_state, american_odds
 from execution_policy import MARKET_FAMILIES
 from ember_slip import EXACT_SLIP_READER_JS, plan_slip_config
 
@@ -419,7 +419,8 @@ const point=left<right&&top<bottom?points.find(p=>button.contains(document.eleme
 const geometry={center,blocker:button.contains(centerHit)?null:describe(centerHit),
     pointerEvents:getComputedStyle(button).pointerEvents};
 if (!point) return {status:'blocked',reason:'selection click target is obstructed or outside the viewport',geometry};
-if (cfg.inspectOnly) return {status:'ready',geometry};
+const american=(button.querySelector('[data-testid="button-odds-market-board"]')?.textContent||'').trim();
+if (cfg.inspectOnly) return {status:'ready',geometry,american};
 // Observe delivery, without intercepting or synthesizing the site's events.
 window.__ttSelectionDelivery?.controller.abort();
 const controller=new AbortController();
@@ -432,7 +433,7 @@ for (const type of ['pointerdown','click']) document.addEventListener(type,event
 },{capture:true,signal:controller.signal});
 // Return the validated element for a normal WebDriver click. A JavaScript
 // button.click() only proves that a synthetic event was dispatched.
-return {status:'ready',button,geometry,alternatePoint:point!==center,
+return {status:'ready',button,geometry,american,alternatePoint:point!==center,
     clickPoint:{...point,offsetX:point.x-center.x,offsetY:point.y-center.y}};
 """
 
@@ -632,12 +633,13 @@ return window.__dkKeepAlive || null;
 # arithmetic ever runs here — the server computed the floor and the stake.
 PLAN_SLIP_READER_JS = VISIBLE_UI_JS + BALANCE_READER_JS + EXACT_SLIP_READER_JS
 PLAN_SLIP_SNAPSHOT_SCRIPT = SLIP_LEGS_SCRIPT
-PLAN_REMOVE_CLOSED_SCRIPT = PLAN_SLIP_READER_JS + """
+UNFUNDED_PICK_REMOVAL_JS = """
+const removeUnfundedPicks=keep=>{
 let snapshot=exactSlipSnapshot();
 const safe=()=>['present','empty'].includes(snapshot.status)&&snapshot.stagingSafe===true;
 const blocked=()=>({status:'blocked',reason:snapshot.reason||'slip funding is not zero'});
 if(!safe())return blocked();
-const closed=snapshot.legs.filter(leg=>leg.closed),removed=[];
+const closed=snapshot.legs.filter(leg=>!keep(leg)),removed=[];
 if(closed.length>128)return {status:'blocked',reason:'too many closed picks'};
 for(const identity of closed){
     snapshot=exactSlipSnapshot();
@@ -646,7 +648,7 @@ for(const identity of closed){
     if(!matches.length)continue;
     if(matches.length!==1)return {status:'blocked',reason:'closed pick identity is ambiguous'};
     const leg=matches[0];
-    if(!leg.closed)continue;
+    if(keep(leg))continue;
     const controls=[...leg.root.querySelectorAll(removeSelector)].filter(visibleUI);
     if(controls.length!==1||controls[0].tagName!=='BUTTON'||controls[0].disabled||controls[0].getAttribute('aria-disabled')==='true')
         return {status:'blocked',reason:'closed pick removal is unavailable'};
@@ -654,7 +656,13 @@ for(const identity of closed){
 }
 snapshot=exactSlipSnapshot();
 if(!safe())return blocked();
-return {status:snapshot.legs.some(leg=>leg.closed)?'waiting':'cleared',removed};
+return {status:snapshot.legs.some(leg=>!keep(leg))?'waiting':'cleared',removed};
+};
+"""
+PLAN_REMOVE_CLOSED_SCRIPT = PLAN_SLIP_READER_JS + UNFUNDED_PICK_REMOVAL_JS + 'return removeUnfundedPicks(leg=>!leg.closed);'
+PLAN_SINGLE_SLIP_SCRIPT = PLAN_SLIP_READER_JS + UNFUNDED_PICK_REMOVAL_JS + """
+const cfg=arguments[0];
+return removeUnfundedPicks(leg=>cfg&&['eventId','marketId','selectionId'].every(key=>leg[key]===cfg[key]));
 """
 PLAN_SLIP_READY_SCRIPT = LOCATION_READER_JS + PLAN_SLIP_READER_JS + """
 const leg=readExactPlanLeg(arguments[0]);
@@ -895,10 +903,11 @@ class LocationRequired(BetSlipError):
 class BetNotSubmitted(BetSlipError):
     """The attempt failed before submission; later sets and games can still bet."""
 
-    def __init__(self, message, comparison=None, *, not_ready=False):
+    def __init__(self, message, comparison=None, *, not_ready=False, window_expired=False):
         super().__init__(message)
         self.comparison = comparison
         self.not_ready = not_ready
+        self.window_expired=window_expired
 
 
 def signed_in_state(driver):
@@ -948,7 +957,7 @@ def keep_alive_line(result):
     return "Keep-alive: the previous ping did not reach the sportsbook."
 
 
-def click_selection(driver, event, outcome, market=None, validate=None, timeout=SELECTION_CLICK_TIMEOUT):
+def click_selection(driver, event, outcome, market=None, validate=None, timeout=SELECTION_CLICK_TIMEOUT,*,min_decimal=None,observe_price=None):
     """Click the odds button the reveal already validated, rechecking it first."""
     timestamps = [datetime.fromisoformat(row["receivedAt"]).timestamp()
                   for row in (event, market or {}) if row.get("receivedAt")]
@@ -969,6 +978,12 @@ def click_selection(driver, event, outcome, market=None, validate=None, timeout=
         if status not in ('ready','blocked'):
             return result
         if status=='ready':
+            if min_decimal is not None:
+                quote=american_odds(result.get('american'))
+                if quote is None:return {'status':'aborted','notReady':True,'reason':'selection price is unreadable'}
+                if quote<min_decimal:return {'status':'aborted','windowExpired':True,'reason':'conservative EV decreased'}
+                if observe_price is not None and not observe_price(quote):
+                    return {'status':'aborted','windowExpired':True,'reason':'conservative EV decreased'}
             button = result.get('button')
             if button is None:
                 return {'status':'aborted','reason':'validated selection button disappeared'}
@@ -1084,6 +1099,13 @@ def remove_closed_picks(driver):
     return result if isinstance(result, dict) else {'status': 'blocked', 'reason': 'closed pick removal is unverified'}
 
 
+def prepare_single_slip(driver,target=None):
+    if any(getattr(driver,flag,False) is True for flag in ('_tt_plan_uncertain','_tt_plan_stopped')):
+        return {'status':'blocked','reason':'a previous submission is unresolved'}
+    result=driver.execute_script(PLAN_SINGLE_SLIP_SCRIPT,target)
+    return result if isinstance(result,dict) else {'status':'blocked','reason':'single-slip cleanup is unverified'}
+
+
 def plan_slip_ready(driver, event, market, plan):
     """Whether the exact unstaked leg can execute without any board navigation."""
     if getattr(driver, "_tt_plan_uncertain", False) is True or getattr(driver, "_tt_plan_stopped", False) is True:
@@ -1111,7 +1133,7 @@ def _authorize_values(authorize_values, quote):
     return values
 
 
-def place_plan(driver, event, market, plan, outcome, authorize_values, validate=None, timing=None, *, deadline_budget=None):
+def place_plan(driver, event, market, plan, outcome, authorize_values, validate=None, timing=None, *, deadline_budget=None,observe_price=None):
     """Execute one validated server plan by comparison; no strategy math runs here.
 
     authorize_values receives each observed slip quote (balance + decimal odds)
@@ -1140,7 +1162,7 @@ def place_plan(driver, event, market, plan, outcome, authorize_values, validate=
             transaction["target"]["validUntil"] = min(transaction["target"]["validUntil"],
                                                        (time.time() + deadline_budget) * 1000)
         transaction["expires"] = time.monotonic() + max(0, transaction["target"]["validUntil"] / 1000 - time.time())
-        result = _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace, transaction)
+        result = _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace, transaction,observe_price)
     except FATAL_BROWSER_ERRORS:
         transaction["lost"] = True
         driver._tt_plan_stopped = True
@@ -1157,7 +1179,7 @@ def place_plan(driver, event, market, plan, outcome, authorize_values, validate=
     except BetNotSubmitted as error:
         result = {"status": "skipped", "reason": str(error), "eventId": event["eventId"],
                 "market": market["name"], "label": outcome["label"], "submitted": False,
-                "comparison": error.comparison, "notReady": error.not_ready}
+                 "comparison": error.comparison, "notReady": error.not_ready,'windowExpired':error.window_expired}
     except (BetSlipError, WebDriverException) as error:
         result = {"status": "unconfirmed" if transaction["uncertain"] else "stopped",
                 "reason": f"{type(error).__name__}: {error}",
@@ -1192,12 +1214,18 @@ def _plan_wait_ms(transaction):
     remaining = min(transaction["expires"] - time.monotonic(),
                     transaction["target"]["validUntil"] / 1000 - time.time())
     if remaining <= 0:
-        raise BetNotSubmitted("plan deadline or dispatch budget expired")
+        raise BetNotSubmitted("plan deadline or dispatch budget expired",not_ready=transaction['target'].get('nonDecreasing') is True)
     return min(PLAN_READY_TIMEOUT, SLIP_ARM_TIMEOUT, remaining) * 1000
 
 
-def _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace, transaction):
+def _place_plan_once(driver, event, market, plan, outcome, authorize_values, validate, trace, transaction,observe_price=None):
     target = transaction["target"]
+    def observe(result):
+        price=result.get('decimalOdds')
+        if observe_price is not None and type(price) in (int,float) and math.isfinite(price) and price>1:
+            if not observe_price(price):raise BetNotSubmitted('conservative EV decreased',window_expired=True)
+            target['minDecimal']=max(target['minDecimal'],price)
+        return result
     if time.time() * 1000 >= target["validUntil"]:
         raise BetNotSubmitted("plan deadline expired")
     if validate is not None and not trace.call("planLiveValidation", validate):
@@ -1213,6 +1241,10 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     if not trace.call("planSlipOpen", ensure_slip_open, driver, timeout=_plan_wait_ms(transaction) / 1000):
         raise BetNotSubmitted("the bet-slip accordion did not open", not_ready=True)
     snapshot = trace.call("planSlipLegs", read_plan_slip, driver)
+    if 'window' in plan:
+        cleared=trace.call('planSingleSlip',prepare_single_slip,driver,target)
+        if cleared.get('status')!='cleared':raise BetNotSubmitted('single-slip cleanup is not ready',not_ready=True)
+        snapshot=trace.call('planSlipLegs',read_plan_slip,driver)
     if snapshot.get('stagingSafe') is True and any(leg.get('closed') is True for leg in snapshot.get('legs', [])):
         removed = trace.call('planClosedPicks', remove_closed_picks, driver)
         if removed.get('status') != 'cleared':
@@ -1228,7 +1260,9 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     for attempt in (1,):
         clicked = ({"status": "selected", "reason": "exact staged leg"} if staged else
                    trace.call("planSelectionClick", click_selection, driver, event, outcome, market, validate,
-                              timeout=_plan_wait_ms(transaction) / 1000))
+                               timeout=_plan_wait_ms(transaction) / 1000,
+                               **({'min_decimal':plan['min_decimal']} if 'window' in plan else {}),
+                               **({'observe_price':observe_price} if observe_price is not None else {})))
         if not clicked or clicked.get("status") not in ("clicked", "selected", "not-delivered"):
             raise BetNotSubmitted((clicked or {}).get("reason", "selection click failed"))
         if clicked.get("status") == "not-delivered":
@@ -1237,10 +1271,10 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
             if not staged and not trace.call("planSelectedSlipOpen", ensure_slip_open, driver, allow_empty=False,
                                              timeout=_plan_wait_ms(transaction) / 1000):
                 raise BetNotSubmitted("the selected bet slip did not become visible", not_ready=True)
-            quote = trace.call("planSlipQuote", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
+            quote = observe(trace.call("planSlipQuote", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
                                {**target, "readOnly": True, "timeoutMs": _plan_wait_ms(transaction),
                                 "emptyTimeoutMs": 0 if staged else _plan_wait_ms(transaction),
-                                "fallbackMs": SLIP_ARM_INTERVAL * 1000}) or {}
+                                 "fallbackMs": SLIP_ARM_INTERVAL * 1000}) or {})
             if quote.get("signIn"):
                 raise SignInRequired(f"the visible submit control asks to sign in ({quote.get('placeText')!r})")
             if quote.get("locationBlocked"):
@@ -1248,7 +1282,7 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
             if quote.get("status") == "aborted":
                 raise BetNotSubmitted(quote.get("reason", "the slip quote could not be read"),
                                       {"slipDecimal": quote.get("decimalOdds"), "balance": quote.get("balance")},
-                                      not_ready=quote.get("notReady") is True)
+                                      not_ready=quote.get("notReady") is True,window_expired=quote.get('windowExpired') is True)
             if quote.get("status") != "armed":
                 raise BetNotSubmitted(quote.get("reason", "the slip quote did not become ready"), not_ready=True)
             if (not isinstance(quote.get("targetFingerprint"), str) or not quote["targetFingerprint"]
@@ -1263,9 +1297,9 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
             transaction['authorized'] = values
             target.update(expectedFingerprint=quote.get("targetFingerprint"), expectedDecimal=quote.get("decimalOdds"))
             transaction["touched"] = True
-            armed = trace.call("planSlipArming", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
+            armed = observe(trace.call("planSlipArming", driver.execute_async_script, WAIT_FOR_PLAN_ARM_SCRIPT,
                                {**target, "stake": values["stake"], "timeoutMs": _plan_wait_ms(transaction),
-                                "fallbackMs": SLIP_ARM_INTERVAL * 1000}) or {}
+                                 "fallbackMs": SLIP_ARM_INTERVAL * 1000}) or {})
         if armed.get("signIn"):
             raise SignInRequired(f"the visible submit control asks to sign in ({armed.get('placeText')!r})")
         if armed.get("locationBlocked"):
@@ -1278,8 +1312,8 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
         if armed.get("status") == "armed" and not armed.get("placeDisabled"):
             break
         raise BetNotSubmitted(armed.get("reason") or "bet slip did not arm",
-                              not_ready=armed.get("status") == "waiting" or armed.get("notReady") is True
-                              or armed.get("placeDisabled") is True)
+                               not_ready=armed.get("status") == "waiting" or armed.get("notReady") is True
+                               or armed.get("placeDisabled") is True,window_expired=armed.get('windowExpired') is True)
     if armed is None or values is None:
         raise BetNotSubmitted("the plan did not arm")
     label = armed.get("placeText") or ""
@@ -1311,6 +1345,7 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
                                  "selectionLine": (plan.get("specification") or {}).get("line")}) or {}
         transaction["uncertain"] = confirmed.get("status") not in ("aborted", "resize")
         driver._tt_plan_uncertain = transaction["uncertain"]
+        if not transaction['uncertain']:observe(confirmed)
         if confirmed.get("status") != "resize":
             break
         if resize_attempt == 2:
@@ -1342,7 +1377,7 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
                                    "minDecimal": confirmed.get("minDecimal"), "odds": confirmed.get("odds")})
         if confirmed.get("uiRejected") or confirmed.get("planRejected") or confirmed.get("quoteRejected"):
             raise BetNotSubmitted(confirmed.get("reason", "the final slip is not usable"),
-                                  not_ready=confirmed.get("notReady") is True)
+                                  not_ready=confirmed.get("notReady") is True,window_expired=confirmed.get('windowExpired') is True)
         raise BetSlipError(confirmed.get("reason", "place-bet click failed"))
     trace.note_submission(confirmed)
     state = {"stake": values["stake"], "minDecimal": values["min_decimal"], "echo": values.get("echo")}
@@ -1390,6 +1425,7 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
         transaction.update(uncertain=False, touched=False)
     location_blocked = receipt.get("locationBlocked")
     return {"status": "placed" if placed else "unconfirmed", "stake": state["stake"],
+            'conservativeEV':values.get('conservative_ev'),
             "sizingMode": "server_plan", "selectionId": outcome["selectionId"],
             "label": outcome["label"], "market": market["name"], "eventId": event["eventId"],
             "nextSet": plan["nextSet"], "betType": plan["betType"], "scoreState": plan["scoreState"],

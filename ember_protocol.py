@@ -8,13 +8,15 @@ import time
 from ember_opportunity import validate_opportunity
 from ember_board import validate_board
 from ember_identity import provider_id
+from execution_window import KIND as WINDOW_KIND, identity as window_identity, points as window_points
 from conservative_policy import contract_id
 from execution_policy import allows_bet, allows_payload, ALLOWED_FAMILIES, DISTRIBUTION_FAMILIES, DISTRIBUTION_MARKETS
 from tt_market_semantics import entry_window, name_key, score_state, next_set_number
 
-VERSION = "0.2.9"
+VERSION = "0.3.0"
 PROTOCOL = 1
 PROTOCOL_V2 = 2
+PROTOCOL_V3 = 3
 
 # The pre-open hint names the exact selection the scanner anticipates on the
 # prepared surface. It carries identity only: no settings, no strategy context
@@ -142,7 +144,7 @@ def validate_plan(plan):
     strategy data — sample counts, history availability, probabilities —
     makes it invalid: the client must execute the plan, never re-derive it.
     """
-    if not isinstance(plan, dict) or set(plan) != PLAN_FIELDS:
+    if not isinstance(plan, dict) or set(plan) not in (PLAN_FIELDS,PLAN_FIELDS|{'window'}):
         raise ValueError("Invalid execution plan")
     if plan["betType"] not in ALLOWED_FAMILIES:
         raise ValueError("Disabled market family")
@@ -173,6 +175,13 @@ def validate_plan(plan):
     if type(stake) is not int or not 1 <= stake <= 10_000_000:
         raise ValueError("Invalid authorized stake")
     timestamp(plan["deadline"])
+    if 'window' in plan:
+        window=plan['window']
+        if (not isinstance(window,dict) or set(window)!={'kind','key','started_at','confidence'} or window['kind']!=WINDOW_KIND
+                or type(window['confidence']) is not int or window['confidence'] not in (90,95)
+                or not isinstance(window['key'],str) or not re.fullmatch(r'[0-9a-f]{64}',window['key'])
+                or timestamp(window['started_at'])>=timestamp(plan['deadline'])):
+            raise ValueError('Invalid reference execution window')
     display = plan["display"]
     if not isinstance(display, dict) or len(display) > 8:
         raise ValueError("Invalid plan display")
@@ -185,17 +194,19 @@ def validate_plan(plan):
 
 
 def validate_signal(signal):
-    if (not isinstance(signal, dict) or signal.get("protocol") not in (PROTOCOL, PROTOCOL_V2)
+    if (not isinstance(signal, dict) or signal.get("protocol") not in (PROTOCOL, PROTOCOL_V2, PROTOCOL_V3)
             or type(signal.get("id")) is not int):
         raise ValueError("Unsupported signal envelope")
     if not isinstance(signal.get("contract"), str) or len(signal["contract"]) > 200:
         raise ValueError("Invalid contract")
     timestamp(signal["expires_at"])
-    if signal["protocol"] == PROTOCOL_V2:
+    if signal["protocol"] in (PROTOCOL_V2,PROTOCOL_V3):
         payload = signal["payload"]
         if set(payload) != {"event", "market", "plan"}:
             raise ValueError("Only the server plan and its market surface are accepted")
         plan = validate_plan(payload["plan"])
+        if ('window' in plan)!=(signal['protocol']==PROTOCOL_V3):
+            raise ValueError('Execution window protocol mismatch')
         if timestamp(plan["deadline"]) > timestamp(signal["expires_at"]):
             raise ValueError("Plan deadline outlives the signal")
         event, market = payload["event"], payload["market"]
@@ -212,8 +223,12 @@ def validate_signal(signal):
                    if outcome.get("selectionId") == plan["selectionId"]]
         if len(matches) != 1 or name_key(matches[0].get("label", "")) != name_key(plan["selection"]):
             raise ValueError("Plan selection does not match a unique market outcome")
+        if signal['protocol']==PROTOCOL_V3 and (type(matches[0].get('decimal')) not in (int,float)
+                or not math.isfinite(matches[0]['decimal']) or matches[0]['decimal']<=1):
+            raise ValueError('Reference quote is below its execution window')
         if (not allows_bet(plan, market, matches[0]) or signal["contract"] != contract_id(event, plan)
-                or plan["scoreState"] != score_state(event) or not entry_window(event)):
+                or plan["scoreState"] != score_state(event)
+                or (window_points(event,plan['nextSet'],plan['scoreState']) is None if signal['protocol']==PROTOCOL_V3 else not entry_window(event))):
             raise ValueError("Signal does not match its contract or entry window")
         spec=plan['specification']
         if (plan['nextSet'] != next_set_number(event)
@@ -221,6 +236,8 @@ def validate_signal(signal):
                 or plan['betType'] not in DISTRIBUTION_FAMILIES and spec.get('target') != plan['nextSet']
                 or plan['betType']=='closeout' and plan['scoreState'][spec['player']] != 2):
             raise ValueError('Plan target or participant disagrees with the observed contract')
+        if signal['protocol']==PROTOCOL_V3 and window_identity(event,market,plan)!=plan['window']['key']:
+            raise ValueError('Execution window identity changed')
         return signal
     # Protocol 1 strategy payloads are private-engine data; this client executes
     # server plans only, so they fail closed at the schema edge.

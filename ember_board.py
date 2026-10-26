@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import math
+import re
 from ember_identity import provider_id
 
 
@@ -89,6 +90,15 @@ def validate_board(value):
                     if not isinstance(values, dict) or any(k not in {"90", "95"} or not numeric(n) for k, n in values.items()):
                         raise ValueError("Invalid confidence EVs")
                 stamp(outcome.get("quote_at"))
+                references=outcome.get('reference_windows',{})
+                if not isinstance(references,dict) or not references.keys()<={'90','95'}:
+                    raise ValueError('Invalid reference window confidence')
+                for reference in [outcome.get('reference_window'),*references.values()]:
+                    if reference is not None and (not isinstance(reference,dict) or set(reference)!={'kind','key','status'}
+                            or reference['kind']!='pregame_non_decreasing' or not isinstance(reference['key'],str)
+                            or not re.fullmatch(r'[0-9a-f]{64}',reference['key'])
+                            or reference['status'] not in {'open','awaiting','paused','cancelled'}):
+                        raise ValueError('Invalid reference window display')
     return value
 
 
@@ -102,4 +112,8 @@ def display_board(scanner, level):
             for outcome in market["outcomes"]:
                 outcome["conservative_ev"] = (outcome.get("lower_probabilities") or {}).get(confidence)
                 outcome["entry_ev"] = (outcome.get("entry_evs") or {}).get(confidence)
+                if 'reference_windows' in outcome:
+                    outcome['reference_window']=outcome['reference_windows'].get(confidence)
+                    outcome['entry_open']=bool(outcome['reference_window'] and outcome['reference_window']['status']=='open'
+                        and outcome['conservative_ev'] is not None and outcome['conservative_ev']>1e-9)
     return result

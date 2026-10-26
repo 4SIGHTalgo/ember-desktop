@@ -585,6 +585,19 @@ class DashboardBrowserTests(unittest.TestCase):
         self.assertNotIn("999", self.card("101").text)
         self.assert_no_start()
 
+    def test_reference_window_status_tracks_selected_confidence_after_points_start(self):
+        from selenium.webdriver.support.ui import Select
+        event=board_event();outcome=event['markets'][0]['outcomes'][0]
+        outcome.update(lower_probabilities={'90':10,'95':5},reference_windows={
+            '90':{'kind':'pregame_non_decreasing','key':'a'*64,'status':'cancelled'},
+            '95':{'kind':'pregame_non_decreasing','key':'b'*64,'status':'open'}})
+        level=Select(self.driver.find_element('id','conservative-level'))
+        level.select_by_value('very_conservative');self.board([event])
+        self.assertIn('Entry open · frozen pre-set conservative reference',self.card('101').text)
+        level.select_by_value('conservative')
+        self.assertIn('Expired · conservative EV decreased or contract ended',self.card('101').text)
+        self.assert_no_start()
+
     def test_real_v2_journal_positions_and_physical_slip_absence_are_distinct(self):
         from ember_client import Client
         from ember_history import OpportunityJournal

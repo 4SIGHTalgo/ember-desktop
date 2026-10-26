@@ -130,6 +130,21 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.core.open_props.assert_not_called()
         self.core.reveal_set_winner.assert_not_called()
 
+    def test_slow_verified_signal_navigation_cannot_rotate_forever_without_a_market_read(self):
+        self.core.correct_event=Mock(return_value=False)
+        def opening(*args,**kwargs):
+            self.advance(.4)
+            return True
+        self.core.open_props.side_effect=opening
+        self.core.reveal_set_winner.return_value={'status':'revealed'}
+        with patch('ember_market_readiness.plan_slip_ready',return_value=False), \
+                patch('ember_market_readiness.read_plan_slip',return_value={'status':'empty','stagingSafe':True,'legs':[]}):
+            result=self.reader.prepare(self.driver,EVENT,MARKET,lambda:True,lambda:5-self.now,plan={'selectionId':SELECTIONS[0]})
+        self.assertEqual(result['status'],'revealed')
+        self.assertEqual(result['attempts'],1)
+        self.core.reveal_set_winner.assert_called_once()
+        self.assertAlmostEqual(self.now,.4)
+
     def test_verified_event_does_not_reopen_the_page_on_every_readiness_turn(self):
         self.core.correct_event = Mock(return_value=True)
         self.core.reveal_set_winner.return_value = {'status': 'revealed'}

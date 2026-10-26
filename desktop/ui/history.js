@@ -22,7 +22,8 @@ window.EmberHistory = (() => {
       const snapshot = row.snapshot || {}, card = node('article', 'missed-record', '');
       const header = node('div', 'missed-record-header', '');
       header.append(node('strong', '', (snapshot.players || []).join(' vs ')), node('span', 'pill', row.outcome === 'uncertain' ? 'Unconfirmed · check My Bets' : row.outcome.replaceAll('_', ' ')));
-      const details = node('p', 'missed-offer', `${snapshot.market || 'Market'} · ${snapshot.selection || 'Selection'} · Point EV ${edge(snapshot.point_ev)} · Odds ${money(snapshot.decimal_odds)}`);
+      const metric = 'conservative_ev' in snapshot ? `Conservative EV (${snapshot.conservative_confidence || '—'}%) ${edge(snapshot.conservative_ev)}` : `Point EV ${edge(snapshot.point_ev)}`;
+      const details = node('p', 'missed-offer', `${snapshot.market || 'Market'} · ${snapshot.selection || 'Selection'} · ${metric} · Odds ${money(snapshot.decimal_odds)}`);
       const reason = node('p', 'missed-reason', row.reason_label || row.reason.replaceAll('_', ' '));
       const when = new Date(row.observed_at).toLocaleString();
       const sync = ['pending', 'processing', 'submitting'].includes(row.outcome) ? 'Awaiting outcome' : row.synced ? 'Synced to server' : 'Queued for server sync';

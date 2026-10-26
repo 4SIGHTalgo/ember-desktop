@@ -33,7 +33,7 @@ from ember_history import OpportunityJournal, reservations, result_reason
 from ember_staging import Staging
 from ember_board import display_board
 from ember_identity import signal_identity
-from tt_market_exec import read_plan_slip, PLAN_CLEAR_STAKE_SCRIPT
+from tt_market_exec import read_plan_slip, PLAN_CLEAR_STAKE_SCRIPT, prepare_single_slip
 from draftkings_location import LocationRecheck
 from conservative_policy import (DEFAULT_LEVEL, DEFAULT_KELLY, DEFAULT_RISK_PERCENT,
                                   client_settings, validate_risk)
@@ -76,6 +76,8 @@ class Ledger:
         self.connection = sqlite3.connect(path)
         self.connection.execute("CREATE TABLE IF NOT EXISTS attempts (account TEXT, contract TEXT, status TEXT, PRIMARY KEY(account, contract))")
         self.connection.execute("CREATE TABLE IF NOT EXISTS economic_attempts (account TEXT, event TEXT, contract TEXT, context TEXT, PRIMARY KEY(account,contract))")
+        self.connection.execute('CREATE TABLE IF NOT EXISTS expired_windows (account TEXT, window TEXT, PRIMARY KEY(account,window))')
+        self.connection.execute('CREATE TABLE IF NOT EXISTS window_prices (account TEXT, window TEXT, peak REAL NOT NULL, PRIMARY KEY(account,window))')
         self.connection.commit()
 
     def reserve(self, account, contract):
@@ -94,6 +96,24 @@ class Ledger:
         return self.connection.execute("SELECT 1 FROM attempts WHERE account=? AND status IN ('submitting','submission_uncertain') LIMIT 1",
                                        (account,)).fetchone() is not None
 
+    def expire_window(self,account,key):
+        self.connection.execute('INSERT OR IGNORE INTO expired_windows VALUES (?,?)',(account,key))
+        self.connection.commit()
+
+    def cancelled_windows(self,account):
+        return {row[0] for row in self.connection.execute('SELECT window FROM expired_windows WHERE account=?',(account,))}
+
+    def window_peak(self,account,key):
+        row=self.connection.execute('SELECT peak FROM window_prices WHERE account=? AND window=?',(account,key)).fetchone()
+        return row[0] if row else 0
+
+    def observe_window(self,account,key,price):
+        with self.connection:
+            self.connection.execute('BEGIN IMMEDIATE')
+            if price<self.window_peak(account,key):return False
+            self.connection.execute('INSERT OR REPLACE INTO window_prices VALUES (?,?,?)',(account,key,price))
+        return True
+
     def reserve_signal(self, account, signal):
         from tt_market_semantics import completed_scores, payoff_key
         payload = signal['payload']
@@ -103,12 +123,20 @@ class Ledger:
         key = payoff_key(context, prefix)
         with self.connection:
             self.connection.execute('BEGIN IMMEDIATE')
-            for (saved,) in self.connection.execute('SELECT context FROM economic_attempts WHERE account=? AND event=?',
-                                                   (account, event['eventId'])):
+            existing=self.connection.execute('SELECT status FROM attempts WHERE account=? AND contract=?',(account,signal['contract'])).fetchone()
+            retry=signal.get('protocol')==3 and existing is not None and existing[0]=='not_submitted'
+            for saved_contract,saved,status in self.connection.execute('SELECT e.contract,e.context,a.status FROM economic_attempts e JOIN attempts a ON a.account=e.account AND a.contract=e.contract WHERE e.account=? AND e.event=?',
+                                                    (account, event['eventId'])):
+                if signal.get('protocol')==3 and status=='not_submitted':continue
                 if key is not None and payoff_key(json.loads(saved), prefix) == key:
                     return False
-            if self.connection.execute('SELECT 1 FROM attempts WHERE account=? AND contract=?', (account, signal['contract'])).fetchone():
+            if existing and not retry:
                 return False
+            if retry:
+                self.connection.execute('UPDATE attempts SET status=? WHERE account=? AND contract=?',('reserved_or_unconfirmed',account,signal['contract']))
+                self.connection.execute('UPDATE economic_attempts SET context=? WHERE account=? AND contract=?',
+                                        (json.dumps(context,allow_nan=False),account,signal['contract']))
+                return True
             self.connection.execute('INSERT INTO attempts VALUES (?,?,?)', (account, signal['contract'], 'reserved_or_unconfirmed'))
             self.connection.execute('INSERT INTO economic_attempts VALUES (?,?,?,?)',
                 (account, event['eventId'], signal['contract'], json.dumps(context, allow_nan=False)))
@@ -151,6 +179,10 @@ class Client:
         self.pending_contracts = set()
         self.preparation = None
         self.staging = Staging()
+        self.window_cache={}
+        self.active_windows=None
+        self.expired_windows=set()
+        self.current_signal=None
         self.stop = threading.Event()
         self.run_cancel = threading.Event()
         self.run_generation = 0
@@ -197,6 +229,9 @@ class Client:
 
     def permits(self, signal):
         return (not self.readiness_only and not self.run_cancel.is_set() and not self.stop.is_set()
+                and (signal.get('protocol')!=3 or signal['id'] in (self.active_windows or set())
+                     and signal['payload']['plan']['window']['key'] not in self.expired_windows
+                     and signal['payload']['plan']['window']['confidence']==client_settings(self.conservative_level)['confidence'])
                 and self.provider_ready.is_set() and self.lease.permits(signal)
                 and (not self.device_test or self.device_test.permits(signal)))
 
@@ -225,7 +260,8 @@ class Client:
             self.history_wake.set()
 
     def receive_opportunity(self, signal, scope):
-        signal.setdefault('_timing', {})['received'] = time.monotonic()
+        if signal.get('protocol')==3:signal.setdefault('_timing',{}).setdefault('received',time.monotonic())
+        else:signal.setdefault('_timing', {})['received'] = time.monotonic()
         signal["_history_scope"] = scope
         signal["_history_handled"] = False
         if not scope:
@@ -236,7 +272,7 @@ class Client:
         self.history_call(self.history.observe, scope, signal, reason, self.history_time(), reserved=signal["contract"] in attempted)
         if self.readiness_only:
             self.history_outcome(signal, "observed_only", "read_only")
-        elif signal["contract"] in attempted:
+        elif signal["contract"] in attempted and not (signal.get('protocol')==3 and attempted[signal['contract']]=='not_submitted'):
             signal["_history_handled"] = True
             state = ("uncertain" if attempted[signal["contract"]] in {"reserved_or_unconfirmed", "unconfirmed", "stopped", "submitting", "submission_uncertain"}
                      else "handled" if attempted[signal["contract"]] == "placed" else "missed")
@@ -484,6 +520,7 @@ class Client:
 
     def feed_disconnected(self, reason, scope=None):
         self.lease.revoke()
+        self.active_windows=set()
         self.preparation = None
         self.last_feed = None
         self.stream_connected = False
@@ -503,6 +540,11 @@ class Client:
 
     def accept_lease(self, message):
         self.lease.update(message)
+        if 'window_ids' in message:
+            ids=message['window_ids']
+            if not isinstance(ids,list) or len(ids)>1000 or any(type(n) is not int or n<1 for n in ids):
+                self.lease.revoke();raise ValueError('Invalid active execution windows')
+            self.active_windows=set(ids)
         self.preparation = validate_preparation(message["preparation"]) if message.get("preparation") else None
         try:
             self.scanner = validate_scanner(message.get("scanner"))
@@ -570,6 +612,20 @@ class Client:
                         except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
                             emit("signal_rejected", code="invalid_signal")
                             continue
+                        if signal.get('protocol')!=3:
+                            emit('signal_rejected',code='unsupported_execution_policy');continue
+                        if signal['payload']['plan']['window']['confidence']!=client_settings(self.conservative_level)['confidence']:
+                            continue
+                        if signal.get('protocol')==3:
+                            key=(stream_scope,signal['id'])
+                            previous=self.window_cache.get(key)
+                            if previous is not None:
+                                try:self.renew_signal(previous,{'signal':signal})
+                                except (ValueError,TypeError,KeyError):
+                                    self.lease.revoke();continue
+                                signal=previous
+                            else:self.window_cache[key]=signal
+                            if self.lease.running and self.current_signal is signal:continue
                         self.receive_opportunity(signal, stream_scope)
                         if self.scan_only and signal["id"] not in self.observed_signals:
                             self.observed_signals.add(signal["id"])
@@ -616,6 +672,8 @@ class Client:
             signal['payload'][key] = deepcopy(renewed['payload'][key])
         if 'plan' in signal['payload']:
             signal['payload']['plan']['deadline'] = renewed['payload']['plan']['deadline']
+            if signal.get('protocol')==3:
+                signal['payload']['plan']['min_decimal']=max(signal['payload']['plan']['min_decimal'],renewed['payload']['plan']['min_decimal'])
 
     def authorization_timeout(self, signal, renewal=False):
         """Yield preclaim turns quickly; a reserved quote gets a longer reply budget."""
@@ -633,11 +691,15 @@ class Client:
                 else "session_stopped" if not self.lease.running else "browser_not_ready" if not self.provider_ready.is_set() else "lease_expired")
             return False
         try:
-            status = self.request(f"/api/v1/signals/{signal['id']}/authorize/", {"claim": claim}, authenticated=True,
+            status = self.request(f"/api/v1/signals/{signal['id']}/authorize/", {"claim": claim,
+                                  'sizing':{'conservative_level':self.conservative_level}}, authenticated=True,
                                   timeout=self.authorization_timeout(signal, renewal=True))
             self.lease.update(status)
             self.renew_signal(signal, status)
+            if signal.get('protocol')==3 and 'signal' in status:
+                signal['payload']['plan']['display']=deepcopy(status['signal']['payload']['plan']['display'])
             permitted = self.permits(signal)
+            if permitted:signal['_qualified']=True
             if not permitted:
                 self.last_authorize_reason = ("signal_expired" if timestamp(signal['expires_at']) <= time.time()+self.lease.server_offset
                     else "session_stopped" if not self.lease.running else "browser_not_ready" if not self.provider_ready.is_set() else "lease_expired")
@@ -648,6 +710,10 @@ class Client:
                 return False
             if str(error) == "contract_claimed_by_another_client":
                 self.last_authorize_reason = "claimed_elsewhere"
+                return False
+            elif str(error) in ('price_below_floor','window_expired'):
+                self.last_authorize_reason='odds_below_ev'
+                if signal.get('protocol')==3 and signal.get('_qualified'):self.expire_signal(signal)
                 return False
             elif str(error) == "signal_expired":
                 self.last_authorize_reason = "signal_expired"
@@ -664,6 +730,8 @@ class Client:
             if (type(available) not in (int, float) or not math.isfinite(available) or available < 0
                     or type(decimal) not in (int, float) or not math.isfinite(decimal) or decimal <= 1):
                 return {"denied": "sizing_failed"}
+            if signal.get('protocol')==3 and ledger is not None and not self.observe_window_price(signal,decimal,ledger):
+                return {'denied':'odds_below_ev'}
             self.last_authorize_reason = "authorization_denied"
             if (not self.permits(signal) or timestamp(signal['payload']['plan']['deadline']) <=
                     time.time()+self.lease.server_offset):
@@ -687,8 +755,9 @@ class Client:
                     self.last_authorize_reason = "claimed_elsewhere"
                 elif str(error) == "signal_expired":
                     self.last_authorize_reason = "signal_expired"
-                elif str(error) == "price_below_floor":
+                elif str(error) in ('price_below_floor','window_expired'):
                     self.last_authorize_reason = "odds_below_ev"
+                    if signal.get('protocol')==3:self.expire_signal(signal,ledger)
                 elif str(error) == "sizing_failed":
                     self.last_authorize_reason = "sizing_failed"
                 else:
@@ -705,6 +774,10 @@ class Client:
                     else "session_stopped" if not self.lease.running else "browser_not_ready" if not self.provider_ready.is_set() else "lease_expired")
                 return {"denied": self.last_authorize_reason}
             fields = status.get("plan")
+            conservative_ev=status.get('conservative_ev')
+            if signal.get('protocol')==3 and type(conservative_ev) in (int,float) and math.isfinite(conservative_ev):
+                signal['payload']['plan']['display']['conservative_ev']=conservative_ev
+                signal['payload']['plan']['display']['confidence']=90 if self.conservative_level=='conservative' else 95
             if (not isinstance(fields, dict) or set(fields) != {"stake_cents", "min_decimal", "echo"}
                     or type(fields.get("stake_cents")) is not int or not 1 <= fields["stake_cents"] <= 10_000_000
                     or type(fields.get("min_decimal")) not in (int, float) or not math.isfinite(fields["min_decimal"])
@@ -714,9 +787,40 @@ class Client:
             # The claim is the sole authority; the signal plan's floor and stake
             # were provisional display data at the 90% publication bound.
             return {"stake": fields["stake_cents"]/100, "min_decimal": fields["min_decimal"],
-                    "echo": fields["echo"]}
+                     "echo": fields["echo"],**({'conservative_ev':conservative_ev} if signal.get('protocol')==3 else {})}
 
         return authorize_values
+
+    def expire_signal(self,signal,ledger=None):
+        window=signal['payload']['plan'].get('window')
+        if not window:return
+        own=ledger is None
+        ledger=ledger or Ledger(self.data_dir/'execution.sqlite3')
+        try:ledger.expire_window(self.account,window['key'])
+        finally:
+            if own:ledger.connection.close()
+        self.expired_windows.add(window['key'])
+        try:self.request(f"/api/v1/signals/{signal['id']}/authorize/",{'cancel_window':True,'window_key':window['key']},authenticated=True,timeout=.3)
+        except (RuntimeError,requests.RequestException):pass
+
+    def release_unsubmitted(self,signal,result,ledger):
+        if result.get('windowExpired'):self.expire_signal(signal,ledger)
+        if not result.get('cleanupFailed') and prepare_single_slip(self.driver).get('status')=='cleared':
+            ledger.finish(self.account,signal['contract'],'not_submitted')
+            signal.pop('_reserved',None)
+            return
+        result.update(status='stopped',cleanupFailed=True,retryable=False,
+                      reason='The single slip could not be verified empty after non-submission')
+        self.lease.running=False
+        self.lease.revoke()
+
+    def observe_window_price(self,signal,price,ledger):
+        plan=signal['payload']['plan'];key=plan['window']['key']
+        if price<plan['min_decimal'] or not ledger.observe_window(self.account,key,price):
+            self.expire_signal(signal,ledger)
+            return False
+        plan['min_decimal']=max(plan['min_decimal'],price)
+        return True
 
     def defer_readiness(self, signal, readiness):
         """Yield only before claim/reservation/submission, within the original expiry."""
@@ -799,20 +903,13 @@ class Client:
                 power.release()
                 self.stopped()
 
-    def maintain_staging(self, driver, core, browser_preparation, market_readiness, mono):
-        stages = (self.scanner or {}).get('stages', [])
-        focus = None
-        if browser_preparation is not None:
-            focused = browser_preparation.focus_event_id()
-            if isinstance(focused, str):
-                focus = focused
-        if focus is None:
-            return None
-        result = self.staging.step(driver, core, market_readiness, stages,
-            valid=lambda: self.run_permitted() and self.last_feed is True,
-            server_now=time.time()+self.lease.server_offset, focus=focus)
-        self.publish_slip(driver, self.staging.recent_snapshot())
-        return result
+    def maintain_empty_slip(self,driver):
+        snapshot=read_plan_slip(driver)
+        if self.run_permitted() and snapshot.get('stagingSafe') is True and snapshot.get('legs'):
+            prepare_single_slip(driver)
+            snapshot=read_plan_slip(driver)
+        self.staging.inventory=snapshot.get('legs',[])
+        self.publish_slip(driver,snapshot)
 
     def publish_slip(self, driver, snapshot=None):
         if snapshot is None:
@@ -848,6 +945,7 @@ class Client:
         tt_market_exec.ROOT = self.data_dir
         tt_market_exec.SLIP_CAPTURE = self.data_dir / "last-slip.json"
         ledger = Ledger(self.data_dir / "execution.sqlite3")
+        self.expired_windows=ledger.cancelled_windows(self.account)
         if ledger.unresolved_submission(self.account) is True:
             self.lease.running = False
             emit('execution',status='unconfirmed',message='A previous submission is unresolved. Reconcile DraftKings history before resuming; no wager was replayed.')
@@ -907,6 +1005,9 @@ class Client:
                     self.browser_activity = "confirm_wager_script"
                     if current is None or not self.permits(current):
                         return {"status": "aborted", "reason": "Ember authorization expired"}
+                    if current.get('protocol')==3 and args:
+                        config=dict(args[0]);config['minDecimal']=max(config['minDecimal'],current['payload']['plan']['min_decimal'])
+                        args=(config,*args[1:])
                     # A browser-side deadline also covers a delayed CDP command.
                     deadlines = [self.lease.until-time.monotonic(),
                                  timestamp(current["expires_at"])-time.time()-self.lease.server_offset]
@@ -938,6 +1039,7 @@ class Client:
 
             self.driver.execute_script = guarded
             while active():
+                self.current_signal=None
                 self.driver._ember_server_offset = self.lease.server_offset
                 current = None
                 submission_may_have_run = False
@@ -1036,6 +1138,10 @@ class Client:
                     if cleared.get('cleared') is not True or snapshot.get('stagingSafe') is not True:
                         self.lease.running = False
                         break
+                    if recovery['signal'].get('protocol')==3:
+                        result={'submissionState':'not-submitted'}
+                        self.release_unsubmitted(recovery['signal'],result,ledger)
+                        if result.get('cleanupFailed'):break
                     self.pre_submit_recovery = None
                     if self.authorize(recovery['signal']):
                         recovery['signal']['_preflight_authorized'] = True
@@ -1067,9 +1173,13 @@ class Client:
                             self.lease.clock() < self.lease.until and self.last_feed is True,
                             time.time()+self.lease.server_offset, hold=self.hold_preparation(),
                             stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
-                        self.maintain_staging(self.driver, core, browser_preparation, market_readiness, time.monotonic())
+                        self.maintain_empty_slip(self.driver)
                     continue
                 current = signal
+                self.current_signal=signal
+                if signal.get('protocol')==3:
+                    plan=signal['payload']['plan']
+                    plan['min_decimal']=max(plan['min_decimal'],ledger.window_peak(self.account,plan['window']['key']))
                 signal.setdefault('_timing', {}).setdefault('dequeued', time.monotonic())
                 self.pending_contracts.discard(signal["contract"])
                 submission_may_have_run = False
@@ -1096,9 +1206,21 @@ class Client:
                             self.history_outcome(signal, "missed", "signal_expired")
                             continue
                         turn_until = time.monotonic()+.3
+                        if signal.get('protocol')==3:
+                            core.ensure_slip_open(self.driver,timeout=.2)
+                            target={'eventId':event['eventId'],'marketId':market['marketId'],'selectionId':plan['selectionId']}
+                            cleanup=prepare_single_slip(self.driver,target)
+                            if cleanup.get('status')!='cleared':
+                                readiness={'status':'not_ready','reason':cleanup.get('reason') or 'single-slip cleanup is not ready'}
+                                if self.defer_readiness(signal,readiness):continue
+                                self.history_outcome(signal,'missed','selection_failed',result={'readiness':readiness});continue
                         readiness = market_readiness.prepare(self.driver, event, market,
-                            valid=lambda: self.permits(signal), remaining=remaining, plan=plan)
+                            valid=lambda: self.permits(signal), remaining=remaining, plan=plan,
+                            **({'observe_price':lambda price:self.observe_window_price(signal,price,ledger)} if signal.get('protocol')==3 else {}))
                         if readiness.get("status") != "revealed":
+                            if readiness.get('windowExpired'):
+                                self.expire_signal(signal,ledger)
+                                self.history_outcome(signal,'missed','odds_below_ev');continue
                             if self.defer_readiness(signal, readiness):
                                 continue
                             reason = "market_unavailable" if self.permits(signal) else "signal_expired"
@@ -1119,21 +1241,28 @@ class Client:
                             continue
                         if not readiness.get('staged'):
                             selected = self.staging.add(self.driver, core, event, market, outcome,
-                                lambda: self.permits(signal), max(.001, turn_until-time.monotonic()))
+                                lambda: self.permits(signal), max(.001, turn_until-time.monotonic()),
+                                **({'min_decimal':plan['min_decimal'],'observe_price':lambda price:self.observe_window_price(signal,price,ledger)} if signal.get('protocol')==3 else {}))
                             if selected.get('status') not in ('clicked', 'selected'):
+                                if selected.get('windowExpired'):
+                                    self.expire_signal(signal,ledger);self.history_outcome(signal,'missed','odds_below_ev');continue
                                 if self.defer_readiness(signal, selected):
                                     continue
                                 self.history_outcome(signal, 'missed', 'market_unavailable')
                                 continue
                         result = core.place_plan(self.driver, event, market, plan, outcome,
                                                  authorize_values=self.claim_values(signal, ledger),
-                                                 validate=lambda: self.permits(signal),
-                                                 deadline_budget=max(0, remaining()))
+                                                  validate=lambda: self.authorize(signal) if signal.get('protocol')==3 else self.permits(signal),
+                                                 deadline_budget=max(0, remaining()),
+                                                 **({'observe_price':lambda price:self.observe_window_price(signal,price,ledger)} if signal.get('protocol')==3 else {}))
+                    if signal.get('protocol')==3 and (result or {}).get('submissionState')=='not-submitted':
+                        self.release_unsubmitted(signal,result,ledger)
                     state = (result or {}).get("status", "not_submitted")
                     if ((result or {}).get('retryable') is True and (result or {}).get('submissionState') == 'not-submitted'
                             and not submission_may_have_run and self.defer_readiness(signal, result)):
                         continue
-                    ledger.finish(self.account, signal["contract"], 'submission_uncertain' if state=='unconfirmed' else state)
+                    ledger.finish(self.account, signal["contract"], 'submission_uncertain' if state=='unconfirmed' else
+                                  'not_submitted' if signal.get('protocol')==3 and (result or {}).get('submissionState')=='not-submitted' and not (result or {}).get('cleanupFailed') else state)
                     signal.setdefault('_timing', {})['finished'] = time.monotonic()
                     if (result or {}).get("denied"):
                         # The denial reason is authoritative; the result payload
@@ -1209,6 +1338,10 @@ class Client:
                 self.account, self.stake = status["account_id"], 0
                 self.max_bankroll_risk_percent = max_bankroll_risk_percent
                 self.conservative_level, self.kelly_multiplier = conservative_level, kelly_multiplier
+                with self.signals.mutex:
+                    for pending in list(self.signals.queue)+list(self.window_cache.values()):
+                        pending.pop('_preflight_authorized',None);pending.pop('_qualified',None)
+                self.window_cache.clear()
                 self.provider_ready.clear()
                 self.browser_alerted = False
                 self.browser_recovering = False

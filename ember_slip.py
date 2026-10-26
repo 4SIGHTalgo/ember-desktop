@@ -31,7 +31,8 @@ def plan_slip_config(event, market, plan, outcome=None, *, server_offset=0):
     line = (plan.get("specification") or {}).get("line")
     if line is not None and (type(line) not in (int, float) or not math.isfinite(line)):
         raise ValueError("plan line is invalid")
-    return {"eventId": event["eventId"], "marketId": market["marketId"],
+    return {"nonDecreasing":'window' in plan,'minDecimal':plan.get('min_decimal'),
+            "eventId": event["eventId"], "marketId": market["marketId"],
             "selectionId": outcome["selectionId"], "selectionLabel": outcome["label"],
             "marketName": market["name"], "selectionLine": line,
             "validUntil": (deadline.timestamp()-server_offset) * 1000}
@@ -153,7 +154,8 @@ const exactSlipSnapshot=()=>{
     if(leafSlipPrices(slip).some(price=>!legs.some(leg=>leg.price===price)))
         return bad('untracked or ambiguous priced leg');
     if(inputs.some(input=>!legs.some(leg=>leg.input===input)&&!zeroStake(input)))return bad('non-target or parlay stake is not zero');
-    if(!removes.length&&!slip.querySelector('[data-testid="betslip-empty-state-title"]'))return bad('unsupported slip without tracked legs');
+    if(!removes.length&&!slip.querySelector('[data-testid="betslip-empty-state-title"]')&&
+        ![...slip.querySelectorAll('[data-testid="dk-betslip-receipt"]')].some(visibleUI))return bad('unsupported slip without tracked legs');
     return {status:removes.length?'present':'empty',slip,legs,inputs,stagingSafe:inputs.every(zeroStake)};
 };
 const readExactPlanLeg=(cfg,cleanup=false)=>{
@@ -179,7 +181,10 @@ const readExactPlanLeg=(cfg,cleanup=false)=>{
         if(!numbers.length||numbers.some(n=>Math.abs(n-cfg.selectionLine)>=1e-9))return bad('target leg line changed or ambiguous');
     }
     if(leg.decimalOdds===null)return bad('target leg price is unreadable');
-    if(cfg.expectedFingerprint&&leg.fingerprint!==cfg.expectedFingerprint)return bad('target leg identity, line or odds changed after claim');
+    if(cfg.nonDecreasing&&leg.decimalOdds<Math.max(cfg.minDecimal||0,cfg.expectedDecimal||0))
+        return {...bad('conservative EV decreased'),windowExpired:true,decimalOdds:leg.decimalOdds};
+    if(cfg.nonDecreasing)cfg.minDecimal=Math.max(cfg.minDecimal||0,leg.decimalOdds);
+    if(cfg.expectedFingerprint&&leg.fingerprint!==cfg.expectedFingerprint)return {...bad('target leg identity, line or odds changed after claim'),notReady:!!cfg.nonDecreasing,decimalOdds:leg.decimalOdds};
     if(Number.isFinite(cfg.expectedDecimal)&&Math.abs(leg.decimalOdds-cfg.expectedDecimal)>1e-9)return bad('target leg odds changed after claim');
     const buttons=[...slip.querySelectorAll('button[data-testid="betslip-place-bet-button"]')].filter(visibleUI);
     if(buttons.length!==1)return bad('place-bet button is hidden or ambiguous');

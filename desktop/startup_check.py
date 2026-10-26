@@ -91,9 +91,14 @@ def owned_leftovers(profile, nonce):
     if not nonce:
         return []
     found = []
-    for process in psutil.process_iter(["pid", "name", "cmdline"]):
-        arguments = process.info.get("cmdline") or []
-        if not chrome_process(process.info.get("name") or "") or argument(arguments, "--type"):
+    for process in psutil.process_iter(["pid", "name"]):
+        if not chrome_process(process.info.get("name") or ""):
+            continue
+        try:
+            arguments=process.cmdline()
+        except (psutil.NoSuchProcess,psutil.AccessDenied):
+            continue
+        if argument(arguments, "--type"):
             continue
         current = argument(arguments, "--user-data-dir")
         if (current and profile_key(current) == profile_key(profile)
@@ -104,22 +109,29 @@ def owned_leftovers(profile, nonce):
 
 def owned_process_snapshot(profile, nonce):
     """Capture children while their exact profile/nonce-verified parent still exists."""
-    pending = owned_leftovers(profile, nonce)
+    pending = [(process,False) for process in owned_leftovers(profile, nonce)]
     found = {}
     while pending:
-        process = pending.pop()
+        process,descendant = pending.pop()
         try:
             identity = (process.pid, process.create_time())
             if identity in found or not process.is_running():
                 continue
-            arguments = process.cmdline()
+            if not chrome_process(process.name()):
+                continue
+            try:
+                arguments = process.cmdline()
+            except psutil.AccessDenied:
+                if not descendant:raise
+                # A verified parent's child remains owned when its sandbox hides arguments.
+                arguments=[]
             current = argument(arguments, "--user-data-dir")
             marker = argument(arguments, "--ember-owned-browser")
-            if (not chrome_process(process.name()) or current and profile_key(current) != profile_key(profile)
+            if (current and profile_key(current) != profile_key(profile)
                     or marker and marker != nonce):
                 continue
             found[identity] = process
-            pending.extend(process.children())
+            pending.extend((child,True) for child in process.children())
         except psutil.NoSuchProcess:
             pass
     return found

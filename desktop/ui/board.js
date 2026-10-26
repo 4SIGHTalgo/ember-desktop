@@ -183,7 +183,12 @@ window.EmberBoard = (() => {
         const currentEV = levelEV(outcome, 'lower_probabilities', 'conservative_ev'), entryEV = levelEV(outcome, 'entry_evs', 'entry_ev');
         ev.append(node('strong', 'current-ev', `Conservative EV ${current ? edge(currentEV) : '—'}`));
         if (finite(entryEV)) ev.append(node('span', 'small entry-ev', `Entry EV ${edge(entryEV)} · historical`));
-        ev.append(node('span', 'small', !current ? 'Stale / unavailable quote or score' : outcome.entry_open === true ? 'Entry open' : 'Entry closed · midgame estimate when available'));
+        const reference = outcome.reference_windows ? outcome.reference_windows[confidence] : outcome.reference_window;
+        const referenceOpen = reference?.status === 'open' && finite(currentEV) && currentEV > 1e-9;
+        ev.append(node('span', 'small', !current ? 'Stale / unavailable quote or score' : reference ?
+          reference.status === 'cancelled' ? 'Expired · conservative EV decreased or contract ended' :
+          referenceOpen ? 'Entry open · frozen pre-set conservative reference' : 'Waiting · positive non-decreasing conservative EV required' :
+          !outcome.reference_windows && outcome.entry_open === true ? 'Entry open' : 'Entry closed · midgame estimate when available'));
         row.append(label, node('span', 'offer-price', `${price(outcome.decimal_odds)}${current ? '' : ' · last'}`), ev); offers.append(row);
       }
       if (!offers.childElementCount) offers.append(node('p', 'small no-offers', 'No current market / conservative EV available.'));

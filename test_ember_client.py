@@ -27,6 +27,94 @@ def plan_signal(**plan_overrides):
                         "plan": {**plan, **plan_overrides}}}
 from ember_protocol import RunLease, validate_preparation, validate_scanner, validate_signal, validate_stage
 
+def window_signal(confidence=90,**overrides):
+    from execution_window import KIND,identity
+    signal=plan_signal(**{'min_decimal':2.0,**overrides})
+    signal['protocol']=3
+    payload=signal['payload'];plan=payload['plan']
+    plan['window']={'kind':KIND,'key':identity(payload['event'],payload['market'],plan,confidence),'confidence':confidence,
+                    'started_at':(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()}
+    return signal
+
+
+class ReferenceWindowTests(unittest.TestCase):
+    def setUp(self):
+        ProtocolV2Tests.setUp(self)
+        self.client.conservative_level='conservative'
+        self.client.provider_ready.set();self.client.active_windows={1}
+
+    def test_settings_change_cannot_execute_a_queued_window_for_another_confidence(self):
+        signal=window_signal()
+        self.client.conservative_level='very_conservative'
+        self.assertFalse(self.client.permits(signal))
+        self.assertTrue(self.client.permits(window_signal(confidence=95)))
+
+    def test_first_point_keeps_the_same_valid_reference_window(self):
+        signal=window_signal();signal['payload']['event']['sets'][-1].update(home=1,away=0)
+        signal['payload']['event']['currentSet']={'set':2,'home':1,'away':0}
+        self.assertIs(validate_signal(signal),signal)
+        self.assertTrue(self.client.permits(signal))
+        self.client.active_windows=set()
+        self.assertFalse(self.client.permits(signal))
+
+    def test_price_and_point_renewals_preserve_plan_reference_and_never_lower_floor(self):
+        from copy import deepcopy
+        signal=window_signal();renewed=deepcopy(signal);plan=signal['payload']['plan']
+        renewed['payload']['plan']['min_decimal']=2.2
+        renewed['payload']['market']['outcomes'][0]['decimal']=2.2
+        renewed['payload']['event']['sets'][-1].update(home=1,away=0)
+        renewed['payload']['event']['currentSet']={'set':2,'home':1,'away':0}
+        self.client.renew_signal(signal,{'signal':renewed})
+        self.assertIs(signal['payload']['plan'],plan)
+        self.assertEqual(plan['min_decimal'],2.2)
+        renewed['payload']['plan']['min_decimal']=2.1
+        self.client.renew_signal(signal,{'signal':renewed})
+        self.assertEqual(plan['min_decimal'],2.2)
+
+    def test_only_verified_unsubmitted_reservations_can_be_reused(self):
+        signal=window_signal();ledger=Ledger(self.client.data_dir/'execution.sqlite3')
+        self.addCleanup(ledger.connection.close)
+        self.assertTrue(ledger.reserve_signal(self.client.account,signal))
+        self.assertFalse(ledger.reserve_signal(self.client.account,signal))
+        ledger.finish(self.client.account,signal['contract'],'not_submitted')
+        self.assertTrue(ledger.reserve_signal(self.client.account,signal))
+        ledger.finish(self.client.account,signal['contract'],'placed')
+        self.assertFalse(ledger.reserve_signal(self.client.account,signal))
+        self.assertEqual(ledger.connection.execute('SELECT count(*) FROM attempts').fetchone()[0],1)
+
+    def test_native_improvement_is_remembered_across_restart_before_any_claim(self):
+        signal=window_signal();self.client.request=Mock(return_value={'cancelled':True})
+        path=self.client.data_dir/'execution.sqlite3';ledger=Ledger(path)
+        self.assertTrue(self.client.observe_window_price(signal,2.75,ledger))
+        ledger.connection.close()
+        ledger=Ledger(path);self.addCleanup(ledger.connection.close)
+        self.assertFalse(self.client.observe_window_price(window_signal(),2.6,ledger))
+        self.assertIn(signal['payload']['plan']['window']['key'],ledger.cancelled_windows(self.client.account))
+        self.assertEqual(ledger.connection.execute('SELECT count(*) FROM attempts').fetchone()[0],0)
+        self.assertFalse(self.client.permits(signal))
+
+    def test_cancelled_window_is_durable_and_no_claim_is_created(self):
+        signal=window_signal();self.client.request=Mock(return_value={'cancelled':True})
+        self.client.expire_signal(signal)
+        self.assertFalse(self.client.permits(signal))
+        ledger=Ledger(self.client.data_dir/'execution.sqlite3');self.addCleanup(ledger.connection.close)
+        self.assertIn(signal['payload']['plan']['window']['key'],ledger.cancelled_windows(self.client.account))
+        self.assertEqual(ledger.connection.execute('SELECT count(*) FROM attempts').fetchone()[0],0)
+        self.assertTrue(self.client.request.call_args.args[1]['cancel_window'])
+
+    def test_failed_cleanup_never_releases_the_reservation_or_resumes_execution(self):
+        signal=window_signal();signal['_reserved']=True
+        ledger=Ledger(self.client.data_dir/'execution.sqlite3');self.addCleanup(ledger.connection.close)
+        self.assertTrue(ledger.reserve_signal(self.client.account,signal))
+        result={'status':'skipped','submissionState':'not-submitted','retryable':True}
+        with patch('ember_client.prepare_single_slip',return_value={'status':'blocked'}):
+            self.client.release_unsubmitted(signal,result,ledger)
+        self.assertFalse(self.client.lease.running)
+        self.assertFalse(result['retryable'])
+        self.assertTrue(result['cleanupFailed'])
+        self.assertFalse(ledger.reserve_signal(self.client.account,signal))
+        self.assertTrue(signal['_reserved'])
+
 
 class ClientProtocolTests(unittest.TestCase):
     def test_waiting_quote_is_replaced_without_losing_other_contracts_fifo_turns(self):
@@ -635,7 +723,11 @@ class SlipStagingTests(unittest.TestCase):
         self.client.lease.running = True
         self.client.provider_ready.set()
         self.inventory = {"status": "present", "stagingSafe": True, "legs": []}
-        self.stack.enter_context(patch('ember_staging.read_plan_slip', return_value=self.inventory))
+        self.stack.enter_context(patch('ember_client.read_plan_slip', return_value=self.inventory))
+        def clear(*args):
+            self.inventory['legs']=[]
+            return {'status':'cleared'}
+        self.remove=self.stack.enter_context(patch('ember_client.prepare_single_slip',side_effect=clear))
         self.client.preparation = {"protocol": 1, "event": self.event, "market_hint": {"betType": "split"},
                                    "expires_at": (now+timedelta(seconds=15)).isoformat()}
         import tt_market_exec as core
@@ -656,24 +748,15 @@ class SlipStagingTests(unittest.TestCase):
         self.client.scanner = {"healthy": True, "counts": {}, "stages": [self.hint]}
 
     def maintain(self, mono=1.0):
-        return self.client.maintain_staging(self.driver, self.core, self.browser_preparation,
-                                            self.market_readiness, mono)
+        return self.client.maintain_empty_slip(self.driver)
 
-    def test_hinted_selection_is_pre_opened_without_a_stake_or_submit(self):
-        self.client.stage_due = 0.0
-        staged = self.maintain()
-        self.assertEqual(staged, self.hint)
-        self.core.click_selection.assert_called_once()
-        driver, event, outcome, market = self.core.click_selection.call_args.args[:4]
-        self.assertEqual(event["eventId"], "100")
-        self.assertEqual((outcome["selectionId"], outcome["label"], outcome["points"]),
-                         ("s2", "Tomasz Lojtek", None))
-        self.assertEqual((market["name"], market["marketId"]), ("Game 2", "200"))
-        # Staging clicks the odds button only; no stake write, no submit, no bettor.
-        self.assertLessEqual(self.core.click_selection.call_args.kwargs["timeout"], .3)
+    def test_hints_never_pre_open_a_selection(self):
+        self.maintain()
+        self.core.click_selection.assert_not_called()
+        self.remove.assert_not_called()
         self.assertIsNone(self.client.bettor)
 
-    def test_stale_hint_never_stages_or_clears_existing_legs(self):
+    def test_stale_hint_never_adds_a_pick_but_unfunded_leftovers_are_removed(self):
         self.client.stage_due = 0.0
         self.client.scanner = {"healthy": True, "counts": {},
                                "stages": [ClientProtocolTests.stage(event_id="100", event=self.event,
@@ -685,26 +768,28 @@ class SlipStagingTests(unittest.TestCase):
         self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2', 'text': 'Tomasz Lojtek'}]
         self.assertIsNone(self.maintain())
         self.core.clear_slip.assert_not_called()
-        self.assertTrue(self.client.hold_preparation())
+        self.remove.assert_called_once()
+        self.assertEqual(self.client.staging.inventory,[])
 
-    def test_a_moved_hint_adds_a_leg_without_clearing_others(self):
+    def test_funded_or_unknown_inventory_is_never_removed(self):
         self.client.stage_due = 0.0
         self.inventory['legs'] = [{'eventId': '100', 'marketId': '200', 'selectionId': 's2', 'text': 'Tomasz Lojtek'}]
         self.client.scanner['stages'] = [ClientProtocolTests.stage(event_id='100', selection_id='s1', event=self.event)]
-        moved = self.maintain()
-        self.assertEqual(moved["selection_id"], "s1")
-        self.assertEqual(self.core.click_selection.call_args.args[2]["selectionId"], "s1")
+        self.inventory['stagingSafe']=False
+        self.maintain()
+        self.remove.assert_not_called()
+        self.core.click_selection.assert_not_called()
         self.core.clear_slip.assert_not_called()
 
-    def test_staging_follows_the_navigation_focus_and_never_navigates_itself(self):
+    def test_navigation_focus_cannot_cause_pre_staging(self):
         self.client.stage_due = 0.0
         self.browser_preparation.key = ("999", "closeout")
         self.browser_preparation.focus_event_id = Mock(return_value="999")
         self.assertIsNone(self.maintain())
         self.core.click_selection.assert_not_called()
         self.browser_preparation.focus_event_id = Mock(return_value="100")
-        self.assertEqual(self.maintain(), self.hint)
-        self.core.click_selection.assert_called_once()
+        self.maintain()
+        self.core.click_selection.assert_not_called()
 
     def test_unhealthy_feed_never_stages(self):
         self.client.stage_due = 0.0

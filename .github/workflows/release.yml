@@ -56,7 +56,7 @@ jobs:
           workspaces: desktop/src-tauri
           cache-on-failure: true
       - run: python -m pip install -r desktop/requirements-worker.txt
-      - run: python -m unittest test_ember_identity test_draftkings_session -v
+      - run: python -m unittest test_execution_window test_ember_identity test_draftkings_session -v
       - run: python -m unittest test_driver_lifecycle -v
         if: runner.os == 'Windows'
       - name: Client test battery

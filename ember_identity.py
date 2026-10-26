@@ -28,6 +28,12 @@ def observation_identity(value):
 
 
 def signal_identity(signal):
+    if signal.get('protocol')==3:
+        payload=signal['payload'];event,market,plan=(payload[key] for key in ('event','market','plan'))
+        return [signal['protocol'],signal['id'],signal['contract'],
+                [event.get(key) for key in ('eventId','player1','player2','startTimestamp')],
+                [market.get(key) for key in ('eventId','marketId','name')],
+                {key:plan[key] for key in ('betType','selection','selectionId','scoreState','nextSet','specification','window')}]
     value = observation_identity({key: signal[key] for key in ("protocol", "id", "contract", "payload")})
     if "plan" in value["payload"]:
         value["payload"]["plan"].pop("deadline", None)

@@ -47,6 +47,7 @@ class OwnedCleanupTests(unittest.TestCase):
         for value in rejected:
             value.terminate.assert_not_called()
             value.kill.assert_not_called()
+        for value in rejected[-2:]:value.cmdline.assert_not_called()
 
     def test_snapshot_includes_owned_descendants_without_profile_arguments(self):
         root = process(1)
@@ -82,6 +83,26 @@ class OwnedCleanupTests(unittest.TestCase):
         child.terminate.assert_not_called()
         unrelated.terminate.assert_not_called()
         unrelated.kill.assert_not_called()
+
+    def test_unreadable_child_arguments_retain_verified_parent_and_generation_ownership(self):
+        root=process(1);child=process(2,profile=None,nonce=None,child=True)
+        root.children.return_value=[child]
+        child.cmdline.side_effect=psutil.AccessDenied(2)
+        with patch.object(check.psutil,'process_iter',return_value=[root]):
+            self.assertEqual(set(check.owned_process_snapshot(PROFILE,NONCE)),{(1,1.0),(2,2.0)})
+            child.wait.assert_not_called()
+            child.create_time.side_effect=psutil.AccessDenied(2)
+            with self.assertRaises(psutil.AccessDenied):check.owned_process_snapshot(PROFILE,NONCE)
+        child.terminate.assert_not_called()
+        child.kill.assert_not_called()
+
+    def test_unreadable_root_arguments_never_inherit_child_ownership(self):
+        root=process(1);root.cmdline.side_effect=psutil.AccessDenied(1)
+        with patch.object(check,'owned_leftovers',return_value=[root]):
+            with self.assertRaises(psutil.AccessDenied):check.owned_process_snapshot(PROFILE,NONCE)
+        root.children.assert_not_called()
+        root.terminate.assert_not_called()
+        root.kill.assert_not_called()
 
     def test_bounded_escalation_only_signals_snapshotted_owned_processes(self):
         child = process(2, profile=None, nonce=None, child=True)

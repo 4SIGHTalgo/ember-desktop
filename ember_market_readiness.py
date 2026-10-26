@@ -61,11 +61,17 @@ class MarketReadiness:
         self.error_reason = 'provider load error; preparation paused'
         return True
 
-    def prepare(self, driver, event, market, valid, remaining, plan=None, max_wait=.3, staging=False):
+    def prepare(self, driver, event, market, valid, remaining, plan=None, max_wait=.3, staging=False,observe_price=None):
         """One shared FIFO turn; an exact ready slip leg needs no board at all."""
         deadline = self.clock()+max_wait
         if not self.provider_ready(driver):
             return {'status': 'not_ready', 'reason': self.error_reason, 'attempts': 0, 'wait_ms': 0}
+        if observe_price is not None and plan is not None:
+            for leg in read_plan_slip(driver).get('legs',[]):
+                if (all(leg.get(key)==value for key,value in {'eventId':event['eventId'],'marketId':market['marketId'],
+                        'selectionId':plan['selectionId']}.items()) and type(leg.get('decimalOdds')) in (int,float)
+                        and not observe_price(leg['decimalOdds'])):
+                    return {'status':'not_ready','reason':'conservative EV decreased','windowExpired':True,'attempts':0,'wait_ms':0}
         if plan is not None and valid() and plan_slip_ready(driver, event, market, plan):
             return {"status": "revealed", "staged": True, "attempts": 0, "wait_ms": 0}
         if plan is not None:
@@ -82,6 +88,10 @@ class MarketReadiness:
                 return {'status':'not_ready','reason':snapshot.get('reason') or 'slip funding is not zero',
                         'attempts':0,'wait_ms':0}
             legs = snapshot.get('legs', [])
+            if plan.get('window') and any(leg.get('eventId')==event['eventId'] and leg.get('marketId')==market['marketId']
+                    and leg.get('selectionId')==plan['selectionId'] and type(leg.get('decimalOdds')) in (int,float)
+                    and leg['decimalOdds']<plan['min_decimal'] for leg in legs):
+                return {'status':'not_ready','reason':'conservative EV decreased','windowExpired':True,'attempts':0,'wait_ms':0}
             if isinstance(legs, list) and any(leg.get('eventId') == event['eventId'] and
                     leg.get('marketId') == market['marketId'] and leg.get('selectionId') == plan['selectionId']
                     and leg.get('suspended') is True for leg in legs):
@@ -95,6 +105,9 @@ class MarketReadiness:
             opening = self.open(driver, event, market, valid, remaining, max_wait=nav_wait)
             if opening.get("status") != "opened":
                 return opening
+            if plan is not None:
+                # Navigation has its own budget; a verified new event still needs a bounded reveal turn.
+                deadline=self.clock()+max_wait
         if plan is not None:
             market = {**market, 'outcomes': [row for row in market.get('outcomes', [])
                                            if row.get('selectionId') == plan['selectionId']]}

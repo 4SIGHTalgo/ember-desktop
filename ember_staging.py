@@ -23,14 +23,16 @@ class Staging:
             return self.read_snapshot
         return None
 
-    def add(self, driver, core, event, market, outcome, valid, timeout):
+    def add(self, driver, core, event, market, outcome, valid, timeout,*,min_decimal=None,observe_price=None):
         snapshot = read_plan_slip(driver)
         if snapshot.get('stagingSafe') is not True or not valid() or timeout <= 0:
             return {'status': 'not_ready'}
         target = (event['eventId'], market['marketId'], outcome['selectionId'])
         if any((leg['eventId'], leg['marketId'], leg['selectionId']) == target for leg in snapshot.get('legs', [])):
             return {'status': 'selected'}
-        return core.click_selection(driver, event, outcome, market, validate=valid, timeout=timeout)
+        return core.click_selection(driver, event, outcome, market, validate=valid, timeout=timeout,
+                                    **({'min_decimal':min_decimal} if min_decimal is not None else {}),
+                                    **({'observe_price':observe_price} if observe_price is not None else {}))
 
     def step(self, driver, core, readiness, stages, valid, server_now, max_wait=.3, focus=None):
         """At most one absent leg per tick; expiry never removes a physical leg."""
