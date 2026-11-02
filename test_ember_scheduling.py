@@ -97,7 +97,8 @@ def scheduling_html(signals):
             slip.prepend(card);};
     const originalPlace=button.onclick;
     button.onclick=()=>{window.fixtureSubmits.push({at:performance.now(),wall:Date.now()});originalPlace();
-        if(window.releaseA)setTimeout(()=>document.querySelector('section input')?.removeAttribute('disabled'),80);};
+        if(window.releaseA)setTimeout(()=>document.querySelector('section input')?.removeAttribute('disabled'),80);
+        if(window.renderA){window.renderA=false;setTimeout(()=>window.renderRows(0),80);}};
     window.renderRows=index=>{const {eventId,outcomes,name}=fixture[index];
         // Live DK 2026-10-31: the match-winner row ("Winner" on Match Lines) has no market label and sits
         // beside, not inside, its collapsible section.
@@ -275,7 +276,7 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
             if mode in ('slow', 'missing'):
                 driver.execute_script('document.querySelector("section").remove()')
                 if mode == 'slow':
-                    driver.execute_script('setTimeout(()=>window.renderRows(0),800)')
+                    driver.execute_script('window.renderA=true')  # A's board renders only after B submits: a timer raced slow runners
             elif mode == 'suspended':
                 driver.execute_script('document.querySelector("section input").disabled=true;window.releaseA=true')
             elif mode == 'quote-suspended':

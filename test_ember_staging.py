@@ -210,12 +210,18 @@ class StagingBrowserTests(unittest.TestCase):
         driver.execute_script("""document.querySelectorAll("section").forEach(e=>e.remove());window.renderRows(0);
             for(const b of document.querySelectorAll('#rows button')){const original=b.onclick;
                 b.onclick=event=>{const trusted=event.isTrusted;setTimeout(()=>original({isTrusted:trusted}),300);};}""")
-        signal = self.signals[0]
+        signal = deepcopy(self.signals[0])
+        # The class fixture's plan deadline can lapse during a slow browser start; this test is about landing.
+        signal['payload']['plan']['deadline'] = (datetime.now(timezone.utc)+timedelta(seconds=10)).isoformat()
         event, market = signal['payload']['event'], signal['payload']['market']
         outcome = next(row for row in market['outcomes'] if row['selectionId'] == signal['payload']['plan']['selectionId'])
         with patch.object(execution, 'correct_event', side_effect=fixtures.local_identity):
             result = Staging().add(driver, execution, event, market, outcome, lambda: True, .3, landing=.75)
         self.assertEqual((result['status'], result.get('landed')), ('clicked', True))
+        # A landed card can still be fading in; the plan's own slip read waits for it the same way.
+        deadline = time.monotonic()+2
+        while not execution.plan_slip_ready(driver, event, market, signal['payload']['plan']) and time.monotonic() < deadline:
+            time.sleep(.05)
         self.assertTrue(execution.plan_slip_ready(driver, event, market, signal['payload']['plan']))
         self.assertEqual(len(driver.execute_script('return window.selectionClicks')), 1)
 
