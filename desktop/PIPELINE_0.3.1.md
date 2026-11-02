@@ -17,8 +17,10 @@ DraftKings repairs from live runs:
 - Closeout signals reach the Moneyline board, including DraftKings' renamed
   "Winner" and "Match Winner" sections. Non-table-tennis pages are left after a
   grace period, so reading My Bets is never interrupted.
-- Ember keeps one tab per live match, closes the tabs of finished matches while
-  always keeping one open, and reattaches to the last worked tab.
+- Ember routes between matches in place in one tab, because a freshly opened
+  DraftKings event tab stalled for 20 to 30 seconds in live runs. It closes the
+  tabs of finished matches while always keeping one open, and it reattaches to
+  the last worked tab.
 - A location failure that persists is rechecked after 2, 4, 8 and 16 minutes,
   then every 30 minutes, instead of pausing wagering for hours. A confirmed
   wagering permission resets that schedule.

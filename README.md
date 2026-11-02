@@ -66,15 +66,15 @@ Anything ambiguous — an expired authorization, an unclear
 balance — aborts the bet instead of guessing.
 
 In 0.3.1, the slip stays empty until a positive conservative-EV signal qualifies.
-Ember funds one exact single at a time while it keeps scanning multiple matches,
-one browser tab per live match. Its probabilities remain the frozen pre-set
-reference at your selected 90% or 95% confidence level. A window opens only while
-conservative EV is positive at the start of the set, then accepts only an unchanged
-or lower price: any observed price rise, or EV no longer positive, permanently ends
-that window. A rising price means the market moved against the selection, which a
-frozen pre-set probability cannot see. This is pre-set-reference conservative EV,
-not a score-conditioned in-play probability. Version 0.3.0 rejects these windows
-and stays idle, so update to keep acting on signals.
+Ember funds one exact single at a time while it keeps scanning multiple matches.
+Its probabilities remain the frozen pre-set reference at your selected 90% or 95%
+confidence level. A window opens only while conservative EV is positive at the
+start of the set, then accepts only an unchanged or lower price: any observed price
+rise, or EV no longer positive, permanently ends that window. A rising price means
+the market moved against the selection, which a frozen pre-set probability cannot
+see. This is pre-set-reference conservative EV, not a score-conditioned in-play
+probability. Version 0.3.0 rejects these windows and stays idle, so update to keep
+acting on signals.
 
 ## Updating
 
