@@ -137,6 +137,7 @@ class NavigationGateBrowserTests(unittest.TestCase):
         time.sleep(.5)
         first = driver.current_window_handle
         driver.switch_to.new_window('tab')
+        second = driver.current_window_handle  # window_handles order differs across Chrome builds
         driver.get(base+'/fast2')
         time.sleep(.5)
         driver.switch_to.window(first)
@@ -145,7 +146,7 @@ class NavigationGateBrowserTests(unittest.TestCase):
         with self.assertRaises(NavigationPending):
             driver.execute_script('return document.title')
         self.assertLess(time.monotonic()-started, 2)  # Without the gate this command is held ~4 s.
-        driver.switch_to.window(driver.window_handles[-1])
+        driver.switch_to.window(second)
         self.assertEqual(driver.execute_script('return document.title'), '/fast2')
         driver.switch_to.window(first)
         deadline = time.monotonic()+10
