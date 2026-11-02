@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 
-KIND = 'pregame_non_decreasing'
+KIND = 'pregame_non_increasing'
 
 
 def points(event, target, state):
@@ -35,7 +35,13 @@ def points(event, target, state):
             current = (a,b)
     if tally != state:
         return None
+    period = re.fullmatch(r'([1-5])(?:st|nd|rd|th)', event.get('period') or '')
+    if not period:
+        return None
     reported = event.get('currentSet')
+    # Between sets DK keeps the finished set as current until its period advances.
+    if int(period[1]) == target-1 and reported == rows[target-2]:
+        reported = None
     if reported is not None:
         if (not isinstance(reported, dict) or reported.get('set') != target
                 or any(type(reported.get(side)) is not int or not 0 <= reported[side] <= 999 for side in ('home','away'))):
@@ -44,9 +50,6 @@ def points(event, target, state):
         if current is not None and pair != current or max(pair) >= 11 and abs(pair[0]-pair[1]) >= 2:
             return None
         current = pair
-    period = re.fullmatch(r'([1-5])(?:st|nd|rd|th)', event.get('period') or '')
-    if not period:
-        return None
     if int(period[1]) == target:
         return current
     return (0,0) if int(period[1]) == target-1 and current in (None,(0,0)) else None

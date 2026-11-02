@@ -138,6 +138,8 @@ class _GuardedExecutor:
         self._execute = delegate.execute
         self.disconnected = False
         self.failure = None
+        self.observer = None  # observer(command, params, seconds): local timing evidence only
+        self.gate = None  # gate.before may refuse a command before it is sent; gate.after sees each success
 
     def __getattr__(self, name):
         return getattr(self.delegate, name)
@@ -148,9 +150,14 @@ class _GuardedExecutor:
                    "from the bot's owning terminal.")
         if self.disconnected:
             raise self.failure
+        if self.gate is not None:
+            self.gate.before(command, params)
         started = time.monotonic()
         try:
-            return self._execute(command, params)
+            response = self._execute(command, params)
+            if self.gate is not None:
+                self.gate.after(command, params, response)
+            return response
         except (HTTPError, OSError) as error:
             self.disconnected = True
             self.failure = DriverConnectionLost(message)
@@ -162,6 +169,12 @@ class _GuardedExecutor:
             except (AttributeError, OSError):
                 self.failure.driver_alive = None
             raise self.failure from None
+        finally:
+            if self.observer is not None:
+                try:
+                    self.observer(command, params, time.monotonic()-started)
+                except Exception:
+                    pass  # Diagnostics never change a driver command's outcome.
 
 
 def create_owned_chrome(options, executable_path=None, preserve_external_browser=False):
@@ -185,6 +198,7 @@ def create_owned_chrome(options, executable_path=None, preserve_external_browser
         pool.clear()
     guard = _GuardedExecutor(driver.command_executor, service)
     driver.command_executor.execute = guard.execute
+    driver.command_guard = guard
     return driver
 
 

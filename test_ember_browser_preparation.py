@@ -121,6 +121,27 @@ class BrowserPreparationTests(unittest.TestCase):
             self.preparation.step(self.driver, self.hint, True, self.server_now, hold=True)
         self.assertNotIn('league', self.events)
 
+    def test_a_staged_hold_keeps_a_match_page_and_leaves_a_non_tt_page_only_after_a_grace(self):
+        # Live 10/30: 44 min on DK's home page after My Bets; live 10/31: an instant return fought the user twice.
+        from ember_browser_preparation import OFF_PAGE_GRACE
+        self.step(self.hint)
+        for url, navigates in (("https://sportsbook.draftkings.com/event/one-vs-two/100?category=odds", False),
+                               ("https://sportsbook.draftkings.com/mybets", True),
+                               ("https://sportsbook.draftkings.com/", True)):
+            with self.subTest(url=url):
+                self.events.clear()
+                self.clock[0] += 30
+                self.driver.current_url = url
+                hold = lambda: self.preparation.step(self.driver, None, True, self.server_now, hold=True)
+                hold()
+                self.clock[0] += OFF_PAGE_GRACE-1
+                hold()
+                self.assertEqual(self.events, [])  # The user may read My Bets undisturbed.
+                self.clock[0] += 1
+                hold()
+                self.assertEqual(self.events, ["grace", "league"] if navigates else [])
+                self.assertEqual(self.notify.call_args.kwargs["state"], "waiting_candidate")
+
     def stage(self, event_id, bet_type="closeout", window=False, points=(5, 3)):
         now = datetime.now(timezone.utc)
         event = {"eventId": event_id, "player1": f"A{event_id}", "player2": f"B{event_id}",

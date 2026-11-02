@@ -71,7 +71,7 @@ class MarketReadiness:
                 if (all(leg.get(key)==value for key,value in {'eventId':event['eventId'],'marketId':market['marketId'],
                         'selectionId':plan['selectionId']}.items()) and type(leg.get('decimalOdds')) in (int,float)
                         and not observe_price(leg['decimalOdds'])):
-                    return {'status':'not_ready','reason':'conservative EV decreased','windowExpired':True,'attempts':0,'wait_ms':0}
+                    return {'status':'not_ready','reason':'conservative EV increased','windowExpired':True,'attempts':0,'wait_ms':0}
         if plan is not None and valid() and plan_slip_ready(driver, event, market, plan):
             return {"status": "revealed", "staged": True, "attempts": 0, "wait_ms": 0}
         if plan is not None:
@@ -91,7 +91,7 @@ class MarketReadiness:
             if plan.get('window') and any(leg.get('eventId')==event['eventId'] and leg.get('marketId')==market['marketId']
                     and leg.get('selectionId')==plan['selectionId'] and type(leg.get('decimalOdds')) in (int,float)
                     and leg['decimalOdds']<plan['min_decimal'] for leg in legs):
-                return {'status':'not_ready','reason':'conservative EV decreased','windowExpired':True,'attempts':0,'wait_ms':0}
+                return {'status':'not_ready','reason':'conservative EV is no longer positive','windowExpired':True,'attempts':0,'wait_ms':0}
             if isinstance(legs, list) and any(leg.get('eventId') == event['eventId'] and
                     leg.get('marketId') == market['marketId'] and leg.get('selectionId') == plan['selectionId']
                     and leg.get('suspended') is True for leg in legs):
@@ -109,8 +109,10 @@ class MarketReadiness:
                 # Navigation has its own budget; a verified new event still needs a bounded reveal turn.
                 deadline=self.clock()+max_wait
         if plan is not None:
-            market = {**market, 'outcomes': [row for row in market.get('outcomes', [])
-                                           if row.get('selectionId') == plan['selectionId']]}
+            # Wire markets carry no scoreState; a Moneyline is revealed only for the plan's state, which the
+            # protocol verified against this event (live 10/27-10/30 every closeout was refused without it).
+            market = {**market, 'scoreState': plan.get('scoreState'),
+                      'outcomes': [row for row in market.get('outcomes', []) if row.get('selectionId') == plan['selectionId']]}
         return self.wait(driver, event, market, valid, remaining,
                          max_wait=max(0, deadline-self.clock()), staging=staging)
 
@@ -155,6 +157,7 @@ class MarketReadiness:
         if max_wait is not None:
             deadline = min(deadline, started+max_wait)
         attempts = 0
+        driver._tt_last_navigation = None
         while valid():
             left = min(deadline-self.clock(), remaining()-reserve)
             if left <= 0:
@@ -162,7 +165,8 @@ class MarketReadiness:
             attempts += 1
             try:
                 if self.core.open_props(driver, event, market, timeout=min(.4, left)):
-                    return {"status": "opened", "attempts": attempts, "wait_ms": round(1000*(self.clock()-started), 1)}
+                    return {"status": "opened", "attempts": attempts, "wait_ms": round(1000*(self.clock()-started), 1),
+                            "navigation": getattr(driver, '_tt_last_navigation', None)}
             except self.core.FATAL_BROWSER_ERRORS:
                 raise
             except self.core.BrowserNavigationPending:
@@ -172,7 +176,9 @@ class MarketReadiness:
                 break
             self.sleep(min(.03, left))
         return {"status": "expired" if not valid() else "not_ready", "reason": "event identity not ready",
-                "attempts": attempts, "wait_ms": round(1000*(self.clock()-started), 1)}
+                "attempts": attempts, "wait_ms": round(1000*(self.clock()-started), 1),
+                "navigation": getattr(driver, '_tt_last_navigation', None),
+                "pending": getattr(driver, '_tt_navigation_readiness', None)}
 
     def wait(self, driver, event, market, valid, remaining, reserve=.6, max_wait=None, staging=False):
         """Retry only pre-submit reveal/expansion; never retry a wager command."""
@@ -184,7 +190,9 @@ class MarketReadiness:
         fallback_attempted = False
         last = {"status": "waiting", "reason": "market surface not ready"}
         while valid():
-            if self.clock() >= deadline or remaining() <= reserve:
+            # Live 2026-10-28: on a loaded page the turn's precondition reads used the whole slice, so
+            # every turn yielded with 0 reveal attempts until expiry; a live signal gets at least one.
+            if remaining() <= reserve or (attempts and self.clock() >= deadline):
                 break
             attempts += 1
             try:

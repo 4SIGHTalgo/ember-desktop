@@ -1,4 +1,5 @@
 """Bounded, non-wager navigation between the league and a verified event."""
+import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -6,6 +7,8 @@ from urllib.parse import urlsplit
 from ember_protocol import timestamp
 from tt_market_semantics import entry_window
 from driver_lifecycle import connection_lost
+
+OFF_PAGE_GRACE = 60  # seconds a non-TT page (the user's My Bets) is left alone before standby returns
 
 
 class BrowserPreparation:
@@ -15,6 +18,7 @@ class BrowserPreparation:
         self.key = self.pending_key = None
         self.next_attempt = 0
         self.no_hint_since = None
+        self.off_page_since = None
         self.failures = 0
         self.last_status = None
         self.last_publish = float("-inf")
@@ -103,16 +107,22 @@ class BrowserPreparation:
             self.notify(state=state, text=text, event_id=event_id, changed=changed,
                         checked_at=datetime.now(timezone.utc).isoformat())
 
-    def at_league(self, driver):
-        address = urlsplit(driver.current_url)
+    def at_league(self, driver, address=None):
+        address = address or urlsplit(driver.current_url)
         expected = urlsplit(self.core.LEAGUE_URL)
         return address.scheme == expected.scheme and address.netloc == expected.netloc and address.path.rstrip("/") == expected.path.rstrip("/")
+
+    def at_tt_page(self, driver):
+        """The league or a match page; anything else (home, My Bets) holds no match worth retaining."""
+        address = urlsplit(driver.current_url)
+        return self.at_league(driver, address) or (address.netloc == urlsplit(self.core.LEAGUE_URL).netloc
+                                                   and re.fullmatch(r"/event/[^/]+/[0-9]{1,32}/?", address.path) is not None)
 
     def league(self, driver):
         self.next_attempt = self.clock()+3
         self.navigation_started()
         self.open_league(driver)
-        self.key = None
+        self.key = self.off_page_since = None
 
     def step(self, driver, hint, feed_ready, server_now, hold=False, stages=None, legs=None):
         now = self.clock()
@@ -130,6 +140,20 @@ class BrowserPreparation:
         if event is None:
             if hold:
                 self.no_hint_since = None
+                # Staged legs retain only a league or match page. Live 10/30 the tab sat 44 min on DK's home page
+                # after My Bets, where a signal needs a full load; live 10/31 returning at once fought the user's
+                # own My Bets visit twice, so a non-TT page is left only after a grace.
+                if self.at_tt_page(driver):
+                    self.off_page_since = None
+                else:
+                    self.off_page_since = now if self.off_page_since is None else self.off_page_since
+                    if now >= self.next_attempt and now-self.off_page_since >= OFF_PAGE_GRACE:
+                        try:
+                            self.league(driver)
+                        except self.core.FATAL_BROWSER_ERRORS:
+                            raise
+                        except (RuntimeError, self.core.WebDriverException):
+                            self.next_attempt = self.clock()+10
                 self.publish("waiting_candidate", "Retaining staged live matches while waiting for fresh signals.", self.key[0] if self.key else None)
                 return
             self.no_hint_since = now if self.no_hint_since is None else self.no_hint_since

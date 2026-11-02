@@ -7,7 +7,8 @@ import time
 from urllib.parse import urlparse
 import re
 
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import (ElementClickInterceptedException, ElementNotInteractableException,
+                                        StaleElementReferenceException, WebDriverException)
 from driver_lifecycle import connection_lost
 from draftkings_live import retry_after_seconds
 
@@ -23,14 +24,17 @@ const visible = el => {
 };
 if (location.hostname!=='sportsbook.draftkings.com'||/^\/(?:auth|login)(?:\/|$)/.test(location.pathname))
     return {state:'authentication_required'};
+// While wagering waits (location check, loading), only DK's idle logout is prevented: a signed-in
+// session clock is clicked whatever the grant. Live 2026-10-28 DK logged out 29 min into a pause.
+const waiting=arguments[0]?.waiting===true&&window.__isLoggedIn===true;
 const span=window.__playSpan?.playSpan;
-if (span?.grantType==='Restricted') return {state:'restricted',nativeSessionPresent:true};
+if (span?.grantType==='Restricted'&&!waiting) return {state:'restricted',nativeSessionPresent:true};
 const authenticated=window.__isLoggedIn===true&&window.__canBet===true&&span?.clientKey&&span.grantType==='PlaySportsbook';
-if (!visible(document.getElementById('standardized-header-account-menu'))&&!authenticated)
+if (!visible(document.getElementById('standardized-header-account-menu'))&&!authenticated&&!waiting)
     return {state:'authentication_required'};
 const nativeSessionPresent=!!span?.clientKey;
 const canBet=window.__canBet===true,viewingOdds=!!window.__viewOdds;
-if (!nativeSessionPresent||!canBet||!viewingOdds)
+if (!waiting&&(!nativeSessionPresent||!canBet||!viewingOdds))
     return {state:'native_session_not_ready',nativeSessionPresent,canBet,viewingOdds};
 const clocks=[...document.querySelectorAll('span#sb-session-time')].filter(visible)
     .filter(el=>!el.closest('a,button,input,label,[role="button"],[role="tab"],[contenteditable="true"]'));
@@ -43,6 +47,10 @@ return {state:'ready',nativeSessionPresent,canBet,viewingOdds,element:clocks[0]}
 
 def utc():
     return datetime.now(timezone.utc).isoformat()
+
+
+CLICK_HANG_BACKOFF = 300  # seconds; cleared at once when the activity click returns
+CLICK_REFUSED = (ElementClickInterceptedException, ElementNotInteractableException, StaleElementReferenceException)
 
 
 class SessionMaintenance:
@@ -126,18 +134,28 @@ class SessionMaintenance:
             except (ValueError,KeyError,TypeError):
                 continue
 
-    def activity(self, driver, now, auth_state, busy=False, paused=False, blocked=False):
+    def activity(self, driver, now, auth_state, busy=False, paused=False, blocked=False, waiting=False):
         if not self.interval or now<max(self.due,self.backoff_until) or busy or blocked or auth_state!='signed-in':
             return False
         self.due=now+self.interval
-        result=driver.execute_script(SESSION_ACTIVITY_SCRIPT)
+        result=driver.execute_script(SESSION_ACTIVITY_SCRIPT,{'waiting':waiting is True})
         if not isinstance(result,dict):
             self.report['state']='native_session_not_ready'
             return False
         self.report.update({key:result[key] for key in ('state','nativeSessionPresent','canBet','viewingOdds') if key in result})
         element=result.get('element')
         if paused or result.get('state')!='ready' or element is None: return False
-        element.click()
+        # Live 2026-10-29: on a loaded page this click hung to the driver timeout four times in six
+        # minutes, each forcing a recovery; a click that never returns holds the next one off 5 min.
+        held,self.backoff_until=self.backoff_until,max(self.backoff_until,now+CLICK_HANG_BACKOFF)
+        try:
+            element.click()
+        except CLICK_REFUSED:
+            # A DK overlay over the clock is refused at once, never clicked through: retry next interval.
+            self.backoff_until=held
+            self.report['state']='session_indicator_covered'
+            return False
+        self.backoff_until=held
         self.report.update(state='activity_sent_waiting_for_native_renewal',lastActivityAt=utc(),
                            activityCount=self.report['activityCount']+1)
         return True

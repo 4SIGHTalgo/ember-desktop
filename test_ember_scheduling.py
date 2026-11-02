@@ -45,7 +45,7 @@ def fixture_signals(h2h=False):
             rows = [{'set': number, 'home': 11 if number % 2 else 5, 'away': 5 if number % 2 else 11}
                     for number in range(1, 5)]+[{'set': 5, 'home': 0, 'away': 0}]
             event.update(sets=rows, currentSet=rows[-1], period='5th', setTally=[2, 2])
-            market.update(name='Moneyline', scoreState=[2, 2], subcategoryId=6386)
+            market.update(name='Moneyline', subcategoryId=6386)  # Like the protocol-3 wire: no scoreState.
             for outcome in market['outcomes']:
                 outcome['selectionId'] = '0ML'+outcome['selectionId']
             plan.update(betType='closeout', nextSet=5, scoreState=[2, 2], selectionId='0ML'+event_id+'a',
@@ -84,7 +84,7 @@ def scheduling_html(signals):
     const fixture=FIXTURE_DATA;
     document.querySelector('.cms-event-scoreboard-container').textContent=fixture[0].players.join(' vs ');
     document.querySelector('[role=tab]').textContent=fixture[0].name==='Moneyline'?'Match Lines':'Game Props';
-    document.querySelector('[data-testid=collapsible-header]').textContent=fixture[0].name==='Moneyline'?'Moneyline':'Winner - Listed Game';
+    document.querySelector('[data-testid=collapsible-header]').textContent=fixture[0].name==='Moneyline'?'Winner':'Winner - Listed Game';
     window.__isLoggedIn=true;window.__canBet=true;
     window.__playSpan={playSpan:{clientKey:'fixture-native-grant',grantType:'PlaySportsbook'}};
     window.selectionClicks=[];window.fixtureSubmits=[];
@@ -99,7 +99,11 @@ def scheduling_html(signals):
     button.onclick=()=>{window.fixtureSubmits.push({at:performance.now(),wall:Date.now()});originalPlace();
         if(window.releaseA)setTimeout(()=>document.querySelector('section input')?.removeAttribute('disabled'),80);};
     window.renderRows=index=>{const {eventId,outcomes,name}=fixture[index];
-        const rows=document.getElementById('rows');rows.innerHTML='<div data-testid="market-template"><div data-testid="market-label">'+name+'</div></div>';
+        // Live DK 2026-10-31: the match-winner row ("Winner" on Match Lines) has no market label and sits
+        // beside, not inside, its collapsible section.
+        const moneyline=name==='Moneyline',rows=document.getElementById('rows');
+        rows.innerHTML='<div data-testid="market-template">'+(moneyline?'':'<div data-testid="market-label">'+name+'</div>')+'</div>';
+        if(moneyline)document.querySelector('[data-testid=collapsible-wrapper]').after(rows);
         for(const {selectionId,label} of outcomes){
             const b=document.createElement('button');b.dataset.testid='component-builder-market-button-'+eventId+'-'+selectionId;
             b.setAttribute('aria-pressed','false');b.innerHTML='<span data-testid="button-title-market-board">'+label+'</span><span data-testid="button-odds-market-board">+150</span>';
@@ -219,7 +223,7 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
             gate=Mock();gate.poll.return_value={'ready':True,'signed_in':True,'signed_out_confirmed':False,
                 'provider_can_bet':True,'native_wagering_grant':True,'location':{'state':'unknown','blocked':False}}
             output=io.StringIO()
-            owner=SimpleNamespace(open=lambda active:driver,detach=lambda:None,retained=False)
+            owner=SimpleNamespace(open=lambda active,prefer=None:driver,detach=lambda:None,retained=False,commands=SimpleNamespace(),log=SimpleNamespace(record=lambda *a,**k:None))
             client.stop.wait=Mock(side_effect=lambda _:setattr(client.lease,'running',False))
             for setting in (patch('ember_client.OUTPUT',output),patch('ember_provider_login.ProviderLoginGate',return_value=gate),
                 patch('draftkings_login.allow_location_permissions'),patch('draftkings_login.TT_ELITE_URL',client.api+'/leagues/tabletennis/tt-elite-series'),
@@ -313,7 +317,7 @@ class ClientSchedulingBrowserTests(unittest.TestCase):
             else:
                 state.on_first = lambda: enqueue(second)
             self.assertIsInstance(client.signals, SignalQueue)
-            owner = SimpleNamespace(open=lambda active: driver, detach=lambda: None, retained=False)
+            owner = SimpleNamespace(open=lambda active, prefer=None: driver, detach=lambda: None, retained=False, commands=SimpleNamespace(), log=SimpleNamespace(record=lambda *a, **k: None))
             gate = Mock()
             gate.poll.return_value = {'ready': True, 'signed_in': True, 'signed_out_confirmed': False,
                 'provider_can_bet': True, 'native_wagering_grant': True, 'location': {'state': 'ready', 'blocked': False}}

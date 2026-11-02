@@ -1,15 +1,17 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import ExitStack
+import json
 import os
 import queue
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from ember_client import Client, Ledger, SignalQueue
+import ember_client
 
 
 def plan_signal(**plan_overrides):
@@ -82,16 +84,22 @@ class ReferenceWindowTests(unittest.TestCase):
         self.assertFalse(ledger.reserve_signal(self.client.account,signal))
         self.assertEqual(ledger.connection.execute('SELECT count(*) FROM attempts').fetchone()[0],1)
 
-    def test_native_improvement_is_remembered_across_restart_before_any_claim(self):
+    def test_the_lowest_native_price_is_remembered_across_restart_and_a_rise_expires_the_window(self):
         signal=window_signal();self.client.request=Mock(return_value={'cancelled':True})
         path=self.client.data_dir/'execution.sqlite3';ledger=Ledger(path)
-        self.assertTrue(self.client.observe_window_price(signal,2.75,ledger))
+        for price in (2.75,2.6,2.6):
+            self.assertTrue(self.client.observe_window_price(signal,price,ledger))
+        self.assertEqual(signal['payload']['plan']['max_decimal'],2.6)
+        self.assertEqual(signal['payload']['plan']['min_decimal'],2.0)  # The EV floor never moves with the price.
         ledger.connection.close()
         ledger=Ledger(path);self.addCleanup(ledger.connection.close)
-        self.assertFalse(self.client.observe_window_price(window_signal(),2.6,ledger))
+        self.assertFalse(self.client.observe_window_price(window_signal(),2.62,ledger))
         self.assertIn(signal['payload']['plan']['window']['key'],ledger.cancelled_windows(self.client.account))
         self.assertEqual(ledger.connection.execute('SELECT count(*) FROM attempts').fetchone()[0],0)
         self.assertFalse(self.client.permits(signal))
+        below=window_signal(confidence=95)
+        self.assertFalse(self.client.observe_window_price(below,1.99,ledger))  # Below the EV floor.
+        self.assertIn(below['payload']['plan']['window']['key'],ledger.cancelled_windows(self.client.account))
 
     def test_cancelled_window_is_durable_and_no_claim_is_created(self):
         signal=window_signal();self.client.request=Mock(return_value={'cancelled':True})
@@ -107,13 +115,35 @@ class ReferenceWindowTests(unittest.TestCase):
         ledger=Ledger(self.client.data_dir/'execution.sqlite3');self.addCleanup(ledger.connection.close)
         self.assertTrue(ledger.reserve_signal(self.client.account,signal))
         result={'status':'skipped','submissionState':'not-submitted','retryable':True}
-        with patch('ember_client.prepare_single_slip',return_value={'status':'blocked'}):
+        with patch('ember_client.clear_single_slip',return_value={'status':'blocked'}):
             self.client.release_unsubmitted(signal,result,ledger)
         self.assertFalse(self.client.lease.running)
         self.assertFalse(result['retryable'])
         self.assertTrue(result['cleanupFailed'])
         self.assertFalse(ledger.reserve_signal(self.client.account,signal))
         self.assertTrue(signal['_reserved'])
+
+    def test_an_animated_pick_removal_is_reverified_instead_of_stopping_the_run(self):
+        import tt_market_exec as execution
+        driver=Mock(_tt_plan_uncertain=False,_tt_plan_stopped=False)
+        for replies,expected in ((['waiting','waiting','cleared'],'cleared'),(['waiting','blocked','cleared'],'blocked')):
+            with self.subTest(replies=replies):
+                driver.execute_script.side_effect=[{'status':status} for status in replies]
+                self.assertEqual(execution.clear_single_slip(driver,sleep=lambda _:None)['status'],expected)
+        driver.execute_script.side_effect=lambda *_:{'status':'waiting'}
+        clock=iter([0,0,1.5,3.1])
+        with patch('tt_market_exec.time.monotonic',side_effect=lambda:next(clock)):
+            self.assertEqual(execution.clear_single_slip(driver,sleep=lambda _:None)['status'],'waiting')
+        signal=window_signal();signal['_reserved']=True
+        ledger=Ledger(self.client.data_dir/'execution.sqlite3');self.addCleanup(ledger.connection.close)
+        self.assertTrue(ledger.reserve_signal(self.client.account,signal))
+        self.client.driver=driver
+        driver.execute_script.side_effect=[{'status':'waiting'},{'status':'cleared'}]
+        with patch('tt_market_exec.time.sleep'):
+            self.client.release_unsubmitted(signal,{'status':'skipped','submissionState':'not-submitted'},ledger)
+        self.assertTrue(self.client.lease.running)
+        self.assertNotIn('_reserved',signal)
+        self.assertTrue(ledger.reserve_signal(self.client.account,signal))
 
 
 class ClientProtocolTests(unittest.TestCase):
@@ -243,6 +273,28 @@ class ProtocolV2Tests(unittest.TestCase):
                                   "access_until": (now+timedelta(hours=1)).isoformat(), "lease_seconds": 5})
 
     plan_signal = staticmethod(plan_signal)
+
+    def test_every_terminal_disposition_and_dropped_signal_leaves_local_evidence(self):
+        self.client.access_token = "synthetic-access-token-never-logged"
+        signal = self.plan_signal()
+        signal['_timing'] = {'received': 10.0, 'dequeued': 10.25}
+        timing = {'stages': [{'name': 'planSlipQuote', 'offsetMs': 1.0, 'durationMs': 240.0}]}
+        with patch('ember_client.time.monotonic', return_value=11.5):
+            self.client.history_outcome(signal, 'missed', 'market_unavailable',
+                                        result={'readiness': {'status': 'not_ready', 'reason': 'market surface not ready'},
+                                                'timing': timing, 'reason': 'the slip quote did not become ready'})
+        for _ in range(3):
+            self.client.trace_dropped({'id': 7, 'contract': '100:split', 'protocol': 3}, 'other_confidence_window', confidence=95)
+        path = Path(os.environ['LOCALAPPDATA'])/'Ember'/'execution-trace.jsonl'
+        text = path.read_text(encoding='utf-8')
+        rows = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([(row['signal'], row['outcome'], row['reason']) for row in rows],
+                         [(1, 'missed', 'market_unavailable'), (7, 'dropped', 'other_confidence_window')])
+        self.assertEqual(rows[0]['ms'], {'received': 0.0, 'dequeued': 250.0, 'finished': 1500.0})
+        self.assertEqual(rows[0]['timing'], timing)
+        self.assertEqual(rows[0]['readiness']['reason'], 'market surface not ready')
+        self.assertEqual(rows[0]['detail'], 'the slip quote did not become ready')
+        self.assertNotIn('synthetic-access-token-never-logged', text)
 
     def test_plan_signal_is_accepted_and_cannot_carry_strategy_data(self):
         signal = self.plan_signal()
@@ -381,6 +433,187 @@ class ProtocolV2Tests(unittest.TestCase):
         self.assertEqual(snapshot["counts"], {"placed": 1})
         self.assertEqual(snapshot["records"][0]["reason"], "placed")
 
+    def run_confirm_probe(self, rehearsal, cleanup='cleared', make_signal=None, place_effect=None, burst=False):
+        import tt_market_exec as core
+        client = self.client
+        client.rehearsal = rehearsal
+        client.provider_ready.set()
+        client.lease.running = True
+        signal = (make_signal or self.plan_signal)()
+        client.receive_opportunity(signal, client.history_scope())
+        deliveries = iter([signal])
+
+        def deliver(**_):
+            try:
+                return next(deliveries)
+            except StopIteration:
+                client.lease.running = False
+                raise queue.Empty
+        client.authorize = Mock(return_value=True)
+        client.signals = Mock()
+        client.signals.get.side_effect = deliver
+        client.signals.get_nowait.side_effect = queue.Empty
+        if burst:  # Two live contracts queued at once, served from a real SignalQueue.
+            second = (make_signal or self.plan_signal)()
+            second['id'] += 1
+            second['contract'] = second['contract'].split(':')[0]+':closeout'
+            class Burst(SignalQueue):
+                def get(self, block=True, timeout=None):
+                    try:
+                        return super().get(block=False)
+                    except queue.Empty:
+                        client.lease.running = False
+                        raise
+            client.signals = Burst()
+            client.signals.put_latest(signal)
+            client.signals.put_latest(second)
+        driver = Mock(current_url=core.LEAGUE_URL)
+        browser = driver.execute_script
+        browser.return_value = {'present': False, 'status': 'empty', 'stagingSafe': True, 'legs': []}
+        owner = Mock(retained=False)
+        owner.open.return_value = driver
+        owner.recovery.return_value = "closed"
+        gate = Mock()
+        gate.poll.return_value = {"ready": True, "signed_in": True, "signed_out_confirmed": False,
+                                  "provider_can_bet": True, "native_wagering_grant": True,
+                                  "location": {"state": "unknown", "blocked": False}, "message": None}
+        confirmations = []
+
+        def place(driver, *args, **kwargs):
+            confirmations.append(driver.execute_script(core.CONFIRM_PLAN_SCRIPT, {'stake': 2.61, 'minDecimal': 2.0,
+                                                       'selectionLabel': 'Two', 'marketName': 'Game 2'}))
+            return {'status': 'stopped', 'submitted': False, 'submissionState': 'not-submitted', 'reason': 'probe'}
+        with ExitStack() as stack:
+            ledger = stack.enter_context(patch("ember_client.Ledger")).return_value
+            ledger.unresolved_submission.return_value = False
+            ledger.window_peak.return_value = 0
+            ledger.window_ceiling.return_value = None
+            for setting in (patch("ember_client.emit"), patch("ember_client.validation_ticket", return_value=None),
+                patch("ember_client.OwnedBrowser", return_value=owner), patch("ember_client.ActiveSessionPower"),
+                patch.object(client.staging, 'add', return_value={'status': 'selected'}),
+                patch("draftkings_login.allow_location_permissions"),
+                patch("draftkings_login.goto_tt_elite"), patch("ember_provider_login.ProviderLoginGate", return_value=gate),
+                patch("draftkings_session.SessionMaintenance"), patch.object(core, "prepare_browser_execution"),
+                patch.object(core, "reveal_set_winner", return_value={"status": "revealed"}),
+                patch("ember_client.clear_single_slip", return_value={'status': cleanup}),
+                patch("ember_client.prepare_single_slip", return_value={'status': 'cleared'}),
+                patch.object(core, "ensure_slip_open"),
+                patch.object(core, "open_props", return_value=True), patch.object(core, "place_plan", side_effect=place_effect or place)):
+                stack.enter_context(setting)
+            client.execute()
+        self.owner = owner
+        self.gate = gate
+        dispatched = [call for call in browser.call_args_list if call.args and call.args[0].endswith(core.CONFIRM_PLAN_SCRIPT)]
+        return confirmations, dispatched, [call.args[2] for call in ledger.finish.call_args_list]
+
+    def test_rehearsal_arms_the_server_sized_slip_but_never_dispatches_a_wager_command(self):
+        _, dispatched, statuses = self.run_confirm_probe(False)
+        self.assertEqual(len(dispatched), 1)  # Control: without rehearsal the same turn reaches the browser.
+        self.assertIn('submitting', statuses)
+        rows = [json.loads(line) for line in (self.client.data_dir/'execution-trace.jsonl').read_text(encoding='utf-8').splitlines()]
+        # A real dispatch records what was armed (stake, price bounds, selection) with its outcome row.
+        self.assertEqual({k: rows[-1]['armed'][k] for k in ('stake', 'minDecimal', 'selectionLabel', 'marketName')},
+                         {'stake': 2.61, 'minDecimal': 2.0, 'selectionLabel': 'Two', 'marketName': 'Game 2'})
+        (self.client.data_dir/'execution-trace.jsonl').unlink()
+        self.setUp()
+        confirmations, dispatched, statuses = self.run_confirm_probe(True)
+        self.assertEqual(dispatched, [])
+        self.assertEqual(confirmations[0]['status'], 'aborted')
+        self.assertNotIn('submitting', statuses)
+        rows = [json.loads(line) for line in (self.client.data_dir/'execution-trace.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual((rows[0]['outcome'], rows[0]['reason']), ('rehearsed', 'armed_not_submitted'))
+        self.assertEqual(rows[0]['armed'], {'stake': 2.61, 'minDecimal': 2.0, 'selectionLabel': 'Two', 'marketName': 'Game 2'})
+        # The armed rehearsal is journaled once as a diagnostic observation, never as a miss or a placement.
+        self.assertEqual([(r['outcome'], r['reason']) for r in rows[1:]], [('observed_only', 'read_only')])
+        history = self.client.history.snapshot(self.client.history_scope(), outcome=None)
+        self.assertEqual([(r['outcome'], r['reason']) for r in history['records']], [('observed_only', 'read_only')])
+
+    def test_a_pick_closed_refusal_blocks_the_contract_and_the_run_continues(self):
+        # #702, user-approved 2026-10-30: a dispatched click DK refused with PICK CLOSED is a miss, not a stop.
+        import tt_market_exec as core
+        def place(driver, *args, **kwargs):
+            driver.execute_script(core.CONFIRM_PLAN_SCRIPT, {'stake': 2.61, 'minDecimal': 2.0,
+                                                             'selectionLabel': 'Two', 'marketName': 'Game 2'})
+            return {'status': 'not_placed', 'submitted': False, 'submissionState': 'closed-not-placed',
+                    'retryable': False, 'notReady': False,
+                    'reason': 'pick closed at submission: DraftKings showed PICK CLOSED, no receipt, and unchanged cash'}
+        _, dispatched, statuses = self.run_confirm_probe(False, place_effect=place, burst=True)
+        self.assertEqual(len(dispatched), 2)  # The second queued contract still ran.
+        self.assertEqual(statuses, ['submitting', 'not_placed', 'submitting', 'not_placed'])  # Never retryable.
+        history = self.client.history.snapshot(self.client.history_scope(), outcome=None)
+        self.assertEqual([(r['outcome'], r['reason']) for r in history['records']], [('missed', 'market_unavailable')])
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Ledger(Path(directory)/'execution.sqlite3')
+            signal = self.plan_signal()
+            self.assertTrue(ledger.reserve_signal('one', signal))
+            ledger.finish('one', signal['contract'], 'not_placed')
+            self.assertFalse(ledger.unresolved_submission('one'))  # A restart is not fenced.
+            self.assertFalse(ledger.reserve_signal('one', {**signal, 'protocol': 3}))  # Never retried.
+            ledger.connection.close()
+
+    def test_an_execution_error_miss_records_the_exception_class_and_our_code_location_only(self):
+        self.run_confirm_probe(True, place_effect=RuntimeError("secret-fixture-text"))
+        # With no match prepared (league standby) the idle wait is the slower standby pace.
+        self.assertEqual(self.client.signals.get.call_args_list[0].kwargs, {'timeout': ember_client.STANDBY_WAIT})
+        text = (self.client.data_dir/'execution-trace.jsonl').read_text(encoding='utf-8')
+        self.assertNotIn("secret-fixture-text", text)
+        row = [json.loads(line) for line in text.splitlines() if json.loads(line)['outcome'] == 'missed'][-1]
+        self.assertEqual(row['reason'], 'execution_error')
+        self.assertTrue(row['detail'].startswith('RuntimeError ember_client:'), row['detail'])
+
+    def test_one_keep_alive_keeper_serves_every_reattach_in_a_run(self):
+        # Live 2026-10-29: a fresh keeper per attachment clicked at once after each recovery, on the same loaded page.
+        from ember_browser_lifecycle import BrowserCancelled
+        keeper = Mock()
+        self.client.session_maintenance = keeper
+        owner = Mock()
+        owner.open.side_effect = BrowserCancelled()
+        with patch('draftkings_session.SessionMaintenance') as fresh, patch('ember_client.Ledger') as ledger:
+            ledger.return_value.unresolved_submission.return_value = False
+            ledger.return_value.cancelled_windows.return_value = set()
+            with self.assertRaises(BrowserCancelled):
+                self.client.execute_browser(owner, lambda: True)
+        fresh.assert_not_called()
+        self.assertIs(self.client.session_maintenance, keeper)
+
+    def test_queued_signals_are_not_held_behind_a_fresh_provider_reread(self):
+        # Live 2026-10-28: each provider re-read took 1-5 s on a loaded page and a burst of four expired queued.
+        self.run_confirm_probe(True, burst=True)
+        rows = [json.loads(line) for line in (self.client.data_dir/'execution-trace.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(len({row['signal'] for row in rows if row['outcome'] == 'rehearsed'}), 2)  # Both turns ran.
+        self.assertEqual(self.gate.poll.call_count, 2)  # Once before the burst, once after it; none between its turns.
+        # Provider phase changes are journaled once each (lockout evidence), not on every poll.
+        phases = [c.args[0] for c in self.owner.log.record.call_args_list if c.args and c.args[0].startswith('provider_')]
+        self.assertEqual(phases, ['provider_waiting'])
+
+    def test_a_match_tab_still_loading_misses_one_signal_without_a_browser_recovery(self):
+        from ember_navigation import NavigationPending
+        self.client.tab_book.update({'h-old': {'event': '1', 'used': 5}, 'h-working': {'event': '2', 'used': 9}})
+        _, dispatched, statuses = self.run_confirm_probe(True, place_effect=NavigationPending("loading"))
+        self.owner.open.assert_called_once_with(ANY, prefer='h-working')  # Reattach resumes the last worked tab.
+        self.assertEqual(dispatched, [])
+        self.owner.recovery.assert_not_called()  # No detach, reattach, or backoff for a refused, unsent command.
+        history = self.client.history.snapshot(self.client.history_scope(), outcome=None)
+        self.assertEqual([(r['outcome'], r['reason']) for r in history['records']], [('missed', 'browser_not_ready')])
+
+    def test_rehearsal_that_cannot_verify_an_empty_slip_still_stops_and_is_not_reported_as_a_submission(self):
+        self.client.conservative_level, self.client.active_windows = 'conservative', {1}
+        _, dispatched, statuses = self.run_confirm_probe(True, cleanup='blocked', make_signal=window_signal)
+        self.assertEqual(dispatched, [])
+        self.assertFalse(self.client.lease.running)
+        self.assertEqual(statuses[-1], 'cleanup_failed')
+        history = self.client.history.snapshot(self.client.history_scope(), outcome=None)
+        self.assertEqual([(r['outcome'], r['reason']) for r in history['records']], [('missed', 'selection_failed')])
+        # A later delivery of the same contract is blocked as already attempted, not shown as an unconfirmed bet.
+        later = window_signal()
+        later['id'] += 1
+        later['payload']['plan']['scoreState'] = [2, 0]
+        with patch('ember_client.reservations', return_value={later['contract']: 'cleanup_failed'}):
+            self.client.receive_opportunity(later, self.client.history_scope())
+        counts = self.client.history.snapshot(self.client.history_scope(), outcome=None)['counts']
+        self.assertNotIn('uncertain', counts)
+        self.assertEqual(counts.get('missed'), 2)
+
     def test_plan_denials_are_journaled_with_the_authoritative_reason(self):
         import tt_market_exec as core
         client = self.client
@@ -459,11 +692,26 @@ class ProtocolV2Tests(unittest.TestCase):
         with self.subTest(case="claimed elsewhere"):
             with patch.object(client, "request", side_effect=RuntimeError("contract_claimed_by_another_client")):
                 self.assertEqual(claim(quote), {"denied": "claimed_elsewhere"})
+        # A device-test dollar ceiling refuses a larger server stake; it never resizes one.
+        for cents, expected in ((10, {"stake": .10, "min_decimal": 1.85, "echo": "e3"}), (11, {"denied": "sizing_failed"})):
+            with self.subTest(case=f"ceiling with {cents} cents"):
+                client.stake_cap_cents = 10
+                with patch.object(client, "request",
+                                  return_value={**lease, "plan": {"stake_cents": cents, "min_decimal": 1.85, "echo": "e3"}}):
+                    self.assertEqual(claim(quote), expected)
+        client.stake_cap_cents = None
         with self.subTest(case="server floor refusal"):
             with patch.object(client, "request", side_effect=RuntimeError("price_below_floor")):
                 self.assertEqual(claim(quote), {"denied": "odds_below_ev"})
         with self.subTest(case="unreadable quote"):
             self.assertEqual(claim({"balance": {}, "decimalOdds": None}), {"denied": "sizing_failed"})
+
+    def test_device_test_stake_ceiling_parses_to_floored_cents_and_fails_closed(self):
+        for raw, expected in (("0.10", 10), ("0.109", 10), ("nan", 0), ("-1", 0), ("ten", 0)):
+            with self.subTest(raw=raw), patch.dict(os.environ, {"EMBER_DEVICE_TEST_ONCE": "1", "EMBER_DEVICE_TEST_STAKE_CAP": raw}):
+                self.assertEqual(Client().stake_cap_cents, expected)
+        with patch.dict(os.environ, {"EMBER_DEVICE_TEST_STAKE_CAP": "0.10", "EMBER_DEVICE_TEST_ONCE": ""}):
+            self.assertIsNone(Client().stake_cap_cents)  # Only an explicit device test carries the ceiling.
 
 
 class ProviderStartupTests(unittest.TestCase):
@@ -626,11 +874,11 @@ class ProviderStartupTests(unittest.TestCase):
                 patch("draftkings_login.goto_tt_elite", side_effect=open_league),
                 patch("ember_provider_login.ProviderLoginGate", return_value=gate),
                 patch("ember_market_readiness.MarketReadiness.warm", return_value={"status": "ready"}),
-                patch("draftkings_session.SessionMaintenance"),
                 patch.object(core, "prepare_browser_execution"),
                 patch.object(core, "ROOT", client.data_dir),
                 patch.object(core, "SLIP_CAPTURE", client.data_dir/"last-slip.json")):
                 stack.enter_context(setting)
+            self.keeper = stack.enter_context(patch("draftkings_session.SessionMaintenance")).return_value
             plan_exec = stack.enter_context(patch.object(core, "place_plan"))
             props = stack.enter_context(patch.object(core, "open_props", return_value=True))
             if scan_only:
@@ -649,6 +897,29 @@ class ProviderStartupTests(unittest.TestCase):
         driver, events = self.run_startup([self.state(False, signed_out=True)], readiness_only=False)
         driver.get.assert_called_once_with(LOGIN_URL)
         self.assertNotIn(("table_tennis", True), events)
+        self.client.signals.get.assert_not_called()
+
+    def test_a_mid_run_signout_sounds_at_once_and_every_five_minutes_until_signed_in(self):
+        # Live 2026-10-31: DK ended the session during a page stall and wagering waited 4 h for a login.
+        client = self.client
+        with patch("ember_client.alert_sound") as sound, patch("ember_client.emit") as emitted, \
+                patch("ember_client.threading.Thread", side_effect=lambda target, daemon: Mock(start=target)):
+            client.provider_alert("awaiting_signin", 0)  # A first login after Start is expected, not alerted.
+            self.assertEqual(sound.call_count, 0)
+            for phase, now in (("ready", 10), ("awaiting_signin", 20), ("awaiting_signin", 319),
+                               ("awaiting_verification", 320), ("ready", 330), ("awaiting_signin", 340)):
+                client.provider_alert(phase, now)
+        self.assertEqual(sound.call_count, 3)  # 20, 320 (5 min later), and 340 after a recovery.
+        messages = [call.kwargs.get("message", "") for call in emitted.call_args_list]
+        self.assertEqual(sum("signed out during the run" in message for message in messages), 3)
+
+    def test_a_signed_in_pause_keeps_the_session_alive_and_a_signed_out_one_does_not(self):
+        # Live 2026-10-28 DK logged out (KRN-006) 29 min into a paused location recheck.
+        self.run_startup([self.state(False, signed_out=True), self.state(False, signed_in=True)], readiness_only=False)
+        calls = self.keeper.activity.call_args_list
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].args[2], "signed-in")
+        self.assertIs(calls[0].kwargs.get("waiting"), True)
         self.client.signals.get.assert_not_called()
 
     def test_browser_closed_during_login_is_detected_before_any_signal_or_wager(self):
@@ -914,6 +1185,10 @@ class PlanRenewalTests(unittest.TestCase):
         self.assertTrue(self.client.defer_readiness(signal, {'status': 'authorization_timeout'}))
         self.assertIs(self.client.signals.get_nowait(), other)
         self.assertIs(self.client.signals.get_nowait(), signal)
+        rows = [json.loads(line) for line in (self.client.data_dir/'execution-trace.jsonl').read_text(encoding='utf-8').splitlines()]
+        # Every yielded turn leaves local evidence with its readiness reason.
+        self.assertEqual([(r['outcome'], r['reason'], r['readiness']) for r in rows if r['outcome'] == 'deferred'],
+                         [('deferred', 'authorization_timeout', {'status': 'authorization_timeout'})])
 
     def test_expired_plan_cannot_consume_a_durable_reservation_even_with_live_envelope(self):
         self.client.provider_ready.set()

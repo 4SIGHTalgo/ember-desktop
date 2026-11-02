@@ -186,8 +186,8 @@ window.EmberBoard = (() => {
         const reference = outcome.reference_windows ? outcome.reference_windows[confidence] : outcome.reference_window;
         const referenceOpen = reference?.status === 'open' && finite(currentEV) && currentEV > 1e-9;
         ev.append(node('span', 'small', !current ? 'Stale / unavailable quote or score' : reference ?
-          reference.status === 'cancelled' ? 'Expired · conservative EV decreased or contract ended' :
-          referenceOpen ? 'Entry open · frozen pre-set conservative reference' : 'Waiting · positive non-decreasing conservative EV required' :
+          reference.status === 'cancelled' ? 'Expired · conservative EV rose, fell to zero, or the contract ended' :
+          referenceOpen ? 'Entry open · frozen pre-set conservative reference' : 'Waiting · positive conservative EV at the set anchor required' :
           !outcome.reference_windows && outcome.entry_open === true ? 'Entry open' : 'Entry closed · midgame estimate when available'));
         row.append(label, node('span', 'offer-price', `${price(outcome.decimal_odds)}${current ? '' : ' · last'}`), ev); offers.append(row);
       }

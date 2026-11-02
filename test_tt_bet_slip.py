@@ -191,6 +191,28 @@ class PlanExecutionBrowserTests(unittest.TestCase):
         self.assertEqual(self.driver.execute_script("return window.nativeClicks"), 1)
         self.assertEqual(self.driver.execute_script("return window.submitClicks"), 1)
 
+    def test_rehearsal_arms_the_authorized_stake_in_the_slip_then_clears_it_without_a_click(self):
+        original, armed = self.driver.execute_script, []
+
+        def rehearsal(script, *args):
+            # The client's rehearsal guard: a confirm script never reaches the page.
+            if script == execution.CONFIRM_PLAN_SCRIPT:
+                armed.append(original("return document.querySelector('[data-testid=betslip-wager-box-input]').value"))
+                return {"status": "aborted", "reason": "rehearsal: the authorized stake is armed; no wager was submitted"}
+            return original(script, *args)
+        self.driver.execute_script = rehearsal
+        try:
+            result = execution.place_plan(self.driver, bet_event(), self.market(), self.plan(), self.outcome(),
+                                          authorize_values=lambda quote: {"stake": 2.61, "min_decimal": 2.0, "echo": "e1"})
+        finally:
+            self.driver.execute_script = original
+        self.assertEqual(armed, ["2.61"])
+        self.assertEqual(result["submissionState"], "not-submitted")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(self.driver.execute_script("return window.submitClicks"), 0)
+        self.assertIn(self.driver.execute_script(
+            "return document.querySelector('[data-testid=betslip-wager-box-input]').value"), ("", "0", "0.00"))
+
     def test_place_plan_never_submits_when_the_server_withholds_the_stake(self):
         result = execution.place_plan(self.driver, bet_event(), self.market(), self.plan(),
                                       self.outcome(), authorize_values=lambda quote: {"denied": "signal_expired"})
@@ -198,6 +220,20 @@ class PlanExecutionBrowserTests(unittest.TestCase):
         self.assertEqual(result["denied"], "signal_expired")
         self.assertEqual(self.driver.execute_script("return window.submitClicks"), 0)
         self.assertEqual(self.driver.execute_script("return window.nativeClicks"), 1)
+
+    def test_scoreboard_and_error_page_reads_are_single_bounded_scripts(self):
+        # One command per identity check, never the whole visible page text of a large live page.
+        texts = self.driver.execute_script(execution.SCOREBOARD_TEXT_SCRIPT)
+        self.assertTrue(any("Piotr Zemla" in text for text in texts))
+        self.driver.execute_script("document.querySelector('.cms-event-scoreboard-container').style.visibility='hidden'")
+        self.assertEqual(self.driver.execute_script(execution.SCOREBOARD_TEXT_SCRIPT), [])  # Hidden panels never identify.
+        self.driver.execute_script("document.querySelector('.cms-event-scoreboard-container').style.visibility=''")
+        self.driver.execute_script("document.title='Fixture';document.body.insertAdjacentHTML('beforeend','<p>Too Many Requests</p>')")
+        self.assertIn("Too Many Requests", self.driver.execute_script(execution.ERROR_PAGE_TEXT_SCRIPT))
+        self.driver.execute_script("const box=document.createElement('div');box.id='bulk';"
+                                   "for(let i=0;i<1600;i++)box.appendChild(document.createElement('span'));document.body.appendChild(box)")
+        self.addCleanup(self.driver.execute_script, "document.getElementById('bulk')?.remove()")
+        self.assertEqual(self.driver.execute_script(execution.ERROR_PAGE_TEXT_SCRIPT), "Fixture")  # A large page: title only.
 
 
 if __name__ == "__main__":

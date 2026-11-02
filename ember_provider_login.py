@@ -5,18 +5,29 @@ from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowEx
 
 from draftkings_login import LOGIN_URL, SPORTSBOOK_URL
 from driver_lifecycle import DriverConnectionLost, connection_lost as browser_connection_lost
+from ember_navigation import NavigationPending
 
 
-PROVIDER_STATE_SCRIPT = r"""
+# Exactly the per-element ancestor-style walk, but each ancestor's result is shared within one
+# synchronous pass (these scripts never mutate the DOM): the unshared walk was ~90 ms of every
+# ~105 ms idle poll on a live 7.5k-node event page (2026-10-27) and grows with page size.
+VISIBLE_JS = r"""
+const shownChain=new Map();
+const chainShown=p=>{if(!p)return true;let v=shownChain.get(p);if(v===undefined){const s=getComputedStyle(p);
+    v=!(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)&&chainShown(p.parentElement);shownChain.set(p,v);}return v;};
+const visible=e=>!!e?.getClientRects().length&&chainShown(e);
+"""
+
+PROVIDER_STATE_SCRIPT = VISIBLE_JS + r"""
 const cfg=arguments[0];
 const providerPage=location.hostname===new URL(cfg.origin).hostname||location.hostname.endsWith('.draftkings.com');
-const visible=e=>{if(!e?.getClientRects().length)return false;for(let p=e;p;p=p.parentElement){
-    const s=getComputedStyle(p);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)return false;}return true;};
 const text=e=>(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim();
 const form=providerPage&&[...document.querySelectorAll('#login-username-input,#login-password-input,input[type="password"]')].some(visible);
 const verification=providerPage&&[...document.querySelectorAll('input[autocomplete="one-time-code"],input[id^="otc-input-"],[data-testid="otp-options-container"],[data-testid="verify-phone-number-screen"],iframe[title*="challenge" i]')].some(visible);
-const login=[...document.querySelectorAll('button,a,[role="button"],span,div')].filter(visible)
-    .some(e=>/^(?:sign\s*up\s*(?:or|\/)\s*)?(?:log\s*in|sign\s*in)$/i.test(text(e)));
+// Same verdict as checking every element: rendered text that is exactly a login label is also in its
+// textContent, so the layout-free textContent test runs first (live 10/31 the full walk took 250-500 ms).
+const login=[...document.querySelectorAll('button,a,[role="button"],span,div')].filter(e=>/log\s*in|sign\s*in/i.test(e.textContent||''))
+    .filter(visible).some(e=>/^(?:sign\s*up\s*(?:or|\/)\s*)?(?:log\s*in|sign\s*in)$/i.test(text(e)));
 const origin=location.origin===cfg.origin;
 const signedIn=origin&&window.__isLoggedIn===true&&!form&&!verification&&!login;
 const native=window.__playSpan?.playSpan;
@@ -28,11 +39,9 @@ return {on_sportsbook:origin,provider_page:providerPage,document_ready:document.
     native_wagering_grant:origin&&!!(native?.clientKey&&native.grantType==='PlaySportsbook')};
 """
 
-OPEN_LOGIN_SCRIPT = r"""
+OPEN_LOGIN_SCRIPT = VISIBLE_JS + r"""
 const cfg=arguments[0];
 if(location.origin!==cfg.origin)return {status:'waiting'};
-const visible=e=>{if(!e?.getClientRects().length)return false;for(let p=e;p;p=p.parentElement){
-    const s=getComputedStyle(p);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)return false;}return true;};
 if([...document.querySelectorAll('#login-username-input,input[type="password"],input[autocomplete="one-time-code"],input[id^="otc-input-"]')].some(visible))
     return {status:'already-open'};
 const matches=[...document.querySelectorAll('button,a,[role="button"],span,div')].filter(visible)
@@ -53,6 +62,13 @@ def provider_state(driver):
         current = driver.current_window_handle
     except NoSuchWindowException:
         current = None
+    # Ember's own match tabs share one DraftKings session; reading every one multiplied each idle
+    # poll and left the driver on the last tab. Other windows (sign-in popups) are still read, and
+    # the working tab is read last so it stays current when it is the authenticated one.
+    own = getattr(driver, "_ember_tabs", None)
+    every, working = list(handles), current
+    if isinstance(own, dict) and current in handles:
+        handles = [handle for handle in handles if handle != current and handle not in own]+[current]
     fallback = authenticated = pending = None
     for handle in handles:
         try:
@@ -73,6 +89,11 @@ def provider_state(driver):
             continue
         except (InvalidSessionIdException, DriverConnectionLost):
             raise
+        except NavigationPending:
+            # The working tab is loading a new page: read the other match tabs instead of waiting on it.
+            if handle == working and isinstance(own, dict):
+                handles.extend(other for other in every if other in own and other not in handles)
+            continue
         except WebDriverException as error:
             if browser_connection_lost(error):
                 raise
@@ -114,7 +135,9 @@ class ProviderLoginGate:
             self.open_requested = False
             ready = bool(state.get("provider_can_bet") and state.get("native_wagering_grant") and not location.get("blocked") and self.active())
             if self.recheck is not None and self.recheck.report.get('attempted'):
-                ready = ready and state.get('document_ready') is True and self.clock() >= self.recheck.hold_until
+                # A DK page may stay 'interactive' long after it settled; past the bound, native evidence decides.
+                settled = state.get('document_ready') is True or self.clock() >= self.recheck.settle_until
+                ready = ready and settled and self.clock() >= self.recheck.hold_until
                 if ready:
                     self.recheck.permission_observed()
             phase = "ready" if ready else "awaiting_location"

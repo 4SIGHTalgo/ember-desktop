@@ -23,8 +23,8 @@ class BoardValidationTests(unittest.TestCase):
         original={'board':board()}
         outcome=original['board']['events'][0]['markets'][0]['outcomes'][0]
         outcome.update(entry_open=False,reference_windows={
-            '90':{'kind':'pregame_non_decreasing','key':'a'*64,'status':'cancelled'},
-            '95':{'kind':'pregame_non_decreasing','key':'b'*64,'status':'open'}})
+            '90':{'kind':'pregame_non_increasing','key':'a'*64,'status':'cancelled'},
+            '95':{'kind':'pregame_non_increasing','key':'b'*64,'status':'open'}})
         validate_board(original['board'])
         for level,opened,key in (('conservative',False,'a'),('very_conservative',True,'b')):
             selected=display_board(original,level)['board']['events'][0]['markets'][0]['outcomes'][0]

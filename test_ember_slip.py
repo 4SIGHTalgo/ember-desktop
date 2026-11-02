@@ -204,6 +204,40 @@ class MultiLegBrowserTests(unittest.TestCase):
                 authorize or (lambda quote: {'stake': 2.61, 'min_decimal': 2.0, 'echo': 'fixture'}), validate,
                 deadline_budget=deadline_budget,observe_price=observe_price)
 
+    def test_a_card_still_fading_in_is_awaited_instead_of_aborting_the_plan(self):
+        # Live DK 2026-10-27: the new card is opacity 0 for ~300 ms and the quote read aborted the turn.
+        event, market, plan, outcome = contract(0)
+        config = {**plan_slip_config(event, market, plan, outcome), 'readOnly': True, 'timeoutMs': 250, 'fallbackMs': 20}
+        self.js("""const card=document.querySelector('section');card.style.opacity='0';
+            setTimeout(()=>card.style.opacity='1',150);""")
+        quote = self.driver.execute_async_script(execution.WAIT_FOR_PLAN_ARM_SCRIPT, config)
+        self.assertEqual(quote['status'], 'armed', quote)
+        self.js("document.querySelector('section').style.opacity='0'")
+        quote = self.driver.execute_async_script(execution.WAIT_FOR_PLAN_ARM_SCRIPT, config)
+        self.assertEqual((quote['status'], quote['notReady'], quote['reason']), ('aborted', True, 'hidden or unsupported leg controls'))
+        self.assertEqual(self.js('return window.actions'), [])
+
+    def test_payout_label_rendered_after_the_stake_write_is_not_a_contract_change(self):
+        # Live DK 2026-10-27: writing the stake adds "Payout: $x" to the card; every claim then aborted.
+        self.js("""for(const input of document.querySelectorAll('section input'))input.addEventListener('input',()=>{
+            const card=input.closest('section');let label=card.querySelector('[data-testid=regular-payout-label]');
+            if(!label){label=document.createElement('span');label.dataset.testid='regular-payout-label';card.appendChild(label);}
+            label.textContent='Payout: $'+(Number(input.value)*2.1).toFixed(2);});""")
+        result = self.run_plan()
+        self.assertEqual(result['status'], 'placed', result)
+        self.assertEqual(self.js('return window.actions[0].map(row=>row.tracking.selectionId)'), ['s1'])
+
+    def test_animated_pick_removal_is_reverified_until_the_slip_is_empty(self):
+        # DK animates a removed card out (0.3 s height transition) before it unmounts.
+        self.js("""for(const button of document.querySelectorAll('section [data-tracking]'))
+            button.onclick=()=>setTimeout(()=>button.closest('section').remove(),300);""")
+        event, market, plan, outcome = contract(0)
+        target = {'eventId': event['eventId'], 'marketId': market['marketId'], 'selectionId': outcome['selectionId']}
+        self.assertEqual(execution.prepare_single_slip(self.driver, target)['status'], 'waiting')
+        self.assertEqual(execution.clear_single_slip(self.driver, target)['status'], 'cleared')
+        self.assertEqual(self.js('return document.querySelectorAll("section").length'), 1)
+        self.assertEqual(self.js('return window.actions'), [])
+
     def test_reference_plan_removes_other_unfunded_picks_and_submits_one_exact_single(self):
         self.js("""window.removedPicks=[];for(const button of document.querySelectorAll('section [data-tracking]')){
             button.onclick=()=>{window.removedPicks.push(JSON.parse(button.dataset.tracking).selectionId);button.closest('section').remove();};} """)
@@ -217,23 +251,31 @@ class MultiLegBrowserTests(unittest.TestCase):
         self.assertEqual(self.js('return window.actions[0].map(row=>row.tracking.selectionId)'),['s1'])
         self.assert_unstaked()
 
-    def test_native_improvement_during_arming_is_observed_before_retry_and_later_decline_stops(self):
-        self.js("""for(const button of document.querySelectorAll('section [data-tracking]'))button.onclick=()=>button.closest('section').remove();
-            const card=document.querySelector('section');card.querySelector('input').addEventListener('input',()=>{
-                if(!window.improved){window.improved=true;card.querySelector('[data-testid=betslip-odds-standard]').textContent='+175';}});""")
+    def test_a_price_rise_during_arming_ends_the_window_and_a_fall_retries_then_places(self):
+        def move(odds):
+            self.js("""for(const button of document.querySelectorAll('section [data-tracking]'))button.onclick=()=>button.closest('section').remove();
+                const card=document.querySelector('section');card.querySelector('input').addEventListener('input',()=>{
+                    if(!window.moved){window.moved=true;card.querySelector('[data-testid=betslip-odds-standard]').textContent=arguments[0];}});""", odds)
+        move('+175')
         prices=[]
-        result=self.run_plan(plan_override={'window':{},'min_decimal':2.1},observe_price=lambda price:prices.append(price) or True)
-        self.assertEqual(result['submissionState'],'not-submitted',result)
-        self.assertTrue(result['retryable'],result)
-        self.assertEqual(prices,[2.1,2.75])
-        self.assert_unstaked()
-        self.js("document.querySelector('[data-testid=betslip-odds-standard]').textContent='+160'")
-        authorize=Mock()
-        result=self.run_plan(authorize=authorize,plan_override={'window':{},'min_decimal':2.75})
+        result=self.run_plan(plan_override={'window':{},'min_decimal':2.0},observe_price=lambda price:prices.append(price) or True)
         self.assertTrue(result['windowExpired'],result)
-        authorize.assert_not_called()
+        self.assertEqual(result['submissionState'],'not-submitted')
+        self.assertEqual(prices,[2.1,2.75])  # The rise is reported so the client expires the window too.
         self.assertEqual(self.js('return window.actions'),[])
         self.assert_unstaked()
+        self.reset()
+        move('+105')
+        prices.clear()
+        result=self.run_plan(plan_override={'window':{},'min_decimal':2.0},observe_price=lambda price:prices.append(price) or True)
+        self.assertEqual(result['submissionState'],'not-submitted',result)
+        self.assertTrue(result['retryable'],result)
+        self.assert_unstaked()
+        result=self.run_plan(plan_override={'window':{},'min_decimal':2.0},observe_price=lambda price:prices.append(price) or True)
+        self.assertEqual(result['status'],'placed',result)
+        self.assertEqual(prices[0],2.1)
+        self.assertTrue(all(price<=2.1 for price in prices))
+        self.assertEqual(self.js('return window.actions[0].map(row=>row.tracking.selectionId)'),['s1'])
 
     def assert_unstaked(self):
         self.assertTrue(self.js("return [...document.querySelectorAll('input')].every(e=>Number(e.value)===0)"))
@@ -268,8 +310,9 @@ class MultiLegBrowserTests(unittest.TestCase):
             card.querySelector('input').remove();card.querySelector('[data-testid="betslip-odds-standard"]').remove();
             card.append(document.createTextNode('SUSPENDED'));""")
 
-    def close_without_controls(self, indexes=(0,)):
-        self.native_tracking()
+    def close_without_controls(self, indexes=(0,), track=True):
+        if track:
+            self.native_tracking()
         self.js("""window.removedPicks=[];window.bulkRemovalClicks=0;window.keepClosed=false;
             const submit=document.querySelector('[data-testid="betslip-place-bet-button"]'),place=submit.onclick;
             const refresh=()=>submit.textContent=document.querySelector('[data-testid="betslip-icon-closed"]')?
@@ -286,6 +329,39 @@ class MultiLegBrowserTests(unittest.TestCase):
                     window.removedPicks.push(props.selection.selectionId);card.remove();refresh();};
             }
             refresh();""", list(indexes))
+
+    def test_pick_closed_at_submit_with_unchanged_cash_is_a_refusal_and_any_doubt_stays_uncertain(self):
+        # #702, user-approved 2026-10-30: DK answered Place Bet with PICK CLOSED, no receipt, no deduction.
+        cases = {'refused': (True, ''),
+                 'cash changed': (True, "document.getElementById('standardized-header-balance').textContent='$97.39'"),
+                 'older receipt visible': (True, None),
+                 'pick still open': (False, '')}
+        for name, (closes, after) in cases.items():
+            with self.subTest(case=name), patch.object(execution, 'CLOSED_PICK_SETTLE', .1), \
+                    patch.object(execution, 'CLOSED_PICK_REREAD', .05):
+                self.reset()
+                self.native_tracking()
+                self.js("window.mode='silent'")
+                if after is None:  # A receipt from an earlier wager is never this click's, nor proof of a refusal.
+                    self.js("""const receipt=document.createElement('div');receipt.dataset.testid='dk-betslip-receipt';
+                        receipt.textContent='Bet placed earlier';document.querySelector('[data-testid=betslip-content-wrapper]').prepend(receipt);""")
+                def answered(*args):
+                    if closes:
+                        self.close_without_controls(track=False)
+                    if after:
+                        self.js(after)
+                    return settle_submission(*args, timeout=.3)
+                with patch.object(execution, 'settle_submission', side_effect=answered):
+                    result = self.run_plan()
+                self.assertEqual(self.js('return window.actions.length'), 1)  # One click, never replayed.
+                if name == 'refused':
+                    self.assertEqual((result['status'], result['submissionState'], result['submitted'], result['retryable']),
+                                     ('not_placed', 'closed-not-placed', False, False), result)
+                    self.assertFalse(self.driver._tt_plan_uncertain)
+                    self.assert_unstaked()
+                else:
+                    self.assertEqual((result['status'], result['submissionState']), ('unconfirmed', 'uncertain'), result)
+                    self.assertTrue(self.driver._tt_plan_uncertain)
 
     def test_closed_native_pick_is_removed_before_another_exact_leg_is_claimed(self):
         self.close_without_controls()

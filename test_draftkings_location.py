@@ -64,6 +64,63 @@ class LocationRecheckTests(unittest.TestCase):
         link.click.assert_called_once()
         self.assertNotIn('fixture-secret',json.dumps(check.report))
 
+    def test_a_failure_that_stays_is_rechecked_with_backoff_and_permission_resets_it(self):
+        # Live 2026-10-28: one hung Recheck click, never retried, left wagering paused for 5 h.
+        now=[0]
+        driver,link=Mock(),Mock()
+        driver.execute_script.return_value={'status':'ready','link':link}
+        check=LocationRecheck(clock=lambda:now[0])
+        clicks=[]
+        with redirect_stdout(io.StringIO()):
+            for second in range(0,5401,30):
+                now[0]=second
+                if check.start(driver,{'state':'blocked'}):
+                    clicks.append(second)
+            # Hand schedule: gaps of 2, 4, 8 and 16 minutes, then every 30 minutes.
+            self.assertEqual(clicks,[0,120,360,840,1800,3600,5400])
+            self.assertEqual(check.report['attempts'],7)
+            now[0]=5401
+            self.assertFalse(check.start(driver,{'state':'unknown'}))  # Only a visible failure is rechecked.
+            check.permission_observed()
+            self.assertTrue(check.start(driver,{'state':'blocked'}))  # A new failure starts the schedule over.
+            now[0]=5401+119
+            self.assertFalse(check.start(driver,{'state':'blocked'}))
+        self.assertEqual(link.click.call_count,8)
+
+    def test_a_restored_attempt_waits_out_the_first_backoff_before_any_recheck(self):
+        now=[1000]
+        driver,link=Mock(),Mock()
+        driver.execute_script.return_value={'status':'ready','link':link}
+        check=LocationRecheck({'attempted':True,'status':'started'},clock=lambda:now[0])
+        now[0]=1119
+        self.assertFalse(check.start(driver,{'state':'blocked'}))
+        driver.execute_script.assert_not_called()
+        now[0]=1120
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(check.start(driver,{'state':'blocked'}))
+        link.click.assert_called_once()
+
+    def test_a_recheck_page_that_never_reports_complete_resumes_only_on_native_evidence(self):
+        from draftkings_location import RECHECK_SETTLE
+        healthy={'signed_in':True,'provider_can_bet':True,'native_wagering_grant':True,'document_ready':False}
+        clear=lambda _:{'state':'unknown','blocked':False}
+        for missing in (None,'provider_can_bet','native_wagering_grant'):
+            with self.subTest(missing=missing):
+                now=[0]
+                driver,link=Mock(),Mock()
+                driver.execute_script.return_value={'status':'ready','link':link}
+                check=LocationRecheck(clock=lambda:now[0])
+                gate=provider.ProviderLoginGate(clock=lambda:now[0],recheck=check)
+                state={**healthy,**({missing:False} if missing else {})}
+                with patch.object(provider,'provider_state',return_value=state),redirect_stdout(io.StringIO()):
+                    self.assertFalse(gate.poll(driver,lambda _:{'state':'blocked','blocked':True})['ready'])
+                    link.click.assert_called_once()
+                    now[0]=RECHECK_SETTLE-1
+                    self.assertFalse(gate.poll(driver,clear)['ready'])  # Still settling.
+                    now[0]=RECHECK_SETTLE
+                    self.assertEqual(gate.poll(driver,clear)['ready'],missing is None)
+                self.assertEqual(check.report['attempted'],missing is not None)
+
 
 class LocationRecheckBrowserTests(unittest.TestCase):
     @classmethod

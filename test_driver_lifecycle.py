@@ -5,10 +5,29 @@ import http.client
 import threading
 import time
 import unittest
+from unittest.mock import Mock
 from urllib.parse import urlsplit
 
 from selenium.webdriver.chrome.options import Options
+from urllib3.exceptions import MaxRetryError
+import driver_lifecycle as lifecycle
 from driver_lifecycle import create_owned_chrome, DriverConnectionLost
+
+
+class ConnectionGuardTests(unittest.TestCase):
+    def test_timing_observer_sees_every_command_and_can_never_change_its_outcome(self):
+        delegate, seen = Mock(), []
+        delegate.execute.side_effect = [{"value": 1}, MaxRetryError(None, "http://localhost/", OSError("down"))]
+        executor = lifecycle._GuardedExecutor(delegate, Mock())
+        executor.observer = lambda command, params, seconds: seen.append((command, params, seconds)) or 1/0
+        self.assertEqual(executor.execute("getCurrentUrl", {}), {"value": 1})
+        with self.assertRaises(lifecycle.DriverConnectionLost):
+            executor.execute("w3cExecuteScript", {"script": "x"})
+        with self.assertRaises(lifecycle.DriverConnectionLost):
+            executor.execute("getTitle", {})  # Poisoned: refused before dispatch, so never timed.
+        self.assertEqual([(c, p) for c, p, _ in seen], [("getCurrentUrl", {}), ("w3cExecuteScript", {"script": "x"})])
+        self.assertTrue(all(isinstance(s, float) and s >= 0 for _, _, s in seen))
+        self.assertEqual(delegate.execute.call_count, 2)
 
 
 class TransportFenceTests(unittest.TestCase):

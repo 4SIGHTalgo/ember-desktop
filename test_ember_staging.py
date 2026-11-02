@@ -44,6 +44,25 @@ class StagingTests(unittest.TestCase):
                                 self.hints if hints is None else hints,
                                 lambda: valid, time.time(), focus=focus)
 
+    def test_signal_add_waits_for_the_clicked_leg_to_land_and_never_clicks_twice(self):
+        signal = fixtures.fixture_signals()[0]
+        event, market = signal['payload']['event'], signal['payload']['market']
+        outcome = market['outcomes'][0]
+        leg = {'eventId': event['eventId'], 'marketId': market['marketId'], 'selectionId': outcome['selectionId']}
+        empty = {'status': 'empty', 'stagingSafe': True, 'legs': []}
+        self.reader.side_effect = [empty, empty, empty, {'status': 'present', 'stagingSafe': True, 'legs': [leg]}]
+        with patch('ember_staging.time.sleep'):
+            result = self.stager.add(self.driver, self.core, event, market, outcome, lambda: True, .3, landing=.75)
+        self.assertEqual(result, {'status': 'clicked', 'landed': True})
+        self.core.click_selection.assert_called_once()
+        self.reader.side_effect = None
+        self.reader.return_value = empty
+        self.core.click_selection.reset_mock()
+        with patch('ember_staging.time.sleep'):
+            self.assertEqual(self.stager.add(self.driver, self.core, event, market, outcome, lambda: True, .3, landing=.05),
+                             {'status': 'clicked'})
+        self.core.click_selection.assert_called_once()
+
     def test_one_native_selection_per_tick_and_round_robin_across_failed_events(self):
         self.readiness.prepare.return_value = {'status': 'not_ready'}
         self.step()
@@ -183,6 +202,22 @@ class StagingBrowserTests(unittest.TestCase):
         options.add_argument('--window-size=1400,1000')
         cls.driver = create_owned_chrome(options)
         cls.addClassCleanup(cls.driver.quit)
+
+    def test_a_slowly_rendered_leg_is_awaited_so_the_plan_reuses_it_without_a_second_click(self):
+        driver = self.driver
+        driver.get(f'http://127.0.0.1:{self.server.server_port}/event/fixture/100')
+        # Live DK: the slip card and pressed styling appear a few hundred ms after the click.
+        driver.execute_script("""document.querySelectorAll("section").forEach(e=>e.remove());window.renderRows(0);
+            for(const b of document.querySelectorAll('#rows button')){const original=b.onclick;
+                b.onclick=event=>{const trusted=event.isTrusted;setTimeout(()=>original({isTrusted:trusted}),300);};}""")
+        signal = self.signals[0]
+        event, market = signal['payload']['event'], signal['payload']['market']
+        outcome = next(row for row in market['outcomes'] if row['selectionId'] == signal['payload']['plan']['selectionId'])
+        with patch.object(execution, 'correct_event', side_effect=fixtures.local_identity):
+            result = Staging().add(driver, execution, event, market, outcome, lambda: True, .3, landing=.75)
+        self.assertEqual((result['status'], result.get('landed')), ('clicked', True))
+        self.assertTrue(execution.plan_slip_ready(driver, event, market, signal['payload']['plan']))
+        self.assertEqual(len(driver.execute_script('return window.selectionClicks')), 1)
 
     def test_all_matches_stage_natively_at_zero_stake_and_survive_hint_expiry(self):
         driver = self.driver

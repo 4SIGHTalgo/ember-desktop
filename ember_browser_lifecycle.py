@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 from urllib.parse import urlsplit
 
 import psutil
@@ -25,6 +26,14 @@ import websocket
 from selenium.webdriver.chrome.options import Options
 
 from driver_lifecycle import close_owned_driver, create_owned_chrome
+from ember_navigation import NavigationGate, NavigationPending
+
+# DK's own scripts held the page's main thread 11-19 s in one task chain (CMS index.js, live
+# 2026-10-28), and a reattach then waited out the same stall (attach 10-56 s): waiting the stall
+# out is shorter than a recovery. Kept under ChromeDriver's 30 s script timeout; wager scripts
+# still abort themselves on their in-browser deadline however long the command was held.
+COMMAND_TIMEOUT = 25
+OWN_MODULES = ("ember_", "tt_", "draftkings_", "driver_lifecycle", "wager_", "execution_", "test_ember")
 
 
 class BrowserClosed(RuntimeError):
@@ -146,8 +155,11 @@ class LifecycleLog:
     def __init__(self, path):
         self.path = Path(path)
 
-    def record(self, event, *, error=None, exit_code=None, attempt=None, stage=None, activity=None):
+    def record(self, event, *, error=None, exit_code=None, attempt=None, stage=None, activity=None, phases=None):
         row = {"at": datetime.now(timezone.utc).isoformat(), "event": event[:60]}
+        if isinstance(phases, dict):  # Attach timing in milliseconds; numbers only.
+            row["phases_ms"] = {str(key)[:24]: round(value) for key, value in phases.items()
+                                if type(value) in (int, float) and math.isfinite(value)}
         if error is not None:
             row["error_type"] = type(error).__name__[:80]
             for key in ('command', 'transport_error', 'elapsed_ms', 'driver_alive'):
@@ -156,6 +168,9 @@ class LifecycleLog:
                     row[key] = value[:80]
                 elif type(value) in (int, float, bool):
                     row[key] = value
+            where = code_location(error)
+            if where:
+                row["where"] = where
         if type(exit_code) is int:
             row["exit_code"] = exit_code
         if type(attempt) is int:
@@ -164,16 +179,78 @@ class LifecycleLog:
             row["stage"] = stage[:60]
         if activity is not None:
             # Only the caller's own short operation label; never DOM or error text.
-            label = str(activity).encode("ascii", "ignore").decode("ascii")[:80].strip()
+            label = ascii_label(activity)
             if label:
                 row["activity"] = label
-        try:
-            if self.path.exists() and self.path.stat().st_size > 256_000:
-                os.replace(self.path, self.path.with_suffix(".previous.jsonl"))
-            with self.path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(row, allow_nan=False)+"\n")
-        except OSError:
-            pass  # Diagnostic storage cannot stop a healthy browser.
+        append_row(self.path, row)
+
+
+def append_row(path, row):
+    try:
+        if path.exists() and path.stat().st_size > 256_000:
+            os.replace(path, path.with_suffix(".previous.jsonl"))
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, allow_nan=False)+"\n")
+    except OSError:
+        pass  # Diagnostic storage cannot stop a healthy browser.
+
+
+def ascii_label(value, limit=80):
+    return str(value).encode("ascii", "ignore").decode("ascii")[:limit].strip()
+
+
+def code_location(error):
+    """Which of our calls raised: code location only, never arguments, DOM or error text.
+
+    Matched by module name, since a packaged worker's frames carry build-time paths.
+    """
+    frames = [frame for frame in traceback.extract_tb(error.__traceback__)
+              if Path(frame.filename).stem.startswith(OWN_MODULES)] if error.__traceback__ else []
+    return [ascii_label(f"{Path(frame.filename).stem}:{frame.lineno}:{frame.name}") for frame in frames[-3:]]
+
+
+class CommandLog:
+    """Per-driver-command timing: which of our commands held the page, never its arguments or results.
+
+    A row per command slower than SLOW_MS, plus a per-minute total of driver
+    busy time by label, separates our own command load from site or driver stalls.
+    """
+    SLOW_MS = 250
+
+    def __init__(self, path, clock=time.monotonic):
+        self.path, self.clock = Path(path), clock
+        self.names, self.activity = {}, lambda: None
+        self.minute, self.since = {}, clock()
+
+    def label(self, command, params):
+        script = params.get("script") if isinstance(params, dict) else None
+        if not isinstance(script, str):
+            return ascii_label(command, 40)
+        name = self.names.get(id(script))
+        if name:
+            return name
+        if script.startswith("/* ") and "*/" in script[:40]:  # Selenium's named atoms, e.g. isDisplayed.
+            return ascii_label(script[3:script.index("*/")], 40)
+        return "inline:" + hashlib.sha256(script.encode()).hexdigest()[:10]
+
+    def __call__(self, command, params, seconds):
+        label, ms = self.label(command, params), round(1000*seconds, 1)
+        row = self.minute.setdefault(label, [0, 0.0, 0.0])
+        row[0] += 1
+        row[1] += ms
+        row[2] = max(row[2], ms)
+        now = datetime.now(timezone.utc).isoformat()
+        if ms >= self.SLOW_MS:
+            activity = self.activity()
+            append_row(self.path, {"at": now, "event": "slow_command", "command": ascii_label(command, 40),
+                                   "label": label, "ms": ms, **({"activity": ascii_label(activity)} if activity else {})})
+        if self.clock()-self.since >= 60:
+            top = sorted(self.minute.items(), key=lambda item: -item[1][1])[:10]
+            append_row(self.path, {"at": now, "event": "command_minute", "seconds": round(self.clock()-self.since, 1),
+                                   "commands": sum(r[0] for r in self.minute.values()),
+                                   "busy_ms": round(sum(r[1] for r in self.minute.values())),
+                                   "top": [[name, r[0], round(r[1]), round(r[2])] for name, r in top]})
+            self.minute, self.since = {}, self.clock()
 
 
 class ActiveSessionPower:
@@ -264,6 +341,7 @@ class OwnedBrowser:
             raise ValueError("Browser profile must remain inside the app data directory")
         self.lease = ProfileLease(self.folder/"owner.lock")
         self.log = LifecycleLog(self.data_dir/"browser-lifecycle.jsonl")
+        self.commands = CommandLog(self.data_dir/"driver-commands.jsonl", clock)
         self.state_path = self.folder/"browser.json"
         self.session = requests.Session()
         self.session.trust_env = False  # A system proxy must never receive local CDP traffic.
@@ -277,6 +355,7 @@ class OwnedBrowser:
         self.headless, self.binary = headless, binary
         self.resume, self.initialized, self.closed = resume, False, False
         self.ever_open = False
+        self.adopted = False  # The process came from an earlier session, not from this owner's launch.
         self.launched_at = None
         self.reload_page = False
         self.exit_code = None
@@ -338,6 +417,7 @@ class OwnedBrowser:
         self._dispose_stale_driver()
         if owners:
             self.process = owners[0]
+            self.adopted = True
             self.created = self.process.create_time()
             self.auto_port = argument(self.process.cmdline(), "--remote-debugging-port") == "0"
             self.exit_witness = ProcessExitWitness(self.process.pid)
@@ -390,6 +470,7 @@ class OwnedBrowser:
             arguments[1:1] = ["--headless=new", "--window-size=1280,900"]
         self.log.record("browser_launch")
         self.launched_at = self.clock()
+        self.adopted = False
         self.process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             start_new_session=os.name != "nt")
@@ -474,11 +555,13 @@ class OwnedBrowser:
         except (OSError, ValueError, KeyError, TypeError, requests.RequestException, BrowserWaiting):
             return {"state": "waiting"}
 
-    def open(self, active):
+    def open(self, active, prefer=None):
         if self.closed:
             raise BrowserClosed("browser_closed")
         if not active():
             raise BrowserCancelled()
+        mark = time.monotonic()
+        phases = {}
         self.lease.acquire()
         if not self.initialized:
             self._restore()
@@ -501,6 +584,15 @@ class OwnedBrowser:
                     self.exit_witness = ProcessExitWitness(self.process.pid)
                     continue
                 if inspection["state"] in {"closed", "unknown"}:
+                    if self.adopted and not self.ever_open and not (self.retained or self.resume):
+                        # Live 2026-10-28: a Start 10 s after Stop adopted that session's still-exiting
+                        # browser; its exit is no close of this new explicit Start, so launch a fresh one.
+                        if self.exit_witness:
+                            self.exit_witness.close()
+                        self.process = self.exit_witness = None
+                        self._spawn(active)
+                        deadline = self.clock()+20
+                        continue
                     self.closed = True
                     raise BrowserClosed("browser_closed")
                 raise BrowserWaiting("browser_start_failed")
@@ -510,6 +602,7 @@ class OwnedBrowser:
         else:
             raise BrowserCancelled()
         self._state()
+        phases["browser"], mark = 1000*(time.monotonic()-mark), time.monotonic()
         options = Options()
         options.page_load_strategy = "none"
         options.add_experimental_option("debuggerAddress", f"127.0.0.1:{self.port}")
@@ -518,10 +611,14 @@ class OwnedBrowser:
         # below deliberately never sends session quit/Browser.close instead.
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         self.driver = create_owned_chrome(options, preserve_external_browser=True)
+        self.driver.command_guard.observer = self.commands
+        self.driver.command_guard.gate = NavigationGate(self.driver.command_guard, settled=lambda ms, refused: self.log.record(
+            "navigation_settled", phases={"load": ms, "refused_commands": refused}))
+        phases["driver"], mark = 1000*(time.monotonic()-mark), time.monotonic()
         self.driver_identity = {"pid": self.driver.service.process.pid,
             "created": psutil.Process(self.driver.service.process.pid).create_time(), "port": self.driver.service.port}
         self._state()
-        self.driver.command_executor.client_config.timeout = 5
+        self.driver.command_executor.client_config.timeout = COMMAND_TIMEOUT  # See COMMAND_TIMEOUT.
         if not active():
             self.detach()
             raise BrowserCancelled()
@@ -531,8 +628,11 @@ class OwnedBrowser:
             self.closed = True
             raise BrowserClosed("browser_windows_closed")
         # A replacement WebDriver session must select a current handle instead
-        # of retaining an already-destroyed default target from attachment.
-        self.driver.switch_to.window(handles[0])
+        # of retaining an already-destroyed default target from attachment. Selecting a window
+        # activates it, and a DK tab activated after a while in the background held its main
+        # thread 10-12 s (live 2026-10-28): resume in the tab Ember last worked in, or every
+        # recovery flips tabs and trips the next command timeout.
+        self.driver.switch_to.window(prefer if prefer in handles else handles[0])
         if self.reload_page:
             from draftkings_login import TT_ELITE_URL
             route = urlsplit(self.driver.current_url)
@@ -541,7 +641,16 @@ class OwnedBrowser:
                 route.path.startswith('/event/') or route.path.rstrip('/') == league.path.rstrip('/'))
             self.driver.get(self.driver.current_url if safe else TT_ELITE_URL)
             self.reload_page = False
-        self.log.record("driver_attached")
+            while True:  # Attach is not done until the new page commits; a refusal here is not a fault.
+                try:
+                    self.driver.current_url
+                    break
+                except NavigationPending:
+                    if not active():
+                        self.detach()
+                        raise BrowserCancelled() from None
+        phases["select"] = 1000*(time.monotonic()-mark)
+        self.log.record("driver_attached", phases=phases)
         return self.driver
 
     def detach(self):

@@ -18,10 +18,13 @@ from unittest.mock import Mock, patch
 
 import websocket
 import psutil
-from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
+from selenium.common.exceptions import InvalidSessionIdException, TimeoutException, WebDriverException
 
-from ember_browser_lifecycle import BrowserCancelled, BrowserClosed, BrowserWaiting, LifecycleLog, OwnedBrowser, ProcessExitWitness, ProfileLease
+from ember_browser_lifecycle import (BrowserCancelled, BrowserClosed, BrowserWaiting, CommandLog, LifecycleLog, OwnedBrowser,
+                                     ProcessExitWitness, ProfileLease)
 from ember_client import Client, Ledger
+from ember_navigation import NavigationPending
+import hashlib
 
 
 def test_directory():
@@ -81,6 +84,27 @@ class BrowserLifecycleTests(unittest.TestCase):
                 self.browser.open(lambda: True)
         launch.assert_not_called()
 
+    def test_a_previous_sessions_browser_still_exiting_is_replaced_on_an_explicit_start(self):
+        # Live 2026-10-28 11:44: a Start 10 s after Stop adopted the exiting browser and stopped as a close.
+        exiting = Mock(pid=4242)
+        exiting.create_time.return_value = 1.0
+        exiting.cmdline.return_value = []
+        class Spawned(Exception):
+            pass
+        cases = ((self.browser, False, Spawned), (OwnedBrowser(self.directory, ("https://example.com", "resumed"), resume=True), False, BrowserClosed),
+                 (OwnedBrowser(self.directory, ("https://example.com", "seen")), True, BrowserClosed))
+        for browser, seen, expected in cases:
+            with self.subTest(resume=browser.resume, seen=seen):
+                self.addCleanup(browser.release)
+                browser.ever_open = seen  # A browser this owner saw open, then closed, is a human close.
+                with patch.object(browser, "_owners", return_value=[exiting]), patch("ember_browser_lifecycle.ProcessExitWitness"), \
+                        patch.object(browser, "inspect", return_value={"state": "closed", "pages": 0}), \
+                        patch.object(browser, "_spawn", side_effect=Spawned) as launch:
+                    with self.assertRaises(expected):
+                        browser.open(lambda: True)
+                self.assertEqual(launch.call_count, 1 if expected is Spawned else 0)
+                self.assertEqual(browser.closed, expected is BrowserClosed)
+
     def test_clean_and_unknown_exits_stop_while_abnormal_exit_permits_browser_restart(self):
         for state, code, expected in (("closed", 0, "closed"), ("unknown", None, "closed"), ("crashed", 0xC0000005, "browser_restart")):
             self.browser.closed = False
@@ -130,6 +154,12 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertNotIn("activity", rows[0])
         self.assertEqual(rows[1]["activity"], "prparer:100")
 
+    def test_attach_phases_record_finite_numbers_only(self):
+        path = self.directory/"diagnostics.jsonl"
+        LifecycleLog(path).record("driver_attached", phases={"browser": 12.6, "driver": float("nan"), "select": "secret-text",
+                                                             "x"*40: 1})
+        self.assertEqual(json.loads(path.read_text())["phases_ms"], {"browser": 13, "x"*24: 1})
+
     def test_recovery_journals_the_last_activity_with_the_fault(self):
         self.browser.process = Mock()
         with patch.object(self.browser, "inspect", return_value={"state": "waiting"}):
@@ -138,6 +168,47 @@ class BrowserLifecycleTests(unittest.TestCase):
         row = json.loads((self.directory/"browser-lifecycle.jsonl").read_text().splitlines()[-1])
         self.assertEqual(row["event"], "browser_fault")
         self.assertEqual(row["activity"], "prepare:100")
+
+    def test_a_fault_records_which_of_our_calls_raised_but_never_its_message(self):
+        def provider_page():
+            raise TimeoutException("timeout: secret-fixture-text")
+        try:
+            provider_page()
+        except TimeoutException as error:
+            LifecycleLog(self.directory/"faults.jsonl").record("browser_fault", error=error)
+        text = (self.directory/"faults.jsonl").read_text()
+        self.assertNotIn("secret-fixture-text", text)
+        where = json.loads(text)["where"]
+        self.assertEqual(where[-1].split(":")[0::2], ["test_ember_browser_lifecycle", "provider_page"])
+        LifecycleLog(self.directory/"plain.jsonl").record("browser_fault", error=WebDriverException("never raised"))
+        self.assertNotIn("where", json.loads((self.directory/"plain.jsonl").read_text()))
+
+    def test_command_log_names_slow_commands_and_totals_a_minute_without_arguments(self):
+        clock = [0.0]
+        path = self.directory/"driver-commands.jsonl"
+        log = CommandLog(path, clock=lambda: clock[0])
+        named, secret = "return 1", "return 'secret-fixture-value'"
+        log.names, log.activity = {id(named): "READ_SLIP_SCRIPT"}, lambda: "prepare:100"
+        log("w3cExecuteScript", {"script": named, "args": ["secret-arg"]}, .1)  # Fast: totalled, not listed.
+        log("w3cExecuteScript", {"script": named, "args": []}, .3)
+        log("w3cExecuteScript", {"script": secret, "args": []}, .5)
+        log("w3cExecuteScript", {"script": "/* isDisplayed */return (function(){})", "args": []}, .25)
+        clock[0] = 61
+        log("getCurrentUrl", {}, .01)
+        content = path.read_text()
+        for private in ("secret-fixture-value", "secret-arg"):
+            self.assertNotIn(private, content)
+        rows = [json.loads(line) for line in content.splitlines()]
+        self.assertEqual([(r["label"], r["ms"], r["activity"]) for r in rows if r["event"] == "slow_command"],
+                         [("READ_SLIP_SCRIPT", 300.0, "prepare:100"),
+                          ("inline:" + hashlib.sha256(secret.encode()).hexdigest()[:10], 500.0, "prepare:100"),
+                          ("isDisplayed", 250.0, "prepare:100")])
+        minute = rows[-1]
+        self.assertEqual((minute["event"], minute["commands"], minute["busy_ms"]), ("command_minute", 5, 1160))
+        self.assertEqual(minute["top"][0], ["inline:" + hashlib.sha256(secret.encode()).hexdigest()[:10], 1, 500, 500])
+        self.assertEqual(minute["top"][1], ["READ_SLIP_SCRIPT", 2, 400, 300])
+        log("getCurrentUrl", {}, .01)  # A new window starts after each minute row.
+        self.assertEqual(len(path.read_text().splitlines()), len(rows))
 
     def test_stale_driver_cleanup_requires_exact_process_creation_and_driver_port(self):
         process = Mock()
@@ -530,6 +601,8 @@ class LocalFixture(BaseHTTPRequestHandler):
             pass  # Expected when the owned browser is deliberately crashed.
 
     def do_GET(self):
+        if self.path.startswith("/slow"):
+            time.sleep(3)  # A document that commits well after the navigation gate's brief wait.
         content = b'<!doctype html><title>Owned recovery fixture</title><button onclick="window.wagerClicks++">Fixture only</button><script>window.wagerClicks=0;</script>'
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -568,10 +641,43 @@ class OwnedBrowserFaultTests(unittest.TestCase):
     def wait(self, predicate):
         deadline = time.monotonic()+8
         while time.monotonic() < deadline:
-            if predicate():
-                return
+            try:
+                if predicate():
+                    return
+            except NavigationPending:
+                pass  # The fixture page has not committed yet; the command was not sent.
             time.sleep(.1)
         self.fail("Owned fixture did not reach the expected state")
+
+    def test_a_reattach_resumes_in_the_preferred_tab_instead_of_flipping_to_the_first_handle(self):
+        # Live 2026-10-28: each recovery reselected handles[0], re-activating a background DK tab whose
+        # 10-12 s wake-up tripped the next command timeout, so recovery looped every ~15 s.
+        first = self.driver.current_window_handle
+        self.driver.switch_to.new_window("tab")
+        self.driver.get(self.url+"second")
+        second = self.driver.current_window_handle
+        for prefer in (first, second, second):
+            self.browser.detach()
+            self.driver = self.browser.open(lambda: True, prefer=prefer)
+            self.assertEqual(self.driver.current_window_handle, prefer)
+        self.browser.detach()
+        self.driver = self.browser.open(lambda: True, prefer="closed-handle")
+        self.assertEqual(self.driver.current_window_handle, self.driver.window_handles[0])
+        self.wait(lambda: self.driver.execute_script("return window.wagerClicks") == 0)
+
+    def test_a_renderer_reload_attach_returns_only_after_its_navigation_commits(self):
+        # A refused command right after attach used to escape as a browser fault and force another recovery.
+        self.browser.detach()
+        self.browser.reload_page = True
+        with patch("draftkings_login.TT_ELITE_URL", self.url+"slow-league"):
+            self.driver = self.browser.open(lambda: True)
+        self.assertEqual(self.driver.execute_script("return location.pathname"), "/slow-league")
+        self.assertEqual(self.driver.command_guard.gate.pending, {})
+        rows = [json.loads(line) for line in (self.directory/"browser-lifecycle.jsonl").read_text().splitlines()]
+        settled, attached = rows[-2:]  # setUp's own fixture load settles earlier in the log.
+        self.assertEqual((settled["event"], attached["event"]), ("navigation_settled", "driver_attached"))
+        self.assertGreaterEqual(settled["phases_ms"]["refused_commands"], 1)
+        self.assertGreaterEqual(settled["phases_ms"]["load"], 2000)
 
     def crash_browser(self):
         connection = websocket.create_connection(f"ws://127.0.0.1:{self.browser.port}{self.browser.endpoint}",
@@ -584,6 +690,16 @@ class OwnedBrowserFaultTests(unittest.TestCase):
                 pass
         finally:
             connection.close()
+
+    def test_a_busy_provider_page_delays_commands_without_a_driver_recovery(self):
+        # Live DK held its main thread 11-19 s in one chain (2026-10-28); a 12 s stall, longer than
+        # the old 10 s timeout, must be waited out rather than poison the session.
+        self.driver.execute_script("setTimeout(()=>{const end=performance.now()+12000;while(performance.now()<end){}},0)")
+        time.sleep(.2)
+        started = time.monotonic()
+        self.assertEqual(self.driver.execute_script("return 7"), 7)
+        self.assertGreater(time.monotonic()-started, 10)
+        self.assertEqual(self.driver.current_url, self.url)
 
     def test_driver_process_loss_reattaches_same_browser_and_retains_page_without_clicks(self):
         pid = self.browser.process.pid

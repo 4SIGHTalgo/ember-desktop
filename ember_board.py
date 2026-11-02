@@ -95,7 +95,7 @@ def validate_board(value):
                     raise ValueError('Invalid reference window confidence')
                 for reference in [outcome.get('reference_window'),*references.values()]:
                     if reference is not None and (not isinstance(reference,dict) or set(reference)!={'kind','key','status'}
-                            or reference['kind']!='pregame_non_decreasing' or not isinstance(reference['key'],str)
+                            or reference['kind']!='pregame_non_increasing' or not isinstance(reference['key'],str)
                             or not re.fullmatch(r'[0-9a-f]{64}',reference['key'])
                             or reference['status'] not in {'open','awaiting','paused','cancelled'}):
                         raise ValueError('Invalid reference window display')

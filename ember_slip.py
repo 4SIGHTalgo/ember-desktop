@@ -31,7 +31,7 @@ def plan_slip_config(event, market, plan, outcome=None, *, server_offset=0):
     line = (plan.get("specification") or {}).get("line")
     if line is not None and (type(line) not in (int, float) or not math.isfinite(line)):
         raise ValueError("plan line is invalid")
-    return {"nonDecreasing":'window' in plan,'minDecimal':plan.get('min_decimal'),
+    return {"nonIncreasing":'window' in plan,'minDecimal':plan.get('min_decimal'),'maxDecimal':plan.get('max_decimal'),
             "eventId": event["eventId"], "marketId": market["marketId"],
             "selectionId": outcome["selectionId"], "selectionLabel": outcome["label"],
             "marketName": market["name"], "selectionLine": line,
@@ -49,7 +49,7 @@ const slipKey=s=>(s||'').toLowerCase().replace(/[łøđ]/g,c=>({ł:'l',ø:'o',đ
 // Recalculated cash payouts cannot establish a contract line or identity change.
 const slipContractText=root=>{
     const copy=root.cloneNode(true);
-    for(const e of copy.querySelectorAll(priceSelector+','+removeSelector+','+stakeSelector))e.remove();
+    for(const e of copy.querySelectorAll(priceSelector+','+removeSelector+','+stakeSelector+',[data-testid="regular-payout-label"]'))e.remove();
     return copy.textContent.replace(/\$\s*[\d,.]+/g,' ').replace(/\s+/g,' ').trim();
 };
 const zeroStake=input=>!input.value.trim()||/^\d+(?:\.\d+)?$/.test(input.value.trim())&&Number(input.value)===0;
@@ -164,6 +164,8 @@ const readExactPlanLeg=(cfg,cleanup=false)=>{
         return bad('exact plan leg identity is required');
     if(!cleanup&&(!Number.isFinite(cfg.validUntil)||Date.now()>=cfg.validUntil))return bad('plan deadline expired');
     const snapshot=exactSlipSnapshot();
+    // DK fades a new card in (opacity 0 for ~300 ms); unverifiable is not yet usable, not a contract change.
+    if(snapshot.reason==='hidden or unsupported leg controls')return {...bad(snapshot.reason),notReady:true,transient:true};
     if(!['present','empty'].includes(snapshot.status))return bad(snapshot.reason);
     if(snapshot.status==='empty'&&!cleanup)return {status:'waiting',notReady:true,empty:true,reason:'waiting for the exact selection to reach the slip'};
     const matches=snapshot.legs.filter(leg=>['eventId','marketId','selectionId'].every(k=>leg[k]===cfg[k]));
@@ -181,10 +183,14 @@ const readExactPlanLeg=(cfg,cleanup=false)=>{
         if(!numbers.length||numbers.some(n=>Math.abs(n-cfg.selectionLine)>=1e-9))return bad('target leg line changed or ambiguous');
     }
     if(leg.decimalOdds===null)return bad('target leg price is unreadable');
-    if(cfg.nonDecreasing&&leg.decimalOdds<Math.max(cfg.minDecimal||0,cfg.expectedDecimal||0))
-        return {...bad('conservative EV decreased'),windowExpired:true,decimalOdds:leg.decimalOdds};
-    if(cfg.nonDecreasing)cfg.minDecimal=Math.max(cfg.minDecimal||0,leg.decimalOdds);
-    if(cfg.expectedFingerprint&&leg.fingerprint!==cfg.expectedFingerprint)return {...bad('target leg identity, line or odds changed after claim'),notReady:!!cfg.nonDecreasing,decimalOdds:leg.decimalOdds};
+    // Reference windows take only the lowest price seen so far, and only while EV stays positive.
+    if(cfg.nonIncreasing&&Number.isFinite(cfg.maxDecimal)&&leg.decimalOdds>cfg.maxDecimal)
+        return {...bad('conservative EV increased'),windowExpired:true,decimalOdds:leg.decimalOdds};
+    if(cfg.nonIncreasing&&Number.isFinite(cfg.minDecimal)&&leg.decimalOdds<cfg.minDecimal)
+        return {...bad('conservative EV is no longer positive'),windowExpired:true,decimalOdds:leg.decimalOdds};
+    if(cfg.nonIncreasing)cfg.maxDecimal=Number.isFinite(cfg.maxDecimal)?Math.min(cfg.maxDecimal,leg.decimalOdds):leg.decimalOdds;
+    if(cfg.expectedFingerprint&&leg.fingerprint!==cfg.expectedFingerprint)return {...bad('target leg identity, line or odds changed after claim'),notReady:!!cfg.nonIncreasing,decimalOdds:leg.decimalOdds,
+        fingerprint:leg.fingerprint,expectedFingerprint:cfg.expectedFingerprint};
     if(Number.isFinite(cfg.expectedDecimal)&&Math.abs(leg.decimalOdds-cfg.expectedDecimal)>1e-9)return bad('target leg odds changed after claim');
     const buttons=[...slip.querySelectorAll('button[data-testid="betslip-place-bet-button"]')].filter(visibleUI);
     if(buttons.length!==1)return bad('place-bet button is hidden or ambiguous');

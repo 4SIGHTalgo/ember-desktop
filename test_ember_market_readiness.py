@@ -29,6 +29,12 @@ EVENT = {"eventId": EVENT_ID, "player1": PLAYERS[0], "player2": PLAYERS[1], "sta
 MARKET = {"name": "Game 2", "betType": "split", "marketId": "381634356", "eventId": EVENT_ID,
     "outcomes": [{"selectionId": SELECTIONS[0], "label": PLAYERS[0], "american": "-124", "decimal": 1.8064516129},
                  {"selectionId": SELECTIONS[1], "label": PLAYERS[1], "american": "-114", "decimal": 1.8771929824}]}
+CLOSEOUT = {**EVENT, "period": "4th", "setTally": [2, 1], "currentSet": {"set": 4, "home": 0, "away": 0},
+    "sets": [{"set": 1, "home": 11, "away": 7}, {"set": 2, "home": 7, "away": 11}, {"set": 3, "home": 11, "away": 9},
+             {"set": 4, "home": 0, "away": 0}]}
+MONEYLINE = {"name": "Moneyline", "marketId": "386000001", "eventId": EVENT_ID,  # As on the wire: no scoreState.
+    "outcomes": [{"selectionId": "0ML386000001_1", "label": PLAYERS[0], "decimal": 1.5},
+                 {"selectionId": "0ML386000001_3", "label": PLAYERS[1], "decimal": 2.5}]}
 
 
 class ReadinessBudgetTests(unittest.TestCase):
@@ -73,8 +79,10 @@ class ReadinessBudgetTests(unittest.TestCase):
 
     def test_transient_opening_failure_is_retried_without_requesting_long_navigation_timeouts(self):
         self.core.open_props.side_effect = [self.core.BrowserNavigationPending("rendering"), False, True]
+        self.driver._tt_last_navigation = 'stale from an earlier turn'
         result = self.reader.open(self.driver, EVENT, MARKET, lambda: True, lambda: 4.3-self.now)
         self.assertEqual(result["status"], "opened")
+        self.assertIsNone(result["navigation"])  # The mock router recorded no route; an old one never leaks.
         self.assertEqual(result["attempts"], 3)
         self.assertTrue(all(call.kwargs["timeout"] <= .4 for call in self.core.open_props.call_args_list))
 
@@ -90,6 +98,19 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.assertEqual(result['status'], 'not_ready')
         self.assertAlmostEqual(self.now, .35)
         self.driver.execute_script.assert_not_called()
+
+    def test_a_turn_whose_slice_was_spent_on_preconditions_still_makes_one_reveal_attempt(self):
+        # Live 2026-10-28: slow precondition reads used the whole slice and every turn yielded with 0 attempts.
+        self.core.reveal_set_winner.return_value = {'status': 'revealed'}
+        result = self.reader.wait(self.driver, EVENT, MARKET, lambda: True, lambda: 3-self.now, max_wait=0)
+        self.assertEqual((result['status'], result['attempts']), ('revealed', 1))
+        self.core.reveal_set_winner.reset_mock()
+        self.core.reveal_set_winner.return_value = {'status': 'waiting', 'reason': 'expanding winner section'}
+        self.assertEqual(self.reader.wait(self.driver, EVENT, MARKET, lambda: True, lambda: 3-self.now, max_wait=0)['attempts'], 1)
+        self.core.reveal_set_winner.reset_mock()
+        # Inside the dispatch reserve nothing is attempted.
+        self.assertEqual(self.reader.wait(self.driver, EVENT, MARKET, lambda: True, lambda: .5, max_wait=0)['attempts'], 0)
+        self.core.reveal_set_winner.assert_not_called()
 
     def test_opening_turn_uses_a_bounded_budget(self):
         self.core.open_props.return_value = False
@@ -150,6 +171,29 @@ class ReadinessBudgetTests(unittest.TestCase):
         self.core.reveal_set_winner.return_value = {'status': 'revealed'}
         self.assertEqual(self.reader.prepare(self.driver, EVENT, MARKET, lambda: True, lambda: 5)['status'], 'revealed')
         self.core.open_props.assert_not_called()
+
+    def test_a_closeout_signal_passes_the_moneyline_gate_only_for_its_verified_plan_state(self):
+        # Live 10/27-10/30: wire markets carry no scoreState, so every closeout signal stopped at this gate.
+        gated = []
+        def tab(driver, event, market, **kwargs):
+            gated.append(market.get('scoreState'))
+            return False  # Stop just past the close-out gate; no page is read.
+        reader = MarketReadiness(execution, clock=lambda: self.now, sleep=self.advance)
+        slip = {'status': 'empty', 'stagingSafe': True, 'legs': []}
+        with patch.object(execution, 'correct_event', return_value=True), \
+                patch.object(execution, 'ensure_market_tab', side_effect=tab), \
+                patch('ember_market_readiness.plan_slip_ready', return_value=False), \
+                patch('ember_market_readiness.read_plan_slip', return_value=slip):
+            for event, state, passes in ((CLOSEOUT, [2, 1], True), (EVENT, [0, 1], False), (CLOSEOUT, [1, 1], False)):
+                with self.subTest(tally=event['setTally'], plan=state):
+                    self.now, gated[:] = 0, []
+                    result = reader.prepare(self.driver, event, MONEYLINE, lambda: True, lambda: 4-self.now,
+                                            plan={'selectionId': '0ML386000001_1', 'scoreState': state})
+                    self.assertEqual(result['status'], 'not_ready')
+                    self.assertEqual(result['reason'] != 'Moneyline is not a verified close-out state', passes, result)
+                    self.assertEqual(bool(gated) and all(value == [2, 1] for value in gated), passes)
+        self.assertNotIn('scoreState', MONEYLINE)  # The signal's own market is never mutated.
+
 
 class ProviderErrorBudgetTests(unittest.TestCase):
     def test_unknown_or_funded_slip_does_not_trigger_navigation_or_reveal(self):

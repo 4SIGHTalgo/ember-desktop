@@ -40,17 +40,17 @@ jobs:
           workspaces: desktop/src-tauri
           cache-on-failure: true
       - run: python -m pip install -r desktop/requirements-worker.txt
-      - run: python -m unittest test_execution_window test_ember_identity test_draftkings_session -v
+      - run: python -m unittest test_execution_window test_ember_identity test_draftkings_session.FatalMaintenanceTests test_draftkings_session.SessionMaintenanceTests -v
       - run: python -m unittest test_driver_lifecycle -v
         if: runner.os == 'Windows'
       - name: Client test battery
-        run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_client', 'test_ember_history', 'test_ember_opportunity', 'test_ember_device_test', 'test_ember_stream', 'test_ember_browser_preparation', 'test_ember_market_readiness.ReadinessBudgetTests', 'test_ember_market_readiness.ProviderErrorBudgetTests', 'test_ember_browser_lifecycle.ClientRecoveryTests', 'test_tt_market_semantics', 'test_tt_market_exec', 'test_execution_policy', 'test_draftkings_login', 'test_draftkings_live'])"
+        run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_client', 'test_ember_history', 'test_ember_opportunity', 'test_ember_device_test', 'test_ember_stream', 'test_ember_browser_preparation', 'test_ember_market_readiness.ReadinessBudgetTests', 'test_ember_market_readiness.ProviderErrorBudgetTests', 'test_ember_browser_lifecycle.ClientRecoveryTests', 'test_ember_tabs.EventTabTests', 'test_ember_navigation.NavigationGateTests', 'test_tt_market_semantics', 'test_tt_market_exec', 'test_execution_policy', 'test_draftkings_login', 'test_draftkings_live'])"
       - run: python -m unittest test_ember_board -v
       - run: python -m unittest test_draftkings_location.LocationRecheckTests -v
       - run: python -m unittest desktop.test_native_smoke.NativeCapabilityTests -v
       - name: Overlapping H2H actual-client scheduler and multi-leg browser fixtures
         if: runner.os == 'Windows'
-        run: python -m unittest test_ember_slip test_ember_staging test_ember_scheduling test_draftkings_location.LocationRecheckBrowserTests desktop.test_dashboard -v
+        run: python -m unittest test_ember_slip test_ember_staging test_ember_scheduling test_ember_tabs.EventTabBrowserTests test_ember_navigation.NavigationGateBrowserTests test_draftkings_session.SessionActivityBrowserTests test_draftkings_location.LocationRecheckBrowserTests desktop.test_dashboard -v
       - name: Real-browser submission and recovery tiers
         if: runner.os == 'Windows'
         run: python -c "import sys, unittest; unittest.main(module=None, argv=['unittest', 'test_ember_provider_login', 'test_ember_browser_lifecycle.BrowserLifecycleTests', 'test_ember_browser_lifecycle.ClientRecoveryTests', 'test_ember_browser_lifecycle.OwnedBrowserFaultTests', 'test_ember_browser_lifecycle.NativeBrowserStartupTests', 'test_ember_market_readiness.MarketReadinessBrowserTests', 'test_tt_bet_slip.PlanExecutionBrowserTests', 'desktop.test_dashboard'])"
@@ -69,6 +69,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.EMBER_UPDATER_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.EMBER_UPDATER_KEY_PASSWORD }}
         run: python build_native.py --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Keep the installer for acceptance before a version tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: ember-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
       - name: Native WebView receives packaged worker events (no sign-in or wagers)
         if: runner.os == 'Windows'
         shell: pwsh

@@ -112,6 +112,8 @@ def offer(signal):
 
 def result_reason(result):
     text = str((result or {}).get("reason", "")).lower()
+    if "pick closed at submission" in text:  # DK refused the click; its words would match other families.
+        return "market_unavailable"
     if any(word in text for word in ("ev minimum", "ev gate", "price moved", "price no longer", "price floor")):
         return "odds_below_ev"
     if any(word in text for word in ("entry window", "score or", "start-state", "entry changed")):

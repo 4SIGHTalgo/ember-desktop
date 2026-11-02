@@ -32,6 +32,7 @@ from execution_timing import ExecutionTiming
 from tt_market_semantics import closeout_state, name_key, score_state, american_odds
 from execution_policy import MARKET_FAMILIES
 from ember_slip import EXACT_SLIP_READER_JS, plan_slip_config
+import ember_tabs as event_tabs
 
 ROOT = Path(__file__).resolve().parent
 
@@ -69,18 +70,26 @@ const visibleUI = element => {
 };
 """
 REVEAL_SCRIPT = VISIBLE_UI_JS + SUBMISSION_UI_JS + (ROOT / "reveal_next_set.js").read_text(encoding="utf-8")
+# One command instead of find + is-displayed + text per panel: on a loaded DK page each element
+# call waited 0.3-1.5 s behind the site's own tasks (live 2026-10-28).
+SCOREBOARD_TEXT_SCRIPT = VISIBLE_UI_JS + r"""
+return [...document.querySelectorAll('.cms-event-scoreboard-container')].filter(visibleUI)
+    .map(panel => panel.innerText || panel.textContent || '');
+"""
+ERROR_PAGE_TEXT_SCRIPT = r"""
+const title = document.title || '';
+return document.body && document.getElementsByTagName('*').length <= 1500 ? title + ' ' + (document.body.innerText || '') : title;
+"""
 
 
 def correct_event(browser, event):
     url = urlparse(browser.current_url)
-    try:
-        return (url.hostname == "sportsbook.draftkings.com"
-                and url.path.rstrip("/").split("/")[-1] == event["eventId"]
-                and any(panel.is_displayed() and all(f" {name_key(event[player])} " in f" {name_key(panel.text)} "
-                                                    for player in ("player1", "player2"))
-                        for panel in browser.find_elements(By.CSS_SELECTOR, ".cms-event-scoreboard-container")))
-    except StaleElementReferenceException:
+    if url.hostname != "sportsbook.draftkings.com" or url.path.rstrip("/").split("/")[-1] != event["eventId"]:
         return False
+    panels = browser.execute_script(SCOREBOARD_TEXT_SCRIPT)
+    return isinstance(panels, list) and any(
+        isinstance(text, str) and all(f" {name_key(event[player])} " in f" {name_key(text)} " for player in ("player1", "player2"))
+        for text in panels)
 
 
 class BrowserThrottled(RuntimeError):
@@ -127,10 +136,13 @@ def market_surface(market=None):
                   'Correct Score': ['Correct Score BO5', 'Correct Score'],
                   'Total Points': ['Total', 'Total Points']}[name]
     else:
-        titles = ['Moneyline'] if family == 'closeout' or name == 'Moneyline' else ['Winner - Listed Game']
-    match_market = distribution or titles == ['Moneyline']
+        # Live DK 2026-10-31 headers the match winner "Winner" on Match Lines and "Match Winner" on Popular;
+        # the exact 0ML selection IDs, not the header, identify the contract.
+        titles = (['Moneyline', 'Winner', 'Match Winner'] if family == 'closeout' or name == 'Moneyline'
+                  else ['Winner - Listed Game'])
+    match_market = distribution or titles[0] == 'Moneyline'
     return {'sectionTitle': titles[0], 'sectionTitles': titles,
-            'rowNames': list(dict.fromkeys(([name] if name else []) + titles + (['Match Winner'] if titles == ['Moneyline'] else []))),
+            'rowNames': list(dict.fromkeys(([name] if name else []) + titles)),
             'tabLabels': ['Match Lines', 'Popular'] if match_market else ['Player Props', 'Game Props', 'Match Lines', 'Popular'],
             'distribution': distribution}
 
@@ -211,6 +223,16 @@ def open_props(driver, event, market=None, timeout=15):
         pending = getattr(driver, '_tt_navigation_intent', None)
         if isinstance(pending, dict) and time.monotonic() < pending['until']:
             return False
+        here = driver.current_url
+        shown = (event_tabs.show(driver, event, f"https://sportsbook.draftkings.com/event/{slug}/{event['eventId']}")
+                 if isinstance(here, str) and urlparse(here).hostname == 'sportsbook.draftkings.com' else None)
+        if shown == 'opened':
+            driver._tt_navigation_intent = {'event': event['eventId'], 'until': time.monotonic()+5}
+        navigation = {'switched': 'tab switch', 'opened': 'new tab'}.get(shown, navigation)
+    if not correct_event(driver, event) and not event_route_open(driver, event):
+        pending = getattr(driver, '_tt_navigation_intent', None)
+        if isinstance(pending, dict) and time.monotonic() < pending['until']:
+            return False
         # Prefer the site's native routing so an event change need not tear down
         # the running GeoComply client. Reuse the current page when already there.
         identifier = event["eventId"]
@@ -252,6 +274,7 @@ def open_props(driver, event, market=None, timeout=15):
                     raise
             navigation = "direct load"
 
+    driver._tt_last_navigation = navigation  # Evidence only: which route a cross-match turn took.
     try:
         def wait(predicate):
             return WebDriverWait(driver, max(.001, deadline - time.monotonic()), poll_frequency=.05).until(predicate)
@@ -263,8 +286,10 @@ def open_props(driver, event, market=None, timeout=15):
                 driver, event, market, min(.4, max(.05, deadline - time.monotonic())), verified=True):
             raise BrowserNavigationPending('verified event is waiting for an unobstructed market tab')
     except TimeoutException:
-        bodies = driver.find_elements(By.TAG_NAME, "body")
-        text = bodies[0].text if bodies else ""
+        # A provider error page is small; reading a full live page's visible text hung 25 s and forced
+        # a recovery (live 2026-10-28), so a large page contributes only its title.
+        text = driver.execute_script(ERROR_PAGE_TEXT_SCRIPT)
+        text = text if isinstance(text, str) else ""  # An unreadable reply is no error evidence.
         if re.search(r"too many requests|rate limit|service unavailable|HTTP\s*(?:429|503)", text, re.I):
             raise BrowserThrottled("DraftKings is rate-limiting or temporarily unavailable; backing off.") from None
         if "Access Denied" in text or "Network Error" in text:
@@ -668,6 +693,16 @@ PLAN_SLIP_READY_SCRIPT = LOCATION_READER_JS + PLAN_SLIP_READER_JS + """
 const leg=readExactPlanLeg(arguments[0]);
 return {ready:!readDkLocation().blocked&&leg.status==='ready'&&exactSlipSnapshot().stagingSafe===true};
 """
+# After an unanswered Place Bet: DK's own closed card for the exact unfunded target, any receipt,
+# whether every stake is zero, and the visible cash balance. Read-only.
+PLAN_CLOSED_EVIDENCE_SCRIPT = PLAN_SLIP_READER_JS + """
+const cfg=arguments[0],snapshot=exactSlipSnapshot(),cash=readAvailableBalance();
+const targets=snapshot.legs.filter(leg=>['eventId','marketId','selectionId'].every(k=>leg[k]===cfg[k]));
+const receipt=!snapshot.slip||[...snapshot.slip.querySelectorAll('[data-testid="dk-betslip-receipt"]')].some(visibleUI)
+    ||/bet placed/i.test(slipText(snapshot.slip));
+return {closed:targets.length===1&&targets[0].closed===true,receipt,stagingSafe:snapshot.stagingSafe===true,
+    balance:Number.isFinite(cash.availableBalance)?cash.availableBalance:null};
+"""
 PLAN_CLEAR_STAKE_SCRIPT = PLAN_SLIP_READER_JS + """
 const owned=window.__ttPlanStake,cfg=arguments[0];
 if(!owned||owned.token!==cfg.stakeToken)return {cleared:true};
@@ -773,7 +808,7 @@ const check = () => {
         finish({...result,deliveryTimedOut:true});
         return;
     }
-    if (result.signIn || result.locationBlocked || result.status === 'aborted'
+    if (result.signIn || result.locationBlocked || result.status === 'aborted' && !result.transient
             || result.status === 'armed' && (cfg.readOnly || !result.placeDisabled)) finish(result);
 };
 observer = new MutationObserver(() => {
@@ -981,9 +1016,9 @@ def click_selection(driver, event, outcome, market=None, validate=None, timeout=
             if min_decimal is not None:
                 quote=american_odds(result.get('american'))
                 if quote is None:return {'status':'aborted','notReady':True,'reason':'selection price is unreadable'}
-                if quote<min_decimal:return {'status':'aborted','windowExpired':True,'reason':'conservative EV decreased'}
+                if quote<min_decimal:return {'status':'aborted','windowExpired':True,'reason':'conservative EV is no longer positive'}
                 if observe_price is not None and not observe_price(quote):
-                    return {'status':'aborted','windowExpired':True,'reason':'conservative EV decreased'}
+                    return {'status':'aborted','windowExpired':True,'reason':'conservative EV increased'}
             button = result.get('button')
             if button is None:
                 return {'status':'aborted','reason':'validated selection button disappeared'}
@@ -1106,6 +1141,37 @@ def prepare_single_slip(driver,target=None):
     return result if isinstance(result,dict) else {'status':'blocked','reason':'single-slip cleanup is unverified'}
 
 
+def clear_single_slip(driver, target=None, timeout=3.0, sleep=time.sleep):
+    """DK animates a removed pick out (~300 ms); re-verify until cleared or the bound passes."""
+    deadline = time.monotonic()+timeout
+    while True:
+        result = prepare_single_slip(driver, target)
+        if result.get('status') != 'waiting' or time.monotonic() >= deadline:
+            return result
+        sleep(.15)
+
+
+CLOSED_PICK_SETTLE = 10  # seconds after the click before DK's closed card and cash count as final
+CLOSED_PICK_REREAD = 2  # seconds between the two evidence reads
+
+
+def closed_pick_unplaced(driver, target, balance, submitted_at, sleep=time.sleep):
+    """DK refused the click: the exact pick shows PICK CLOSED with no receipt, no stake and unchanged cash.
+
+    Approved by the user 2026-10-30 (#702). Read twice; any other evidence stays uncertain.
+    """
+    if type(balance) not in (int, float) or not math.isfinite(balance):
+        return False
+    for delay in (submitted_at + CLOSED_PICK_SETTLE - time.monotonic(), CLOSED_PICK_REREAD):
+        if delay > 0:
+            sleep(delay)
+        seen = driver.execute_script(PLAN_CLOSED_EVIDENCE_SCRIPT, target)
+        if not (isinstance(seen, dict) and seen.get("closed") is True and seen.get("receipt") is False
+                and seen.get("stagingSafe") is True and seen.get("balance") == balance):
+            return False
+    return True
+
+
 def plan_slip_ready(driver, event, market, plan):
     """Whether the exact unstaked leg can execute without any board navigation."""
     if getattr(driver, "_tt_plan_uncertain", False) is True or getattr(driver, "_tt_plan_stopped", False) is True:
@@ -1203,7 +1269,8 @@ def place_plan(driver, event, market, plan, outcome, authorize_values, validate=
         if transaction["uncertain"]:
             result.update(status="unconfirmed", submitted=True)
         result["submissionState"] = "uncertain" if transaction["uncertain"] else (
-            "placed" if result.get("status") == "placed" else "not-submitted")
+            "placed" if result.get("status") == "placed" else
+            "closed-not-placed" if result.get("status") == "not_placed" else "not-submitted")
         result.setdefault("notReady", False)
         result["retryable"] = result["notReady"] and result["submissionState"] == "not-submitted"
         result["timing"] = trace.snapshot(result.get("status"))
@@ -1214,7 +1281,7 @@ def _plan_wait_ms(transaction):
     remaining = min(transaction["expires"] - time.monotonic(),
                     transaction["target"]["validUntil"] / 1000 - time.time())
     if remaining <= 0:
-        raise BetNotSubmitted("plan deadline or dispatch budget expired",not_ready=transaction['target'].get('nonDecreasing') is True)
+        raise BetNotSubmitted("plan deadline or dispatch budget expired",not_ready=transaction['target'].get('nonIncreasing') is True)
     return min(PLAN_READY_TIMEOUT, SLIP_ARM_TIMEOUT, remaining) * 1000
 
 
@@ -1223,8 +1290,8 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     def observe(result):
         price=result.get('decimalOdds')
         if observe_price is not None and type(price) in (int,float) and math.isfinite(price) and price>1:
-            if not observe_price(price):raise BetNotSubmitted('conservative EV decreased',window_expired=True)
-            target['minDecimal']=max(target['minDecimal'],price)
+            if not observe_price(price):raise BetNotSubmitted('conservative EV increased',window_expired=True)
+            target['maxDecimal']=min(target.get('maxDecimal') or price,price)
         return result
     if time.time() * 1000 >= target["validUntil"]:
         raise BetNotSubmitted("plan deadline expired")
@@ -1332,12 +1399,14 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
     if armed.get("placeDisabled"):
         raise BetSlipError("place-bet button is disabled")
     confirmed = None
+    cash = (armed.get("balance") or {}).get("availableBalance")  # The last read before the click.
     for resize_attempt in range(3):
         _plan_wait_ms(transaction)
         if validate is not None and not trace.call("planFinalLiveValidation", validate):
             raise BetNotSubmitted("the live authorization expired before submission")
         transaction["uncertain"] = True
         driver._tt_plan_uncertain = True
+        submitted_at = time.monotonic()
         confirmed = trace.call("planFinalSubmit", driver.execute_script, CONFIRM_PLAN_SCRIPT,
                                {**target, "stake": values["stake"], "minDecimal": values["min_decimal"],
                                 "echo": values.get("echo"), "selectionLabel": outcome["label"],
@@ -1362,6 +1431,7 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
                            {**target, "stake": values["stake"], "timeoutMs": _plan_wait_ms(transaction), "fallbackMs": 50}) or {}
         if rearm.get("status") != "armed" or rearm.get("placeDisabled"):
             raise BetNotSubmitted("the changed stake did not re-arm")
+        cash = (rearm.get("balance") or {}).get("availableBalance")
         if validate is not None and not trace.call("planResizeLiveValidation", validate):
             raise BetNotSubmitted("the live authorization expired while resizing the stake")
     if confirmed.get("status") != "submitted":
@@ -1417,24 +1487,31 @@ def _place_plan_once(driver, event, market, plan, outcome, authorize_values, val
 
     receipt = trace.call("planReceiptWait", settle_submission, driver, confirmed, BET_RECEIPT_SCRIPT, continue_plan)
     confirmed = receipt["lastConfirmation"]
-    save_slip_capture({"stage": "plan_receipt", "armed": armed, "confirmed": confirmed, "receipt": receipt,
-                       "eventId": event["eventId"], "plan": plan, "timing": trace.snapshot()})
     placed = bool(receipt.get("placed"))
-    if placed:
+    # Only an unanswered single click qualifies; a continued prompt or a location stop stays uncertain.
+    unplaced = (not placed and len(receipt["actions"]) == 1 and not receipt.get("locationBlocked")
+                and trace.call("planClosedEvidence", closed_pick_unplaced, driver, target, cash, submitted_at))
+    save_slip_capture({"stage": "plan_receipt", "armed": armed, "confirmed": confirmed, "receipt": receipt,
+                       "closedUnplaced": unplaced, "eventId": event["eventId"], "plan": plan, "timing": trace.snapshot()})
+    if placed or unplaced:
         driver._tt_plan_uncertain = False
         transaction.update(uncertain=False, touched=False)
-    location_blocked = receipt.get("locationBlocked")
-    return {"status": "placed" if placed else "unconfirmed", "stake": state["stake"],
+    outcome_fields = {"stake": state["stake"],
             'conservativeEV':values.get('conservative_ev'),
             "sizingMode": "server_plan", "selectionId": outcome["selectionId"],
             "label": outcome["label"], "market": market["name"], "eventId": event["eventId"],
             "nextSet": plan["nextSet"], "betType": plan["betType"], "scoreState": plan["scoreState"],
             "odds": confirmed.get("odds", armed.get("odds")),
             "acceptedDecimal": confirmed.get("decimalOdds", armed.get("decimalOdds")),
-            "minDecimal": state["minDecimal"], "echo": state["echo"], "submitted": True,
+            "minDecimal": state["minDecimal"], "echo": state["echo"],
             "submitKind": confirmed.get("submitKind", "place-bet"),
             "submissionActions": receipt.get("actions"),
             "confirmationBlocked": receipt.get("confirmationBlocked"),
             "receipt": receipt.get("text"), "receiptPlaced": placed,
             "comparison": {"slipDecimal": confirmed.get("decimalOdds", armed.get("decimalOdds")),
                            "estimatedNetEVPercent": None}}
+    if unplaced:
+        # Positive evidence of a refusal: never a placement, never retried (the ledger keeps the contract).
+        return {**outcome_fields, "status": "not_placed", "submitted": False,
+                "reason": "pick closed at submission: DraftKings showed PICK CLOSED, no receipt, and unchanged cash"}
+    return {**outcome_fields, "status": "placed" if placed else "unconfirmed", "submitted": True}

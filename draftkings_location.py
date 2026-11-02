@@ -69,35 +69,55 @@ return matches.length === 1 ? {status: 'ready', link: matches[0]} : {status: 'un
 """
 
 
+# Seconds after each Recheck before DK's still-visible failure banner may be rechecked again, then
+# every RECHECK_REPEAT. Live 2026-10-28 one hung click, never retried, left wagering paused for 5 h.
+RECHECK_BACKOFF = (120, 240, 480, 960)
+RECHECK_REPEAT = 1800
+# After this long a recheck's page counts as settled even if it never reports readyState
+# 'complete'; native sign-in, can-bet and the wagering grant still gate resumption.
+RECHECK_SETTLE = 60
+
+
 class LocationRecheck:
-    """One official recheck until native permission returns; never resubmit a wager."""
+    """DK's official Recheck link, retried with backoff while its failure stays; never resubmit a wager."""
 
     def __init__(self, state=None, *, clock=None):
         self.report = dict(state or {"attempted": False})
         self.hold_until = 0
         self.clock = clock if clock is not None else lambda: time.monotonic()
+        self.attempts = 1 if self.report.get("attempted") else 0
+        # A restored reservation is never replayed at once: it waits out the first backoff.
+        now = self.clock()
+        self.retry_at = now + RECHECK_BACKOFF[0] if self.attempts else 0
+        self.settle_until = now + RECHECK_SETTLE if self.attempts else 0
 
     def start(self, driver, reading, validate=None):
-        if self.report.get("attempted") or reading.get("state") != "blocked" or validate is not None and not validate():
+        if (reading.get("state") != "blocked" or self.report.get("attempted") and self.clock() < self.retry_at
+                or validate is not None and not validate()):
             return False
         result = driver.execute_script(LOCATION_RECHECK_SCRIPT)
         if not isinstance(result, dict) or result.get("status") != "ready" or result.get("link") is None:
             return False
-        # Reserve the attempt before clicking: a lost WebDriver reply must not
-        # replay the /auth action. No login credentials or wager is submitted.
-        self.report = {"attempted": True, "status": "attempted", "sourceUrl": reading.get("pageUrl")}
-        self.hold_until = self.clock() + 2
+        # Reserve the attempt before clicking: a lost WebDriver reply must not replay
+        # the /auth action before its backoff. No login credentials or wager is submitted.
+        now = self.clock()
+        self.attempts += 1
+        self.report = {"attempted": True, "status": "attempted", "sourceUrl": reading.get("pageUrl"), "attempts": self.attempts}
+        self.hold_until = now + 2
+        self.settle_until = now + RECHECK_SETTLE
+        self.retry_at = now + (RECHECK_BACKOFF[self.attempts-1] if self.attempts <= len(RECHECK_BACKOFF) else RECHECK_REPEAT)
         if validate is not None and not validate():
             self.report['status'] = 'cancelled'
             return False
         result["link"].click()
         self.report["status"] = "started"
-        print("Location recheck: opened DraftKings' official Recheck link once; waiting for verification.", flush=True)
+        print("Location recheck: opened DraftKings' official Recheck link; waiting for verification.", flush=True)
         return True
 
     def permission_observed(self):
         self.report = {'attempted': False, 'status': 'permission_restored'}
-        self.hold_until = 0
+        self.hold_until = self.retry_at = self.settle_until = 0
+        self.attempts = 0
 
 
 def update_location(driver, bettor, recheck=None, stage="periodic"):

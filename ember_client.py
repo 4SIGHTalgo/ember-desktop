@@ -14,6 +14,7 @@ import queue
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -28,18 +29,25 @@ from ember_protocol import (RunLease, VERSION, timestamp, validate_preparation, 
 from ember_device_test import DeviceTest
 from ember_browser_session import validation_ticket
 from ember_browser_lifecycle import (ActiveSessionPower, BrowserCancelled, LifecycleLog, OwnedBrowser,
-                                     startup_stage)
+                                     code_location, startup_stage)
 from ember_history import OpportunityJournal, reservations, result_reason
 from ember_staging import Staging
 from ember_board import display_board
 from ember_identity import signal_identity
-from tt_market_exec import read_plan_slip, PLAN_CLEAR_STAKE_SCRIPT, prepare_single_slip
+from tt_market_exec import read_plan_slip, PLAN_CLEAR_STAKE_SCRIPT, prepare_single_slip, clear_single_slip
+import ember_tabs as event_tabs
+from ember_navigation import NavigationPending
 from draftkings_location import LocationRecheck
+from draftkings_session import AuthenticationAlerts
 from conservative_policy import (DEFAULT_LEVEL, DEFAULT_KELLY, DEFAULT_RISK_PERCENT,
                                   client_settings, validate_risk)
 
 OUTPUT = sys.stdout
 OUTPUT_LOCK = threading.Lock()
+IDLE_WAIT = 1.0  # seconds between idle browser reads; signals never wait for it
+# League standby (no match prepared): live 2026-10-29 the idle reads still held 68% of a loaded page.
+STANDBY_WAIT = 3.0
+PROVIDER_REUSE = 10  # seconds a ready provider reading may serve queued signals
 
 # Startup wait-stage codes (ember_browser_lifecycle.BrowserWaiting) to the exact
 # user-facing failure text. Anything absent keeps the generic recovery message,
@@ -61,6 +69,21 @@ def emit(kind, **fields):
         OUTPUT.flush()
 
 
+def alert_sound():
+    """The host's three-tone alert, from the worker: the host itself sounds only browser closes."""
+    try:
+        if os.name == "nt":
+            import winsound
+            for frequency in (880, 660, 880):
+                winsound.Beep(frequency, 150)
+                time.sleep(.1)
+        elif sys.platform == "darwin":
+            subprocess.run(["/usr/bin/osascript", "-e", "beep 3"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        pass  # A missing sound device cannot affect execution.
+
+
 class QuietOutput(io.TextIOBase):
     def write(self, value):
         # Existing browser scripts print human diagnostics and receipt text. Do
@@ -77,7 +100,7 @@ class Ledger:
         self.connection.execute("CREATE TABLE IF NOT EXISTS attempts (account TEXT, contract TEXT, status TEXT, PRIMARY KEY(account, contract))")
         self.connection.execute("CREATE TABLE IF NOT EXISTS economic_attempts (account TEXT, event TEXT, contract TEXT, context TEXT, PRIMARY KEY(account,contract))")
         self.connection.execute('CREATE TABLE IF NOT EXISTS expired_windows (account TEXT, window TEXT, PRIMARY KEY(account,window))')
-        self.connection.execute('CREATE TABLE IF NOT EXISTS window_prices (account TEXT, window TEXT, peak REAL NOT NULL, PRIMARY KEY(account,window))')
+        self.connection.execute('CREATE TABLE IF NOT EXISTS window_ceilings (account TEXT, window TEXT, ceiling REAL NOT NULL, PRIMARY KEY(account,window))')
         self.connection.commit()
 
     def reserve(self, account, contract):
@@ -103,15 +126,17 @@ class Ledger:
     def cancelled_windows(self,account):
         return {row[0] for row in self.connection.execute('SELECT window FROM expired_windows WHERE account=?',(account,))}
 
-    def window_peak(self,account,key):
-        row=self.connection.execute('SELECT peak FROM window_prices WHERE account=? AND window=?',(account,key)).fetchone()
-        return row[0] if row else 0
+    def window_ceiling(self,account,key):
+        """The lowest price this device observed for the window; None before any observation."""
+        row=self.connection.execute('SELECT ceiling FROM window_ceilings WHERE account=? AND window=?',(account,key)).fetchone()
+        return row[0] if row else None
 
     def observe_window(self,account,key,price):
         with self.connection:
             self.connection.execute('BEGIN IMMEDIATE')
-            if price<self.window_peak(account,key):return False
-            self.connection.execute('INSERT OR REPLACE INTO window_prices VALUES (?,?,?)',(account,key,price))
+            ceiling=self.window_ceiling(account,key)
+            if ceiling is not None and price>ceiling:return False
+            self.connection.execute('INSERT OR REPLACE INTO window_ceilings VALUES (?,?,?)',(account,key,price))
         return True
 
     def reserve_signal(self, account, signal):
@@ -182,6 +207,8 @@ class Client:
         self.window_cache={}
         self.active_windows=None
         self.expired_windows=set()
+        self.tab_book = {}  # Match tabs outlive any one driver attachment; recovery must not orphan them.
+        self.session_maintenance = None  # Likewise the keep-alive timer (one per run).
         self.current_signal=None
         self.stop = threading.Event()
         self.run_cancel = threading.Event()
@@ -218,14 +245,27 @@ class Client:
         self.history_offset = 0
         self.provider_phase = "waiting"
         self.location_recheck = LocationRecheck()
+        self.signin_alerts, self.run_was_ready = AuthenticationAlerts(), False
         self.last_authorize_reason = "authorization_denied"
+        self.dropped_signals = set()
         timeout = int(os.environ.get("EMBER_DEVICE_TEST_TIMEOUT_SECONDS", "1200"))
         if not 120 <= timeout <= 7200:
             raise ValueError("Device test wait must be between two minutes and two hours")
         self.scan_only = os.environ.get("EMBER_DEVICE_TEST_SCAN_ONLY") == "1"
+        # Local no-wager rehearsal: run every stage to an armed, server-sized slip, never the place-bet click.
+        self.rehearsal = os.environ.get("EMBER_REHEARSAL") == "1"
         self.readiness_only = os.environ.get("EMBER_DEVICE_TEST_LOGIN_ONLY") == "1" or self.scan_only
         self.device_test = DeviceTest(self.data_dir/"device-tests", VERSION, timeout=timeout,
                                       readiness_only=self.readiness_only, scan_only=self.scan_only) if os.environ.get("EMBER_DEVICE_TEST_ONCE") == "1" or self.readiness_only else None
+        # A device test may carry a hard dollar ceiling: a larger server-sized stake is refused, never reduced.
+        cap = os.environ.get("EMBER_DEVICE_TEST_STAKE_CAP")
+        self.stake_cap_cents = None
+        if cap is not None and self.device_test:
+            try:
+                value = float(cap)
+            except ValueError:
+                value = math.nan
+            self.stake_cap_cents = int(math.floor(value*100+1e-8)) if math.isfinite(value) and value > 0 else 0
 
     def permits(self, signal):
         return (not self.readiness_only and not self.run_cancel.is_set() and not self.stop.is_set()
@@ -254,14 +294,44 @@ class Client:
     def history_outcome(self, signal, outcome, reason, result=None):
         if outcome in {'placed', 'missed', 'handled', 'uncertain', 'observed_only'}:
             signal.setdefault('_timing', {}).setdefault('finished', time.monotonic())
+            self.trace(signal, outcome, reason, result, authorize_reason=self.last_authorize_reason)
         scope = signal.get("_history_scope") or self.history_scope()
         if scope:
             self.history_call(self.history.transition, scope, signal, outcome, reason, now=self.history_time(), result=result)
             self.history_wake.set()
 
+    def trace(self, signal, outcome, reason, result=None, **extra):
+        """Local-only evidence of where each signal stopped; the journal keeps only the latest reason."""
+        marks = signal.get('_timing') or {}
+        start = marks.get('received')
+        result = result if isinstance(result, dict) else {}
+        row = {'at': datetime.now(timezone.utc).isoformat(), 'signal': signal.get('id'), 'contract': signal.get('contract'),
+               'protocol': signal.get('protocol'), 'outcome': outcome, 'reason': reason,
+               'received_at': signal.get('_received_at'), 'expires_at': signal.get('expires_at'),
+               'ms': {key: round(1000*(value-start), 1) for key, value in marks.items() if start is not None and type(value) is float},
+               **{key: result[key] for key in ('status', 'denied', 'readiness', 'timing') if key in result},
+               **({'detail': str(result['reason'])[:200]} if result.get('reason') else {}),
+               **({'armed': signal['_armed']} if isinstance(signal.get('_armed'), dict) else {}), **extra}
+        path = self.data_dir/'execution-trace.jsonl'
+        try:
+            if path.exists() and path.stat().st_size > 1_000_000:
+                os.replace(path, path.with_suffix('.previous.jsonl'))
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(row, allow_nan=False, default=str)+'\n')
+        except (OSError, ValueError, TypeError):
+            pass  # Evidence storage cannot change execution.
+
+    def trace_dropped(self, raw, reason, **extra):
+        """The stream re-sends every second; record each dropped signal once."""
+        key = (raw.get('id'), reason)
+        if key not in self.dropped_signals:
+            self.dropped_signals.add(key)
+            self.trace({key: raw.get(key) for key in ('id', 'contract', 'protocol')}, 'dropped', reason, **extra)
+
     def receive_opportunity(self, signal, scope):
         if signal.get('protocol')==3:signal.setdefault('_timing',{}).setdefault('received',time.monotonic())
         else:signal.setdefault('_timing', {})['received'] = time.monotonic()
+        signal.setdefault('_received_at', self.history_time())
         signal["_history_scope"] = scope
         signal["_history_handled"] = False
         if not scope:
@@ -395,6 +465,21 @@ class Client:
             self.history_wake.set()
         if not self.execution_thread or not self.execution_thread.is_alive():
             self.stopped()
+
+    def provider_alert(self, phase, now):
+        """A mid-run DK sign-out needs the user's password: sound at once, then every 5 min until signed in.
+
+        Live 2026-10-31 DK ended the session (KRN-006) during a 42 s page stall and wagering waited 4 h.
+        """
+        self.run_was_ready = self.run_was_ready or phase == "ready"
+        if self.run_was_ready:
+            self.signin_alerts.update(phase in ("awaiting_signin", "awaiting_verification"), now,
+                                      self.signed_out_alert, lambda: None)
+
+    def signed_out_alert(self):
+        emit("status", message="DraftKings signed out during the run. Log in again in the Ember browser; "
+                               "betting resumes after its sign-in and location checks.")
+        threading.Thread(target=alert_sound, daemon=True).start()
 
     def pause_browser(self):
         # Queued signals stay: their own expiry is the fail-closed authority,
@@ -607,14 +692,18 @@ class Client:
                             emit("status", message="Signal access paused; rechecking Ember sign-in and subscription.")
                         break
                     elif message.get("type") == "signal":
+                        raw = message.get("signal") if isinstance(message.get("signal"), dict) else {}
                         try:
                             signal = validate_signal(message["signal"])
-                        except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+                        except (ValueError, TypeError, KeyError, OverflowError, AttributeError) as error:
                             emit("signal_rejected", code="invalid_signal")
+                            self.trace_dropped(raw, "invalid_signal", detail=str(error)[:200])
                             continue
                         if signal.get('protocol')!=3:
-                            emit('signal_rejected',code='unsupported_execution_policy');continue
+                            emit('signal_rejected',code='unsupported_execution_policy')
+                            self.trace_dropped(raw, 'unsupported_execution_policy');continue
                         if signal['payload']['plan']['window']['confidence']!=client_settings(self.conservative_level)['confidence']:
+                            self.trace_dropped(raw, 'other_confidence_window', confidence=signal['payload']['plan']['window']['confidence'])
                             continue
                         if signal.get('protocol')==3:
                             key=(stream_scope,signal['id'])
@@ -746,7 +835,8 @@ class Client:
                                                                    "balance_cents": int(round(available*100))},
                                        "sizing": {"kelly_multiplier": self.kelly_multiplier,
                                                   "max_bankroll_risk_percent": self.max_bankroll_risk_percent,
-                                                  "conservative_level": self.conservative_level}},
+                                                  "conservative_level": self.conservative_level},
+                                       **({"rehearsal": True} if self.rehearsal else {})},
                                       authenticated=True, timeout=self.authorization_timeout(signal))
             except Exception as error:
                 if isinstance(error, (requests.Timeout, requests.ConnectionError)) or str(error) == 'request_timeout':
@@ -784,6 +874,8 @@ class Client:
                     or fields["min_decimal"] <= 1
                     or not isinstance(fields.get("echo"), str) or not 0 < len(fields["echo"]) <= 200):
                 return {"denied": "authorization_denied"}
+            if self.stake_cap_cents is not None and fields["stake_cents"] > self.stake_cap_cents:
+                return {"denied": "sizing_failed"}
             # The claim is the sole authority; the signal plan's floor and stake
             # were provisional display data at the 90% publication bound.
             return {"stake": fields["stake_cents"]/100, "min_decimal": fields["min_decimal"],
@@ -805,7 +897,7 @@ class Client:
 
     def release_unsubmitted(self,signal,result,ledger):
         if result.get('windowExpired'):self.expire_signal(signal,ledger)
-        if not result.get('cleanupFailed') and prepare_single_slip(self.driver).get('status')=='cleared':
+        if not result.get('cleanupFailed') and clear_single_slip(self.driver).get('status')=='cleared':
             ledger.finish(self.account,signal['contract'],'not_submitted')
             signal.pop('_reserved',None)
             return
@@ -815,11 +907,12 @@ class Client:
         self.lease.revoke()
 
     def observe_window_price(self,signal,price,ledger):
+        """Unchanged or lower prices keep the window while EV stays positive; any rise ends it."""
         plan=signal['payload']['plan'];key=plan['window']['key']
         if price<plan['min_decimal'] or not ledger.observe_window(self.account,key,price):
             self.expire_signal(signal,ledger)
             return False
-        plan['min_decimal']=max(plan['min_decimal'],price)
+        plan['max_decimal']=min(plan.get('max_decimal',price),price)
         return True
 
     def defer_readiness(self, signal, readiness):
@@ -834,12 +927,16 @@ class Client:
         except queue.Full:
             return False
         self.history_outcome(signal, 'pending', 'waiting', result={'readiness': readiness})
+        # Local evidence of every yielded turn (the journal keeps only the latest reason).
+        self.trace(signal, 'deferred', readiness.get('reason') or readiness.get('status'), {'readiness': readiness})
         if waiting:
             self.stop.wait(.03)
         return True
 
     def execute(self):
         owner, attempt = None, 0
+        self.session_maintenance = None
+        self.signin_alerts, self.run_was_ready = AuthenticationAlerts(), False  # Per run, across reattaches.
         power = ActiveSessionPower()
         active = lambda: self.lease.running and not self.run_cancel.is_set() and not self.stop.is_set()
         try:
@@ -951,11 +1048,23 @@ class Client:
             emit('execution',status='unconfirmed',message='A previous submission is unresolved. Reconcile DraftKings history before resuming; no wager was replayed.')
             ledger.connection.close()
             return
-        maintenance = SessionMaintenance(core.DEFAULT_KEEP_ALIVE)
+        # One keeper per run, not per attachment: a fresh one clicked at once after every reattach.
+        if self.session_maintenance is None:
+            self.session_maintenance = SessionMaintenance(core.DEFAULT_KEEP_ALIVE)
+        maintenance = self.session_maintenance
+
+        def keep_session():
+            # Paused but signed in: DK's own idle logout would need the user's password.
+            with redirect_stdout(QuietOutput()):
+                try:
+                    maintenance.activity(self.driver, time.monotonic(), "signed-in", waiting=True)
+                except NavigationPending:
+                    pass
         login_gate = ProviderLoginGate(recheck=self.location_recheck, active=active)
         self.provider_ready.clear()
         table_prepared = False
         last_provider = None
+        provider_cache = None  # (monotonic, the last ready provider reading)
         def browser_status(**fields):
             emit("browser", **fields)
             if fields["state"] != "provider_wait" and fields.get("changed", True):
@@ -978,7 +1087,8 @@ class Client:
             with redirect_stdout(QuietOutput()):
                 if self.device_test:
                     self.device_test.update(phase="browser_launch")
-                self.driver = owner.open(active)
+                self.driver = owner.open(active, prefer=event_tabs.working(self.tab_book))
+                event_tabs.adopt(self.driver, self.tab_book)
                 if self.device_test:
                     self.device_test.update(phase="browser_permissions")
                 allow_location_permissions(self.driver)
@@ -998,16 +1108,37 @@ class Client:
             script_names = {id(getattr(module, name)): name
                             for module in (core, tt_market_exec) for name in dir(module)
                             if name.endswith("_SCRIPT")}
+            owner.commands.names = {id(value): name for module in list(sys.modules.values())
+                                    if getattr(module, '__name__', '').startswith(('ember_', 'tt_', 'draftkings_'))
+                                    for name, value in vars(module).items()
+                                    if isinstance(value, str) and name.isupper() and name.endswith(('_SCRIPT', '_JS'))}
+            owner.commands.activity = lambda: self.browser_activity
 
             def guarded(script, *args):
                 nonlocal submission_may_have_run
                 if script == core.CONFIRM_PLAN_SCRIPT:
+                    if self.rehearsal:
+                        self.browser_activity = "rehearsal_stop"
+                        if current is not None:
+                            current['_rehearsed'] = True
+                            config = args[0] if args and isinstance(args[0], dict) else {}
+                            self.trace(current, 'rehearsed', 'armed_not_submitted',
+                                       armed={key: config.get(key) for key in ('stake', 'minDecimal', 'selectionLabel', 'marketName')})
+                            window = (current.get('payload', {}).get('plan') or {}).get('window')
+                            if window:
+                                self.expired_windows.add(window['key'])  # One rehearsal per window; in memory only.
+                        return {"status": "aborted", "reason": "rehearsal: the authorized stake is armed; no wager was submitted"}
                     self.browser_activity = "confirm_wager_script"
                     if current is None or not self.permits(current):
                         return {"status": "aborted", "reason": "Ember authorization expired"}
                     if current.get('protocol')==3 and args:
                         config=dict(args[0]);config['minDecimal']=max(config['minDecimal'],current['payload']['plan']['min_decimal'])
+                        ceiling=current['payload']['plan'].get('max_decimal')
+                        if ceiling is not None:config['maxDecimal']=min(config.get('maxDecimal') or ceiling,ceiling)
                         args=(config,*args[1:])
+                    armed = args[0] if args and isinstance(args[0], dict) else {}
+                    # In memory only; written with the outcome row, so no I/O precedes the submit command.
+                    current['_armed'] = {key: armed.get(key) for key in ('stake', 'minDecimal', 'maxDecimal', 'selectionLabel', 'marketName')}
                     # A browser-side deadline also covers a delayed CDP command.
                     deadlines = [self.lease.until-time.monotonic(),
                                  timestamp(current["expires_at"])-time.time()-self.lease.server_offset]
@@ -1049,8 +1180,22 @@ class Client:
                 if self.device_test and not self.device_test.permits():
                     self.device_test.finish("timed_out")
                     break
-                with redirect_stdout(QuietOutput()):
-                    provider = login_gate.poll(self.driver, core.location_status)
+                if (not self.signals.empty() and provider_cache is not None
+                        and time.monotonic()-provider_cache[0] <= PROVIDER_REUSE):
+                    # A queued signal is not held behind a re-read on a loaded page (live 2026-10-28: each
+                    # read took 1-5 s and a burst of four expired in the queue); its plan re-checks sign-in
+                    # and location right before execution, and the wager script re-checks permission.
+                    provider = provider_cache[1]
+                else:
+                    with redirect_stdout(QuietOutput()):
+                        try:
+                            provider = login_gate.poll(self.driver, core.location_status)
+                        except NavigationPending:
+                            provider = None
+                    provider_cache = (time.monotonic(), provider) if provider is not None and provider.get("ready") else None
+                if provider is None:  # Every readable tab is mid-navigation: wait for a commit, not a driver timeout.
+                    self.stop.wait(.1)
+                    continue
                 if not active():
                     break
                 signed_in = bool(provider.get("signed_in"))
@@ -1058,7 +1203,11 @@ class Client:
                 evidence = {"signed_in": signed_in, "ready": bool(provider["ready"]),
                             "can_bet": bool(provider.get("provider_can_bet")), "phase": provider.get("phase", "waiting")}
                 self.provider_phase = evidence["phase"]
+                self.provider_alert(evidence["phase"], time.monotonic())
                 if evidence != last_provider:
+                    if (last_provider or {}).get("phase") != evidence["phase"]:
+                        # Phase name only: when sign-in/location blocked wagering, and for how long.
+                        owner.log.record("provider_" + str(evidence["phase"])[:40])
                     last_provider = evidence
                     emit("provider", **evidence)
                 if provider.get("message"):
@@ -1081,20 +1230,27 @@ class Client:
                         browser_preparation.publish("provider_wait", provider["message"])
                     elif browser_preparation.last_status and browser_preparation.last_status[0] == "provider_wait":
                         browser_preparation.publish("provider_wait", browser_preparation.last_status[1])
+                    if signed_in:
+                        keep_session()
                     self.stop.wait(.5)
                     continue
                 if not table_prepared:
                     self.provider_ready.clear()
-                    if not market_readiness.provider_ready(self.driver):
-                        browser_preparation.publish('provider_loading',market_readiness.error_reason)
-                        self.stop.wait(.5)
+                    try:
+                        if not market_readiness.provider_ready(self.driver):
+                            browser_preparation.publish('provider_loading',market_readiness.error_reason)
+                            keep_session()
+                            self.stop.wait(.5)
+                            continue
+                        snapshot = read_plan_slip(self.driver)
+                        route = urlsplit(self.driver.current_url)
+                    except NavigationPending:
+                        self.stop.wait(.1)
                         continue
-                    snapshot = read_plan_slip(self.driver)
                     if snapshot.get('status') == 'present' and snapshot.get('legs'):
                         self.staging.inventory = snapshot['legs']
                         table_prepared = True
                         continue
-                    route = urlsplit(self.driver.current_url)
                     league = urlsplit(core.LEAGUE_URL)
                     reusable = (route.scheme == league.scheme and route.netloc == league.netloc and
                         (route.path.rstrip('/') == league.path.rstrip('/') or
@@ -1126,6 +1282,7 @@ class Client:
                     continue
                 if not self.provider_ready.is_set() and not self.scan_only:
                     emit("status", message="Table Tennis is signed in and ready. Waiting for fresh, qualifying model signals.")
+                    owner.log.record("signals_ready")  # Fault-to-ready evidence for recovery timing.
                 if not self.scan_only:
                     self.provider_ready.set()
                 if self.pre_submit_recovery is not None:
@@ -1147,39 +1304,55 @@ class Client:
                         recovery['signal']['_preflight_authorized'] = True
                         self.signals.put_latest(recovery['signal'])
                 with redirect_stdout(QuietOutput()):
-                    maintenance.observe_network(self.driver, time.monotonic())
-                    maintenance.activity(self.driver, time.monotonic(), "signed-in", busy=not self.signals.empty(),
-                                         blocked=bool(location.get("blocked")))
+                    if self.signals.empty():  # The performance-log read took up to 5 s on a loaded page.
+                        maintenance.observe_network(self.driver, time.monotonic())
+                    try:
+                        maintenance.activity(self.driver, time.monotonic(), "signed-in", busy=not self.signals.empty(),
+                                             blocked=bool(location.get("blocked")))
+                    except NavigationPending:
+                        pass  # Session upkeep waits for the page commit; it never holds a signal.
                 if self.device_test and maintenance.report.get("lastVerificationAt") and not self.device_test.state.get("session_renewal_verified"):
                     self.device_test.update(session_renewal_verified=True)
                 if self.device_test and self.device_test.state.get("phase") in {"awaiting_provider_signin", "awaiting_provider_location"}:
                     self.device_test.update(phase="waiting_for_qualified_signal")
                 if self.scan_only:
-                    browser_preparation.step(self.driver, self.preparation,
-                        self.lease.clock() < self.lease.until and self.last_feed is True,
-                        time.time()+self.lease.server_offset,
-                        stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
+                    try:
+                        browser_preparation.step(self.driver, self.preparation,
+                            self.lease.clock() < self.lease.until and self.last_feed is True,
+                            time.time()+self.lease.server_offset,
+                            stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
+                    except NavigationPending:
+                        pass  # Same as the idle loop: the scan resumes once the tab's new page commits.
                     if self.device_test:
                         self.device_test.update(phase="watching_verified_event_no_wagers" if browser_preparation.key else "league_standby_no_wagers")
                     self.stop.wait(.5)
                     continue
                 try:
                     # A queued signal wakes this immediately; the timeout only
-                    # paces the idle loop's browser reads.
-                    signal = self.signals.get(timeout=.3)
+                    # paces the idle loop's browser reads. At .3 s that idle polling
+                    # held ~25% of DraftKings' page thread (A/B, live 2026-10-27). With no match
+                    # prepared, reads only watch sign-in and location, so they slow further.
+                    signal = self.signals.get(timeout=IDLE_WAIT if browser_preparation.focus_event_id() else STANDBY_WAIT)
                 except queue.Empty:
                     with redirect_stdout(QuietOutput()):
-                        browser_preparation.step(self.driver, self.preparation,
-                            self.lease.clock() < self.lease.until and self.last_feed is True,
-                            time.time()+self.lease.server_offset, hold=self.hold_preparation(),
-                            stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
-                        self.maintain_empty_slip(self.driver)
+                        try:
+                            browser_preparation.step(self.driver, self.preparation,
+                                self.lease.clock() < self.lease.until and self.last_feed is True,
+                                time.time()+self.lease.server_offset, hold=self.hold_preparation(),
+                                stages=(self.scanner or {}).get('stages', []), legs=self.staging.inventory)
+                            self.maintain_empty_slip(self.driver)
+                            board = (self.scanner or {}).get('board')
+                            event_tabs.retire(self.driver, event_tabs.live_events(board, time.time()+self.lease.server_offset)
+                                              if isinstance(board, dict) and self.last_feed is True else None)
+                        except NavigationPending:
+                            pass  # Idle upkeep resumes once the tab's new page commits.
                     continue
                 current = signal
                 self.current_signal=signal
                 if signal.get('protocol')==3:
                     plan=signal['payload']['plan']
-                    plan['min_decimal']=max(plan['min_decimal'],ledger.window_peak(self.account,plan['window']['key']))
+                    ceiling=ledger.window_ceiling(self.account,plan['window']['key'])
+                    if ceiling is not None:plan['max_decimal']=min(plan.get('max_decimal',ceiling),ceiling)
                 signal.setdefault('_timing', {}).setdefault('dequeued', time.monotonic())
                 self.pending_contracts.discard(signal["contract"])
                 submission_may_have_run = False
@@ -1191,6 +1364,7 @@ class Client:
                     self.history_outcome(signal, "handled" if self.last_authorize_reason == "claimed_elsewhere" else "missed", self.last_authorize_reason)
                     continue
                 signal['_preflight_authorized'] = True
+                signal['_timing'].setdefault('authorized', time.monotonic())  # Stage marks: where a slow turn went.
                 payload = signal["payload"]
                 # Protocol 2 only: the plan is the sole decision. The client
                 # executes it by comparison and never derives a stake or a floor.
@@ -1227,6 +1401,7 @@ class Client:
                             self.history_outcome(signal, "handled" if reason == "claimed_elsewhere" else "missed", reason,
                                                  result={"readiness": readiness})
                             continue
+                        signal['_timing'].setdefault('revealed', time.monotonic())
                         self.history_outcome(signal, "processing", "waiting", result={"readiness": readiness})
                         # Protocol 2 claims only with the observed quote, inside the plan flow.
                         if self.device_test and not self.device_test.claim(signal):
@@ -1237,11 +1412,11 @@ class Client:
                         outcome = next((row for row in market.get("outcomes") or []
                                         if row.get("selectionId") == plan["selectionId"]), None)
                         if outcome is None:
-                            self.history_outcome(signal, "missed", "execution_error")
+                            self.history_outcome(signal, "missed", "execution_error", result={'reason': 'plan selection missing from the market'})
                             continue
                         if not readiness.get('staged'):
                             selected = self.staging.add(self.driver, core, event, market, outcome,
-                                lambda: self.permits(signal), max(.001, turn_until-time.monotonic()),
+                                lambda: self.permits(signal), max(.001, turn_until-time.monotonic()), landing=.75,
                                 **({'min_decimal':plan['min_decimal'],'observe_price':lambda price:self.observe_window_price(signal,price,ledger)} if signal.get('protocol')==3 else {}))
                             if selected.get('status') not in ('clicked', 'selected'):
                                 if selected.get('windowExpired'):
@@ -1250,6 +1425,7 @@ class Client:
                                     continue
                                 self.history_outcome(signal, 'missed', 'market_unavailable')
                                 continue
+                            signal['_timing'].setdefault('selected', time.monotonic())
                         result = core.place_plan(self.driver, event, market, plan, outcome,
                                                  authorize_values=self.claim_values(signal, ledger),
                                                   validate=lambda: self.authorize(signal) if signal.get('protocol')==3 else self.permits(signal),
@@ -1257,12 +1433,20 @@ class Client:
                                                  **({'observe_price':lambda price:self.observe_window_price(signal,price,ledger)} if signal.get('protocol')==3 else {}))
                     if signal.get('protocol')==3 and (result or {}).get('submissionState')=='not-submitted':
                         self.release_unsubmitted(signal,result,ledger)
+                    if signal.get('_rehearsed') and not submission_may_have_run and (result or {}).get('cleanupFailed') is not True:
+                        # An armed rehearsal is a diagnostic observation, not a miss to retry or relabel.
+                        self.history_outcome(signal, 'observed_only', 'read_only',
+                                             result={key: value for key, value in (result or {}).items() if key != 'submitted'})
+                        emit("execution", status="rehearsed", message=f"Signal {signal['id']}: stake armed in rehearsal; no wager was submitted")
+                        continue
                     state = (result or {}).get("status", "not_submitted")
                     if ((result or {}).get('retryable') is True and (result or {}).get('submissionState') == 'not-submitted'
                             and not submission_may_have_run and self.defer_readiness(signal, result)):
                         continue
+                    # A failed post-non-submission slip check still blocks the contract, but nothing was submitted.
+                    not_submitted = signal.get('protocol')==3 and (result or {}).get('submissionState')=='not-submitted'
                     ledger.finish(self.account, signal["contract"], 'submission_uncertain' if state=='unconfirmed' else
-                                  'not_submitted' if signal.get('protocol')==3 and (result or {}).get('submissionState')=='not-submitted' and not (result or {}).get('cleanupFailed') else state)
+                                  ('cleanup_failed' if (result or {}).get('cleanupFailed') else 'not_submitted') if not_submitted else state)
                     signal.setdefault('_timing', {})['finished'] = time.monotonic()
                     if (result or {}).get("denied"):
                         # The denial reason is authoritative; the result payload
@@ -1285,6 +1469,13 @@ class Client:
                         self.lease.revoke()
                     emit("execution", status=state, message=f"Signal {signal['id']}: {state}")
                 except Exception as error:
+                    if isinstance(error, NavigationPending) and not submission_may_have_run:
+                        # The refused command never reached the page: a provable non-submission, not a browser fault.
+                        if signal.get('_reserved'):
+                            ledger.finish(self.account, signal["contract"], 'not_submitted')
+                        self.history_outcome(signal, "missed", "browser_not_ready")
+                        emit("execution", status="not_submitted", message=f"Signal {signal['id']}: the match tab was still loading a new page")
+                        continue
                     transaction = getattr(self.driver,'_tt_plan_transaction',None)
                     if (browser_connection_lost(error) and not submission_may_have_run and signal.get('_reserved')
                             and isinstance(transaction,dict) and transaction.get('uncertain') is False
@@ -1295,7 +1486,8 @@ class Client:
                         self.lease.running = False
                         self.lease.revoke()
                     self.history_outcome(signal, "uncertain" if submission_may_have_run else "missed",
-                        "submission_uncertain" if submission_may_have_run else "browser_not_ready" if browser_connection_lost(error) else "execution_error")
+                        "submission_uncertain" if submission_may_have_run else "browser_not_ready" if browser_connection_lost(error) else "execution_error",
+                        result={'reason': ' '.join([type(error).__name__[:60], *code_location(error)])})  # Class and our code location only.
                     if self.device_test and not self.readiness_only:
                         self.device_test.finish("execution_error")
                         self.lease.running = False

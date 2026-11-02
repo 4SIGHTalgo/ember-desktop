@@ -29,6 +29,22 @@ class ExecutorContractTests(unittest.TestCase):
 
 
 class PureHelperTests(unittest.TestCase):
+    def test_event_identity_is_one_script_after_a_url_gate(self):
+        event = {"eventId": "34906242", "player1": "Piotr Zemla", "player2": "Tomasz Lojtek"}
+        driver = Mock(current_url="https://sportsbook.draftkings.com/event/a-vs-b/34906242")
+        driver.execute_script.return_value = ["LIVE Piotr Zemla 2 Tomasz Lojtek 1"]
+        self.assertTrue(execution.correct_event(driver, event))
+        driver.execute_script.assert_called_once_with(execution.SCOREBOARD_TEXT_SCRIPT)
+        driver.find_elements.assert_not_called()
+        for panels in (["Piotr Zemla vs Someone Else"], [], None, {"present": False}):
+            with self.subTest(panels=panels):
+                driver.execute_script.return_value = panels
+                self.assertFalse(execution.correct_event(driver, event))
+        driver.reset_mock()
+        driver.current_url = "https://sportsbook.draftkings.com/event/a-vs-b/999"
+        self.assertFalse(execution.correct_event(driver, event))
+        driver.execute_script.assert_not_called()  # A wrong route never costs a page command.
+
     def test_surface_family_maps_distribution_families_to_their_surface(self):
         self.assertEqual(execution.surface_family("split"), "split")
         self.assertEqual(execution.surface_family("complement"), "split")
@@ -47,6 +63,16 @@ class PureHelperTests(unittest.TestCase):
         surface = execution.market_surface({"name": "Game 2", "betType": "split"})
         self.assertEqual(surface["sectionTitle"], "Winner - Listed Game")
         self.assertFalse(surface["distribution"])
+
+    def test_closeout_surface_accepts_the_live_match_winner_headers(self):
+        # Live DK 2026-10-31: no "Moneyline" header; "Winner" on Match Lines, "Match Winner" on Popular.
+        for market in ({"name": "Moneyline"}, {"betType": "closeout"}):
+            with self.subTest(market=market):
+                surface = execution.market_surface(market)
+                self.assertEqual(surface["sectionTitle"], "Moneyline")  # Still keys the close-out code paths.
+                self.assertEqual(set(surface["sectionTitles"]), {"Moneyline", "Winner", "Match Winner"})
+                self.assertEqual(surface["tabLabels"], ["Match Lines", "Popular"])
+                self.assertNotIn("Winner - Listed Game", surface["sectionTitles"])
 
     def test_event_route_open_requires_the_exact_event_path(self):
         driver = Mock()
