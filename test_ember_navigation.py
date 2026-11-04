@@ -131,15 +131,27 @@ class NavigationGateBrowserTests(unittest.TestCase):
         cls.addClassCleanup(cls.driver.quit)
         cls.driver.command_guard.gate = NavigationGate(cls.driver.command_guard)
 
+    def committed(self, driver, path, seconds=10):
+        """Wait until the tab's document is the one at path; the gate refuses commands until it commits."""
+        deadline = time.monotonic()+seconds
+        while True:
+            try:
+                if driver.execute_script('return location.pathname') == path:
+                    return
+            except NavigationPending:
+                pass
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+
     def test_a_slow_document_refuses_page_commands_quickly_while_another_tab_keeps_working(self):
         driver, base = self.driver, f'http://127.0.0.1:{self.server.server_port}'
         driver.get(base+'/fast')
-        time.sleep(.5)
+        self.committed(driver, '/fast')
         first = driver.current_window_handle
         driver.switch_to.new_window('tab')
         second = driver.current_window_handle  # window_handles order differs across Chrome builds
         driver.get(base+'/fast2')
-        time.sleep(.5)
+        self.committed(driver, '/fast2')  # A new tab starts a renderer: on a slow runner that took over 1 s.
         driver.switch_to.window(first)
         driver.get(base+'/slow')
         started = time.monotonic()
@@ -149,13 +161,7 @@ class NavigationGateBrowserTests(unittest.TestCase):
         driver.switch_to.window(second)
         self.assertEqual(driver.execute_script('return document.title'), '/fast2')
         driver.switch_to.window(first)
-        deadline = time.monotonic()+10
-        while True:
-            try:
-                self.assertEqual(driver.execute_script('return location.pathname'), '/slow')
-                break
-            except NavigationPending:
-                self.assertLess(time.monotonic(), deadline)
+        self.committed(driver, '/slow')
 
 
 if __name__ == '__main__':
