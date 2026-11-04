@@ -119,6 +119,7 @@ class ReferenceWindowTests(unittest.TestCase):
                 self.assertTrue(ledger.reserve_signal(self.client.account,signal))
                 self.client.lease.running=True
                 result={'status':'skipped','submissionState':'not-submitted','retryable':True,
+                        'reason':'plan deadline or dispatch budget expired',
                         **({'cleanupFailed':True} if own_stake_left else {})}
                 with patch('ember_client.clear_single_slip',return_value={'status':'blocked'}) as clear:
                     self.client.release_unsubmitted(signal,result,ledger)
@@ -127,8 +128,27 @@ class ReferenceWindowTests(unittest.TestCase):
                 self.assertEqual(clear.called,not own_stake_left)
                 self.assertFalse(result['retryable'])
                 self.assertTrue(result['cleanupFailed'])
+                self.assertEqual(result['skipped'],'plan deadline or dispatch budget expired')  # Why it skipped stays in the trace.
                 self.assertFalse(ledger.reserve_signal(self.client.account,signal))
                 self.assertTrue(signal['_reserved'])
+
+    def test_idle_keep_alive_sends_one_status_read_per_interval_and_ignores_failures(self):
+        # Live 11/02-11/04: a turn's first authorize took a median 704 ms on a cold connection, 79 ms warm.
+        client=self.client
+        client.request=Mock(side_effect=[{'enabled':True},RuntimeError('request_timeout')])
+        clock=[1000.0]
+        with patch('ember_client.time.monotonic',side_effect=lambda:clock[0]):
+            client.warmed_at=clock[0]
+            client.keep_connection_warm()
+            client.request.assert_not_called()  # Inside the interval nothing is sent.
+            clock[0]+=ember_client.WARM_INTERVAL
+            client.keep_connection_warm()
+            clock[0]+=1
+            client.keep_connection_warm()
+            clock[0]+=ember_client.WARM_INTERVAL
+            client.keep_connection_warm()  # A failed warm-up changes nothing.
+        self.assertEqual([(c.args,c.kwargs) for c in client.request.call_args_list],
+                         [(('/api/v1/status/',),{'authenticated':True,'timeout':1})]*2)
 
     def test_an_animated_pick_removal_is_reverified_instead_of_stopping_the_run(self):
         import tt_market_exec as execution
@@ -619,6 +639,11 @@ class ProtocolV2Tests(unittest.TestCase):
         counts = self.client.history.snapshot(self.client.history_scope(), outcome=None)['counts']
         self.assertNotIn('uncertain', counts)
         self.assertEqual(counts.get('missed'), 2)
+
+    def test_an_idle_turn_keeps_the_execution_connection_warm(self):
+        with patch.object(self.client, 'keep_connection_warm') as warm:
+            self.run_confirm_probe(False)
+        warm.assert_called()  # On the execution thread, whose session the next signal's authorize uses.
 
     def test_a_leftover_pick_keeps_the_run_and_the_next_contract_arms_only_on_a_verified_slip(self):
         # Live 2026-11-02..04: three run stops on an unverifiable post-abort slip idled DK into a logout.

@@ -48,6 +48,9 @@ IDLE_WAIT = 1.0  # seconds between idle browser reads; signals never wait for it
 # League standby (no match prepared): live 2026-10-29 the idle reads still held 68% of a loaded page.
 STANDBY_WAIT = 3.0
 PROVIDER_REUSE = 10  # seconds a ready provider reading may serve queued signals
+# Live 11/02-11/04: a turn's first authorize took a median 704 ms on a cold HTTPS connection and 79 ms
+# warm; #1115 expired 0.2 s short of its claim. Idle keep-alive keeps the execution thread's warm.
+WARM_INTERVAL = 20  # seconds
 
 # Startup wait-stage codes (ember_browser_lifecycle.BrowserWaiting) to the exact
 # user-facing failure text. Anything absent keeps the generic recovery message,
@@ -216,6 +219,7 @@ class Client:
         self.intent_lock = threading.RLock()
         self.auth_lock = threading.RLock()
         self.http_local = threading.local()
+        self.warmed_at = time.monotonic()
         self.login_lock = threading.Lock()
         self.run_lock = threading.Lock()
         self.provider_ready = threading.Event()
@@ -309,7 +313,7 @@ class Client:
                'protocol': signal.get('protocol'), 'outcome': outcome, 'reason': reason,
                'received_at': signal.get('_received_at'), 'expires_at': signal.get('expires_at'),
                'ms': {key: round(1000*(value-start), 1) for key, value in marks.items() if start is not None and type(value) is float},
-               **{key: result[key] for key in ('status', 'denied', 'readiness', 'timing') if key in result},
+               **{key: result[key] for key in ('status', 'denied', 'skipped', 'readiness', 'timing') if key in result},
                **({'detail': str(result['reason'])[:200]} if result.get('reason') else {}),
                **({'armed': signal['_armed']} if isinstance(signal.get('_armed'), dict) else {}), **extra}
         path = self.data_dir/'execution-trace.jsonl'
@@ -902,13 +906,23 @@ class Client:
             signal.pop('_reserved',None)
             return
         own_stake_left=result.get('cleanupFailed') is True  # place_plan could not clear the stake it armed
-        result.update(status='stopped',cleanupFailed=True,retryable=False,
+        result.update(status='stopped',cleanupFailed=True,retryable=False,skipped=result.get('reason'),
                       reason='The single slip could not be verified empty after non-submission')
         # Live 11/02-11/04: three stops on a leftover unfunded pick idled DK into a logout. That pick is
         # harmless: every later signal must verify the single slip before arming. Only a stake stops.
         if own_stake_left:
             self.lease.running=False
             self.lease.revoke()
+
+    def keep_connection_warm(self):
+        """Idle only: one read-only status request keeps this thread's HTTPS connection open for the next turn."""
+        if time.monotonic()-self.warmed_at < WARM_INTERVAL:
+            return
+        self.warmed_at = time.monotonic()
+        try:
+            self.request("/api/v1/status/", authenticated=True, timeout=1)
+        except Exception:
+            pass  # Best effort: the signal path makes and checks its own requests.
 
     def observe_window_price(self,signal,price,ledger):
         """Unchanged or lower prices keep the window while EV stays positive; any rise ends it."""
@@ -1340,6 +1354,7 @@ class Client:
                     # prepared, reads only watch sign-in and location, so they slow further.
                     signal = self.signals.get(timeout=IDLE_WAIT if browser_preparation.focus_event_id() else STANDBY_WAIT)
                 except queue.Empty:
+                    self.keep_connection_warm()
                     with redirect_stdout(QuietOutput()):
                         try:
                             browser_preparation.step(self.driver, self.preparation,

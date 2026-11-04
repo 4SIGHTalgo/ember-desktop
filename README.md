@@ -81,6 +81,10 @@ blocks only that contract. Monitoring continues, and every later signal must
 verify the slip before arming. While DraftKings still shows "Placing your bets",
 Ember waits up to 30 seconds for the receipt before calling a bet unconfirmed.
 
+In 0.3.3, Ember keeps its connection to the signal service open while it waits,
+so each signal's first server check takes tens of milliseconds instead of most
+of a second. That time now goes to placing the bet before the signal expires.
+
 ## Updating
 
 Ember checks for signed updates on its own and installs them after your
