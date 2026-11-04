@@ -901,10 +901,14 @@ class Client:
             ledger.finish(self.account,signal['contract'],'not_submitted')
             signal.pop('_reserved',None)
             return
+        own_stake_left=result.get('cleanupFailed') is True  # place_plan could not clear the stake it armed
         result.update(status='stopped',cleanupFailed=True,retryable=False,
                       reason='The single slip could not be verified empty after non-submission')
-        self.lease.running=False
-        self.lease.revoke()
+        # Live 11/02-11/04: three stops on a leftover unfunded pick idled DK into a logout. That pick is
+        # harmless: every later signal must verify the single slip before arming. Only a stake stops.
+        if own_stake_left:
+            self.lease.running=False
+            self.lease.revoke()
 
     def observe_window_price(self,signal,price,ledger):
         """Unchanged or lower prices keep the window while EV stays positive; any rise ends it."""
@@ -1298,7 +1302,9 @@ class Client:
                     if recovery['signal'].get('protocol')==3:
                         result={'submissionState':'not-submitted'}
                         self.release_unsubmitted(recovery['signal'],result,ledger)
-                        if result.get('cleanupFailed'):break
+                        if result.get('cleanupFailed'):
+                            self.lease.running = False  # After a browser recovery the run still stops, as before.
+                            break
                     self.pre_submit_recovery = None
                     if self.authorize(recovery['signal']):
                         recovery['signal']['_preflight_authorized'] = True

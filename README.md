@@ -76,6 +76,11 @@ see. This is pre-set-reference conservative EV, not a score-conditioned in-play
 probability. Version 0.3.0 rejects these windows and stays idle, so update to keep
 acting on signals.
 
+In 0.3.2, a bet slip Ember cannot verify empty after a bet it did not submit
+blocks only that contract. Monitoring continues, and every later signal must
+verify the slip before arming. While DraftKings still shows "Placing your bets",
+Ember waits up to 30 seconds for the receipt before calling a bet unconfirmed.
+
 ## Updating
 
 Ember checks for signed updates on its own and installs them after your

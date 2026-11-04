@@ -110,18 +110,25 @@ class ReferenceWindowTests(unittest.TestCase):
         self.assertEqual(ledger.connection.execute('SELECT count(*) FROM attempts').fetchone()[0],0)
         self.assertTrue(self.client.request.call_args.args[1]['cancel_window'])
 
-    def test_failed_cleanup_never_releases_the_reservation_or_resumes_execution(self):
-        signal=window_signal();signal['_reserved']=True
-        ledger=Ledger(self.client.data_dir/'execution.sqlite3');self.addCleanup(ledger.connection.close)
-        self.assertTrue(ledger.reserve_signal(self.client.account,signal))
-        result={'status':'skipped','submissionState':'not-submitted','retryable':True}
-        with patch('ember_client.clear_single_slip',return_value={'status':'blocked'}):
-            self.client.release_unsubmitted(signal,result,ledger)
-        self.assertFalse(self.client.lease.running)
-        self.assertFalse(result['retryable'])
-        self.assertTrue(result['cleanupFailed'])
-        self.assertFalse(ledger.reserve_signal(self.client.account,signal))
-        self.assertTrue(signal['_reserved'])
+    def test_failed_cleanup_never_releases_the_reservation_and_only_a_stake_left_stops_the_run(self):
+        for own_stake_left in (False, True):
+            with self.subTest(own_stake_left=own_stake_left):
+                self.setUp()
+                signal=window_signal();signal['_reserved']=True
+                ledger=Ledger(self.client.data_dir/'execution.sqlite3');self.addCleanup(ledger.connection.close)
+                self.assertTrue(ledger.reserve_signal(self.client.account,signal))
+                self.client.lease.running=True
+                result={'status':'skipped','submissionState':'not-submitted','retryable':True,
+                        **({'cleanupFailed':True} if own_stake_left else {})}
+                with patch('ember_client.clear_single_slip',return_value={'status':'blocked'}) as clear:
+                    self.client.release_unsubmitted(signal,result,ledger)
+                # A stake Ember armed may still be in the slip: stop. A leftover pick is re-verified by every later signal.
+                self.assertEqual(self.client.lease.running,not own_stake_left)
+                self.assertEqual(clear.called,not own_stake_left)
+                self.assertFalse(result['retryable'])
+                self.assertTrue(result['cleanupFailed'])
+                self.assertFalse(ledger.reserve_signal(self.client.account,signal))
+                self.assertTrue(signal['_reserved'])
 
     def test_an_animated_pick_removal_is_reverified_instead_of_stopping_the_run(self):
         import tt_market_exec as execution
@@ -433,7 +440,7 @@ class ProtocolV2Tests(unittest.TestCase):
         self.assertEqual(snapshot["counts"], {"placed": 1})
         self.assertEqual(snapshot["records"][0]["reason"], "placed")
 
-    def run_confirm_probe(self, rehearsal, cleanup='cleared', make_signal=None, place_effect=None, burst=False):
+    def run_confirm_probe(self, rehearsal, cleanup='cleared', make_signal=None, place_effect=None, burst=False, prepare=None):
         import tt_market_exec as core
         client = self.client
         client.rehearsal = rehearsal
@@ -496,7 +503,7 @@ class ProtocolV2Tests(unittest.TestCase):
                 patch("draftkings_session.SessionMaintenance"), patch.object(core, "prepare_browser_execution"),
                 patch.object(core, "reveal_set_winner", return_value={"status": "revealed"}),
                 patch("ember_client.clear_single_slip", return_value={'status': cleanup}),
-                patch("ember_client.prepare_single_slip", return_value={'status': 'cleared'}),
+                patch("ember_client.prepare_single_slip", **({'side_effect': prepare} if prepare else {'return_value': {'status': 'cleared'}})),
                 patch.object(core, "ensure_slip_open"),
                 patch.object(core, "open_props", return_value=True), patch.object(core, "place_plan", side_effect=place_effect or place)):
                 stack.enter_context(setting)
@@ -596,11 +603,10 @@ class ProtocolV2Tests(unittest.TestCase):
         history = self.client.history.snapshot(self.client.history_scope(), outcome=None)
         self.assertEqual([(r['outcome'], r['reason']) for r in history['records']], [('missed', 'browser_not_ready')])
 
-    def test_rehearsal_that_cannot_verify_an_empty_slip_still_stops_and_is_not_reported_as_a_submission(self):
+    def test_rehearsal_that_cannot_verify_an_empty_slip_blocks_its_contract_and_is_not_reported_as_a_submission(self):
         self.client.conservative_level, self.client.active_windows = 'conservative', {1}
         _, dispatched, statuses = self.run_confirm_probe(True, cleanup='blocked', make_signal=window_signal)
         self.assertEqual(dispatched, [])
-        self.assertFalse(self.client.lease.running)
         self.assertEqual(statuses[-1], 'cleanup_failed')
         history = self.client.history.snapshot(self.client.history_scope(), outcome=None)
         self.assertEqual([(r['outcome'], r['reason']) for r in history['records']], [('missed', 'selection_failed')])
@@ -613,6 +619,37 @@ class ProtocolV2Tests(unittest.TestCase):
         counts = self.client.history.snapshot(self.client.history_scope(), outcome=None)['counts']
         self.assertNotIn('uncertain', counts)
         self.assertEqual(counts.get('missed'), 2)
+
+    def test_a_leftover_pick_keeps_the_run_and_the_next_contract_arms_only_on_a_verified_slip(self):
+        # Live 2026-11-02..04: three run stops on an unverifiable post-abort slip idled DK into a logout.
+        import tt_market_exec as core
+        for verified in (True, False):
+            with self.subTest(verified=verified):
+                self.setUp()
+                self.client.conservative_level, self.client.active_windows = 'conservative', {1, 2}
+                placed = []
+
+                def place(driver, *args, **kwargs):
+                    placed.append(args[0]['eventId'])
+                    if len(placed) == 1:
+                        return {'status': 'skipped', 'submitted': False, 'submissionState': 'not-submitted',
+                                'retryable': False, 'notReady': False, 'reason': 'selection price moved'}
+                    driver.execute_script(core.CONFIRM_PLAN_SCRIPT, {'stake': 2.61, 'minDecimal': 2.0,
+                                                                     'selectionLabel': 'Two', 'marketName': 'Game 2'})
+                    return {'status': 'placed', 'submitted': True, 'submissionState': 'placed', 'reason': 'placed'}
+                checks = iter([{'status': 'cleared'}] + ([{'status': 'cleared'}] if verified else []))
+                prepare = Mock(side_effect=lambda driver, target=None: next(checks, {'status': 'blocked', 'reason': 'slip funding is not zero'}))
+                _, dispatched, statuses = self.run_confirm_probe(False, cleanup='blocked', make_signal=window_signal,
+                                                                 place_effect=place, burst=True, prepare=prepare)
+                self.assertGreaterEqual(prepare.call_count, 2)  # The run went on and re-verified the slip.
+                if verified:
+                    self.assertEqual(len(placed), 2)
+                    self.assertEqual(len(dispatched), 1)
+                    self.assertEqual(statuses, ['cleanup_failed', 'submitting', 'placed'])
+                else:  # An unverified slip never arms or submits the next contract.
+                    self.assertEqual(len(placed), 1)
+                    self.assertEqual(dispatched, [])
+                    self.assertEqual(statuses, ['cleanup_failed'])
 
     def test_plan_denials_are_journaled_with_the_authoritative_reason(self):
         import tt_market_exec as core

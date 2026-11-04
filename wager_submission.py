@@ -1,5 +1,10 @@
 """Bounded continuation of one wager through explicit provider confirmations."""
+import re
 import time
+
+# Live 2026-11-02 (#1017): DK still showed "PLACING YOUR BETS" 12.9 s after the click of a bet it placed.
+PLACING = re.compile(r"placing your bets?", re.I)
+PLACING_WAIT = 30  # seconds from the click; DK's own in-flight state past this stays unconfirmed
 
 
 SUBMISSION_UI_JS = r"""
@@ -157,14 +162,20 @@ def recover_load_notice(driver, script, timeout=2):
     return not state.get("present")
 
 
-def settle_submission(driver, confirmation, read_script, continue_submit=None, timeout=12, max_actions=4):
-    """Continue only explicit changed prompts. An unanswered Place Bet is never replayed."""
+def settle_submission(driver, confirmation, read_script, continue_submit=None, timeout=12, max_actions=4,
+                      placing=PLACING_WAIT):
+    """Continue only explicit changed prompts. An unanswered Place Bet is never replayed.
+
+    While DK itself still shows its in-flight placing state the wait runs on, up to `placing` seconds.
+    """
     actions = [confirmation]
-    deadline = time.monotonic()+timeout
+    started = time.monotonic()
+    deadline = started+timeout
     candidate, stable_since = None, None
     receipt = {}
     blocked = None
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline or (time.monotonic() < started+placing
+                                          and PLACING.search(str(receipt.get("text") or ""))):
         receipt = driver.execute_script(read_script) or {}
         if receipt.get("placed") or receipt.get("failed") or receipt.get("locationBlocked"):
             break
